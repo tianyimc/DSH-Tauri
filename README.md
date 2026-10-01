@@ -65,7 +65,8 @@ DSHTauri/
 │   ├── Cargo.toml                  # 第 5 项
 │   ├── Cargo.lock                  # 提交它，保证 CI 可复现
 │   └── tauri.conf.json             # 第 3 项
-├── app-icon.png                    # 图标源文件（1024x1024）
+├── app-icon.png                    # 图标源文件（当前为 DeepSeek 鲸鱼 logo，225x225 透明 PNG）
+├── deepseek.ico                    # 用户提供的原始 ico（保留备查，不参与构建）
 ├── package.json                    # 第 2 项
 ├── package-lock.json               # `npm ci` 依赖它
 ├── .gitignore
@@ -178,6 +179,27 @@ DSHTauri/
 | 无构建步骤 | 不写 `devUrl` / `beforeDevCommand`。Tauri CLI 官方说明：*"If you don't have a dev server or don't want to use one, ignore this option and use `frontendDist` … Tauri CLI will run its built-in dev server and provide a simple hot-reload experience."* |
 | `withGlobalTauri` | 必须为 `true`，否则静态页面拿不到 `window.__TAURI__`，选择界面无法调用 Rust 命令 |
 | CSP | 设为 `null` = 不注入 CSP。远程 WebUI 往往有自己的 CSP/内联脚本，由 Tauri 再注入一份容易白屏。见 [§4 安全说明](#4-选择界面前端) |
+
+### 图标
+
+| 项 | 值 |
+| --- | --- |
+| 源文件 | `app-icon.png` —— DeepSeek 鲸鱼 logo，225×225，透明背景，纯色 `#020E36` |
+| 原始素材 | `deepseek.ico`（用户提供，单帧 225×225 BMP）—— 保留备查，**不参与构建** |
+| 生成命令 | `npm run icon`（= `tauri icon app-icon.png`） |
+| 产物 | `src-tauri/icons/` 全套；其中 `icon.ico` 含 **16/24/32/48/64/256** 六档，全部内嵌 PNG |
+| 用在哪 | NSIS 安装器图标、exe 文件图标、任务栏、系统托盘（`app.default_window_icon()` 复用 `bundle.icon`） |
+
+> ⚠️ **深色任务栏可见性**：该 logo 是不透明的 `#020E36`（极深藏青，亮度约 14/255），
+> 在 Windows 11 默认的深色任务栏/托盘上对比度很低，可能看不清。
+> 如需改善，给 `app-icon.png` 加一层浅色圆角底或白色描边后再跑 `npm run icon` 即可。
+> 也可以单独给托盘用一个浅色图标（`TrayIconBuilder::icon()` 接受任意 `Image`）。
+
+**换图标**：把自己的方形 PNG（建议 1024×1024、带透明通道）覆盖到 `app-icon.png`，然后 `npm run icon`。
+不要直接把 `.png` 改名成 `.ico` —— 文件头不对，`makensis` 会拒绝（见 [TROUBLESHOOTING §4](docs/TROUBLESHOOTING.md#4-图标格式错误)）。
+
+`npm run icon` 之后会自动跑 `posticon` 钩子（[scripts/clean-mobile-icons.mjs](scripts/clean-mobile-icons.mjs)），
+把 `tauri icon` 顺带生成的 `android/`、`ios/` 两套图标删掉——本项目只做 Windows 桌面端。
 
 ---
 
@@ -597,9 +619,9 @@ node scripts/check-env.mjs
 # ---------- 3. 安装依赖 ----------
 npm install                 # 生成 package-lock.json（只需一次，之后 CI 用 npm ci）
 
-# ---------- 4. 图标（仓库已包含生成结果；改了 app-icon.png 才需要重跑）----------
-node scripts/make-icon.mjs
-npm run icon
+# ---------- 4. 图标（仓库已包含生成结果；换了 logo 才需要重跑）----------
+#   换图标：把自己的方形 PNG 覆盖到 app-icon.png，然后
+npm run icon                # = tauri icon app-icon.png，重新派生全套（含多尺寸 icon.ico）
 
 # ---------- 5. 本地跑起来（验收标准 1）----------
 npm run tauri dev

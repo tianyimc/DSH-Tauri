@@ -1,0 +1,20 @@
+{
+  "name": "dshtauri",
+  "private": true,
+  "version": "0.1.0",
+  "description": "DSHTauri - lightweight Tauri 2 desktop shell for the DSH WebUI (WebView2, system tray, local/remote selector)",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "build:nsis": "tauri build --bundles nsis",
+    "icon": "tauri icon app-icon.png"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.12.1"
+  }
+}

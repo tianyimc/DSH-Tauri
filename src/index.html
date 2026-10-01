@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>选择 DSH 连接方式</title>
+    <link rel="stylesheet" href="selector.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="head">
+        <div class="brand">
+          <span class="dot"></span>
+          <h1>选择 DSH 连接方式</h1>
+        </div>
+        <button id="toggle-settings" class="ghost" type="button" title="编辑地址与启动命令">
+          设置
+        </button>
+      </header>
+
+      <!-- ============ 主选择区 ============ -->
+      <section id="picker" class="picker">
+        <button id="pick-local" class="card" type="button">
+          <span class="card-icon" aria-hidden="true">⌂</span>
+          <span class="card-body">
+            <span class="card-title">本地</span>
+            <span class="card-url" id="label-local">http://127.0.0.1:8080</span>
+          </span>
+          <span class="card-badge" id="badge-local">可选自动启动服务</span>
+        </button>
+
+        <button id="pick-remote" class="card" type="button">
+          <span class="card-icon" aria-hidden="true">☁</span>
+          <span class="card-body">
+            <span class="card-title">远程</span>
+            <span class="card-url" id="label-remote">https://dsh.example.com</span>
+          </span>
+          <span class="card-badge">直接加载远程页面</span>
+        </button>
+      </section>
+
+      <!-- ============ 首次配置 / 设置面板 ============ -->
+      <section id="setup" class="setup" hidden>
+        <p class="setup-hint" id="setup-hint">
+          首次使用，请确认下面的地址。保存后会写入配置文件，之后直接点击“本地 / 远程”即可连接。
+        </p>
+
+        <label class="field">
+          <span class="field-label">本地 URL</span>
+          <input id="input-local" type="text" spellcheck="false" placeholder="http://127.0.0.1:8080" />
+        </label>
+
+        <label class="field">
+          <span class="field-label">远程 URL</span>
+          <input id="input-remote" type="text" spellcheck="false" placeholder="https://dsh.example.com" />
+        </label>
+
+        <label class="check">
+          <input id="input-autostart" type="checkbox" />
+          <span>选择“本地”时自动执行下面的命令（启动本地 DSH 服务）</span>
+        </label>
+
+        <label class="field" id="field-command">
+          <span class="field-label">本地服务启动命令（PowerShell）</span>
+          <textarea
+            id="input-command"
+            rows="3"
+            spellcheck="false"
+            placeholder="dsh web --port 8080"
+          ></textarea>
+          <span class="field-help">
+            通过 <code>powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "…"</code>
+            在后台执行，窗口不会弹出。留空则不做任何事（由你手动启动服务）。
+          </span>
+        </label>
+
+        <div class="actions">
+          <button id="save-setup" class="primary" type="button">保存</button>
+          <button id="cancel-setup" class="ghost" type="button">取消</button>
+        </div>
+      </section>
+
+      <p id="status" class="status" role="status"></p>
+      <footer class="foot">
+        <span id="foot-config">配置未加载</span>
+      </footer>
+    </main>
+
+    <!-- Tauri 2 全局 API（tauri.conf.json -> app.withGlobalTauri = true） -->
+    <script src="selector.js"></script>
+  </body>
+</html>

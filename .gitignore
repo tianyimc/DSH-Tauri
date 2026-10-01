@@ -1,0 +1,22 @@
+# dependencies
+node_modules/
+
+# rust
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# local toolchain installed inside the repo for sandboxed dev boxes (see README)
+.toolchain/
+
+# generated app icons keep the source png, ignore OS noise
+.DS_Store
+Thumbs.db
+
+# logs
+*.log
+
+# local npm cache (sandboxed dev boxes)
+.npm-cache/
+
+# headless smoke-test scratch (scripts/smoke-linux.sh uses mktemp, kept for manual runs)
+.devhome/

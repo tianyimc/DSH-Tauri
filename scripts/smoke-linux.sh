@@ -8,6 +8,7 @@
 #   3) 保存后主窗口「DSHTauri」出现，尺寸 1200x800
 #   4) 主窗口确实加载了配置里的 URL（本地测试服务收到请求）
 #   5) 关闭主窗口 = 隐藏到托盘（进程仍存活，窗口不可见）
+#   6) 重启后仍然要求选择，但地址已记住、无需再设置
 #
 # 依赖（Debian）：
 #   sudo apt-get install -y xvfb xdotool wmctrl openbox dbus-x11 curl nodejs
@@ -29,6 +30,10 @@ check() { # check <描述> <实际> <期望子串>
 check_empty() { # check_empty <描述> <实际> —— 期望为空
   if [[ -z "$2" ]]; then echo "  ✅ $1"; PASS=$((PASS+1));
   else echo "  ❌ $1  (实际: '$2', 期望为空)"; FAIL=$((FAIL+1)); fi
+}
+check_nonempty() { # check_nonempty <描述> <实际> —— 期望非空（用于「窗口存在」这类断言）
+  if [[ -n "$2" ]]; then echo "  ✅ $1"; PASS=$((PASS+1));
+  else echo "  ❌ $1  (期望非空，实际为空)"; FAIL=$((FAIL+1)); fi
 }
 
 cleanup() {
@@ -83,7 +88,7 @@ find_main() { xdotool search --name "^DSHTauri$" 2>/dev/null | while read -r w; 
 
 SEL=$(xdotool search --name "选择 DSH 连接方式" 2>/dev/null | head -1)
 echo "== 4. 断言 =="
-check "选择窗口已创建（标题=选择 DSH 连接方式）" "${SEL:-<无>}" "1"
+check_nonempty "选择窗口已创建（标题=选择 DSH 连接方式）" "${SEL:-}"
 
 eval "$(xdotool getwindowgeometry --shell "$SEL")"
 check "选择窗口尺寸 560x460" "${WIDTH}x${HEIGHT}" "560x460"
@@ -91,7 +96,7 @@ check "选择窗口尺寸 560x460" "${WIDTH}x${HEIGHT}" "560x460"
 echo "   → 点击「本地」"
 xdotool mousemove $((X + WIDTH / 2)) $((Y + 84)) click 1
 sleep 3
-check "首次点击不直接开主窗口（先要求确认配置）" "$(find_main || echo '<无>')" "<无>"
+check_empty "首次点击不直接开主窗口（先要求确认配置）" "$(find_main)"
 check "首次点击不写 config.json" "$([[ -f "$CONFIG_FILE" ]] && echo YES || echo NO)" "NO"
 
 echo "   → Tab x3 聚焦「保存」+ 回车"
@@ -101,7 +106,7 @@ xdotool key --clearmodifiers Return
 sleep 6
 
 MAIN=$(find_main)
-check "保存后主窗口已创建" "${MAIN:-<无>}" "1"
+check_nonempty "保存后主窗口已创建" "${MAIN:-}"
 check "config.json 已写入" "$([[ -f "$CONFIG_FILE" ]] && echo YES || echo NO)" "YES"
 if [[ -n "${MAIN:-}" ]]; then
   eval "$(xdotool getwindowgeometry --shell "$MAIN")"
@@ -117,6 +122,20 @@ sleep 4
 check "关闭后进程仍存活（隐藏到托盘）" "$(kill -0 "$APP_PID" 2>/dev/null && echo ALIVE || echo DEAD)" "ALIVE"
 check_empty "关闭后主窗口不可见" "$(xdotool search --onlyvisible --name "^DSHTauri$" 2>/dev/null | head -1 || true)"
 check "托盘创建成功（无降级告警）" "$(grep -c '系统托盘创建失败' "$OUT/app.log" 2>/dev/null || echo 0)" "0"
+
+echo
+echo "== 5. 重启应用：验证「每次都要选，但地址已记住」 =="
+kill "$APP_PID" 2>/dev/null; wait "$APP_PID" 2>/dev/null
+"$APP" >>"$OUT/app.log" 2>&1 & APP_PID=$!
+sleep 6
+SEL2=$(xdotool search --name "选择 DSH 连接方式" 2>/dev/null | head -1)
+check_nonempty "重启后仍然显示选择界面（「选择」不持久化）" "${SEL2:-}"
+eval "$(xdotool getwindowgeometry --shell "$SEL2")"
+echo "   → 直接点击「本地」（不按任何键、不打开设置）"
+xdotool mousemove $((X + WIDTH / 2)) $((Y + 84)) click 1
+sleep 5
+check_nonempty "直接点击即连上（「地址」已持久化，无需再设置）" "$(find_main)"
+check "config.json 未被改写" "$(cat "$CONFIG_FILE" | tr -d ' \n')" '"configured":true'
 
 echo
 echo "== 结果: $PASS 通过, $FAIL 失败 =="

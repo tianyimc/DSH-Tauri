@@ -24,12 +24,14 @@
 | `{{WINDOW_SIZE}}` | `1200x800` | `src-tauri/src/lib.rs` → `MAIN_WIDTH` / `MAIN_HEIGHT` |
 | 远程页面是否需要本地 Rust 命令 | **否**（默认不开放） | 需要时见 [§7](#7-src-tauri-capabilities权限配置) |
 
-**首次配置 vs 每次选择**：需求里这两句是冲突的（「首次点击要求用户提供并记录在配置文件」/「选择不需要持久化」）。本项目的处理是：
+**每次启动都要选，地址只设置一次**（需求里「首次点击要求用户提供并记录在配置文件」和「选择不需要持久化」看起来冲突，本项目按下面这条语义实现，已与需求方确认）：
 
-- **每次启动都显示选择界面**（满足「每次启动都重新选择」）；
-- **首次**点击「本地 / 远程」时弹出表单让用户确认地址，保存进 `config.json`；
-- 之后每次启动读同一份配置，点一下就直接连接（满足「以后直接调用」）；
+- **每次启动都显示选择界面**，必须点「本地」或「远程」——**「选择」本身不持久化**；
+- **首次**点击时弹出表单让用户确认地址，保存进 `config.json`——**「地址」持久化**；
+- 之后每次启动读同一份配置，点一下就直接连接，**不需要再设置地址**；
 - 地址随时可在「设置」里改。
+
+对应代码：`src/selector.js` 的 `pick()` 判断 `config.configured`——未配置过才弹表单，已配置直接 `connect(mode)`。
 
 ---
 
@@ -43,8 +45,10 @@ DSHTauri/
 ├── docs/
 │   └── TROUBLESHOOTING.md          # 第 11 项：常见错误与排查
 ├── scripts/
+│   ├── check-env.mjs               # 环境自检：cargo 不在 PATH 等问题直接给修复命令
+│   ├── env.sh                      # `source scripts/env.sh` 接入项目自带 Rust 工具链
 │   ├── make-icon.mjs               # 生成 app-icon.png（纯 Node，无需图形库）
-│   └── smoke-linux.sh              # Xvfb 下的无头冒烟测试（12 项断言）
+│   └── smoke-linux.sh              # Xvfb 下的无头冒烟测试（15 项断言）
 ├── src/                            # 前端（无框架、无构建步骤，直接嵌入二进制）
 │   ├── index.html                  # 选择界面
 │   ├── selector.css
@@ -573,7 +577,8 @@ sudo apt-get install -y \
 # ---------- 1. Node 22 + Rust stable ----------
 node -v          # 需要 >= 22；否则用 nvm：nvm install 22 && nvm use 22
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source "$HOME/.cargo/env"
+source "$HOME/.cargo/env"          # ★ 必须执行！否则 npm run tauri dev 会报
+                                   #   failed to run 'cargo metadata' ... No such file or directory
 rustc -Vv && cargo -V
 
 # ---------- 2. 拿到项目（二选一）----------
@@ -582,6 +587,12 @@ cd ~/projects/DSHTauri
 
 # 2b. 或者从零建一个空仓库
 #   mkdir -p ~/projects/DSHTauri && cd ~/projects/DSHTauri && git init
+
+# ---------- 2c. 环境自检（强烈建议先跑一次）----------
+node scripts/check-env.mjs
+#   Rust 若装在非标准位置（例如项目内的 .toolchain/），它会直接打印可复制的修复命令。
+#   本项目自带的工具链也可以一条命令接入当前 shell：
+#   source scripts/env.sh
 
 # ---------- 3. 安装依赖 ----------
 npm install                 # 生成 package-lock.json（只需一次，之后 CI 用 npm ci）
@@ -595,10 +606,10 @@ npm run tauri dev
 #   无桌面环境时用虚拟显示：
 #   xvfb-run -a -s "-screen 0 1400x900x24" npm run tauri dev
 
-# ---------- 5b.（可选）无头自动冒烟测试：12 项断言 ----------
+# ---------- 5b.（可选）无头自动冒烟测试：15 项断言 ----------
 sudo apt-get install -y xvfb xdotool wmctrl openbox dbus-x11
 (cd src-tauri && cargo build)          # 脚本用 target/debug/dshtauri
-bash scripts/smoke-linux.sh            # 期望输出：12 通过, 0 失败
+bash scripts/smoke-linux.sh            # 期望输出：15 通过, 0 失败
 
 # ---------- 6.（可选）验证 Windows 目标能编译，不需要 Windows 机器 ----------
 rustup target add x86_64-pc-windows-msvc
@@ -669,7 +680,7 @@ git push -u origin main
 
 ## 11. 常见错误与排查
 
-完整版见 **[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)**，覆盖你点名的 7 类问题：
+完整版见 **[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)**，覆盖你点名的 7 类问题，外加 1 类必踩的环境问题：
 
 1. [托盘图标不显示](docs/TROUBLESHOOTING.md#1-托盘图标不显示)
 2. [关闭窗口未隐藏到托盘](docs/TROUBLESHOOTING.md#2-关闭窗口未隐藏到托盘程序直接退出了)
@@ -678,6 +689,13 @@ git push -u origin main
 5. [remote capabilities 权限错误](docs/TROUBLESHOOTING.md#5-remote-capabilities-权限错误)
 6. [WebView2 加载远程 URL 白屏](docs/TROUBLESHOOTING.md#6-webview2-加载远程-url-白屏)
 7. [选择界面到主窗口的 URL 传递失败](docs/TROUBLESHOOTING.md#7-选择界面到主窗口的-url-传递失败)
+8. [`npm run tauri dev` 报 `cargo metadata ... No such file or directory`](docs/TROUBLESHOOTING.md#8-npm-run-tauri-dev-报-cargo-metadata--no-such-file-or-directory) ← **第一次跑最常踩，先看这条**
+
+**先跑一次环境自检，能省掉大半排查**：
+
+```bash
+node scripts/check-env.mjs      # 检查 Node / cargo / RUSTUP_HOME / Tauri CLI / 前端资源 / 构建目标
+```
 
 **遇到编译或打包错误时，请把这两样贴出来**（你要求的「先要完整日志」）：
 
@@ -701,7 +719,7 @@ npm run tauri build -- --bundles nsis --verbose 2>&1 | tail -100   # 完整打�
 | Artifact 中存在 NSIS `.exe` | ⏳ 需要 CI 运行后确认 | `upload-artifact` 路径 = `src-tauri/target/release/bundle/nsis/*`，`if-no-files-found: error` |
 | Windows 11 安装后功能正常 | ⏳ 需要你在 Windows 上确认 | — |
 
-复现方式：`bash scripts/smoke-linux.sh`（需要 `xvfb xdotool wmctrl openbox dbus-x11`）。当前结果：**12 通过 / 0 失败**。
+复现方式：`bash scripts/smoke-linux.sh`（需要 `xvfb xdotool wmctrl openbox dbus-x11`）。当前结果：**15 通过 / 0 失败**。
 
 ---
 
@@ -731,7 +749,7 @@ npm run tauri build -- --bundles nsis --verbose 2>&1 | tail -100   # 完整打�
 | Clippy 无告警 | `cargo clippy --all-targets` | ✅ 0 warning |
 | 图标 | `npm run icon` → `icons/icon.ico` | ✅ 6 档 16/24/32/48/64/256，内嵌 PNG |
 | 工作流 YAML | `python3 -c "yaml.safe_load(...)"` | ✅ 解析通过，`permissions: contents: write` 就位 |
-| 端到端冒烟 | `bash scripts/smoke-linux.sh` | ✅ 12 通过 / 0 失败 |
+| 端到端冒烟 | `bash scripts/smoke-linux.sh` | ✅ 15 通过 / 0 失败 |
 
 > 说明：`cargo check --target x86_64-pc-windows-msvc` 在 Debian 上需要 `llvm`（提供 `llvm-rc`，`tauri-build` 用它嵌入 Windows 资源）。这只影响**在 Linux 上预检 Windows 目标**；GitHub Actions 上用的是真正的 MSVC 工具链，不需要这一步。
 >

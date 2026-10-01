@@ -286,6 +286,9 @@ await invoke("open_main_window", {
 ## 附：快速自检清单
 
 ```bash
+# 0. 环境自检（先跑这个，能直接定位 90% 的「跑不起来」）
+node scripts/check-env.mjs
+
 # 1. 配置能过 schema
 npx --yes ajv-cli@5 validate -s <(curl -s https://schema.tauri.app/config/2) -d src-tauri/tauri.conf.json
 
@@ -296,3 +299,78 @@ cd src-tauri && cargo check --target x86_64-pc-windows-msvc
 # 3. 完整打包（只能在 Windows / CI 上做）
 npm run tauri build -- --bundles nsis --verbose
 ```
+
+---
+
+## 8. `npm run tauri dev` 报 `cargo metadata ... No such file or directory`
+
+**现象**（第一次跑必踩，实测过）：
+
+```text
+$ npm run tauri dev
+failed to run 'cargo metadata' command to get workspace directory:
+failed to run command cargo metadata --no-deps --format-version 1:
+No such file or directory (os error 2)
+```
+
+**根因**：Tauri CLI 在启动前会调用 `cargo metadata` 探测 workspace，而 **`cargo` 不在当前 shell 的 `PATH` 上**。跟项目代码、`tauri.conf.json` 都没关系。
+
+**一分钟定位**：
+
+```bash
+node scripts/check-env.mjs
+```
+
+它会告诉你 cargo 在哪、缺哪个环境变量，并**直接打印可以复制的修复命令**。
+
+### 情况 A：Rust 装在标准位置（rustup 默认），只是没 source
+
+```bash
+source "$HOME/.cargo/env"     # 立刻生效
+echo 'source "$HOME/.cargo/env"' >> ~/.bashrc   # 永久生效
+```
+
+验证：`cargo --version` 有输出。
+
+### 情况 B：`cargo` 能在 PATH 上找到，但运行报 rustup 错误
+
+```text
+error: rustup could not choose a version of cargo to run, because one wasn't
+specified explicitly, and no default is configured.
+```
+
+这是**只加了 PATH、没设 `RUSTUP_HOME`**。`cargo` 本身只是 rustup 的代理，它要靠 `RUSTUP_HOME` 找到真正的工具链（默认 `~/.rustup`）。三个变量缺一不可：
+
+```bash
+export CARGO_HOME="/path/to/cargo-home"
+export RUSTUP_HOME="/path/to/rustup-home"
+export PATH="$CARGO_HOME/bin:$PATH"
+```
+
+### 情况 C：Rust 装在项目内（本项目开发机就是这种）
+
+```bash
+source scripts/env.sh          # 项目自带脚本，一次搞定三个变量
+cargo --version
+npm run tauri dev
+```
+
+永久生效：
+
+```bash
+echo 'export CARGO_HOME="/root/projects/DSHTauri/.toolchain/cargo"' >> ~/.bashrc
+echo 'export RUSTUP_HOME="/root/projects/DSHTauri/.toolchain/rustup"' >> ~/.bashrc
+echo 'export PATH="$CARGO_HOME/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+### 情况 D：根本没装 Rust
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+```
+
+> 注意：`.toolchain/` 在 `.gitignore` 里，**不会**跟着仓库走。换机器/新克隆后要重新装 Rust（情况 D），不要指望拷过来就能用。
+>
+> 另外 `npm install` 如果报「added 0 packages」且 `node_modules/.bin/tauri` 不存在，多半是 `NODE_ENV=production` 导致 devDependencies 被跳过，用 `npm install --include=dev`。

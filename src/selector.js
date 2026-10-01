@@ -80,8 +80,8 @@ function render() {
     ? "自动启动本地服务"
     : "需手动启动服务";
   ui.footConfig.textContent = config.configured
-    ? `配置：${config.localUrl}  |  ${config.remoteUrl}`
-    : "首次使用：点击任一方式以填写并保存配置";
+    ? `已记住地址：本地 ${config.localUrl} ｜ 远程 ${config.remoteUrl}`
+    : "首次使用：点击任一方式以填写并保存地址（之后每次启动直接选择即可）";
 }
 
 /* ------------------------------------------------------------- setup panel */
@@ -257,7 +257,12 @@ ui.saveSetup.addEventListener("click", async () => {
     const loaded = await invoke("load_config");
     config = { ...DEFAULT_CONFIG, ...loaded };
     render();
-    setStatus("请选择连接方式。");
+    // 语义：每次启动都要选「本地 / 远程」，但地址只需在首次设置一次。
+    setStatus(
+      config.configured
+        ? "请选择连接方式（地址已记住，点右上角「设置」可修改）。"
+        : "请选择连接方式。",
+    );
   } catch (err) {
     render();
     setStatus(`读取配置失败，使用默认值：${err}`, "err");

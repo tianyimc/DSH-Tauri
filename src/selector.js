@@ -11,18 +11,23 @@
  * 说明：Tauri 2 会把 JS 的 camelCase 参数名转换成 Rust 的 snake_case。
  * 为避免歧义，这里所有参数都用「单个单词」的参数名（config / command / url / request），
  * 结构体内部字段由 Rust 侧 serde(rename_all = "camelCase") 负责映射。
+ *
+ * 配置语义（与需求方确认）：
+ *   - 「每次启动都要选本地 / 远程」——选择本身不持久化；
+ *   - 「地址只设置一次」——首次填写后写入 config.json，之后点一下就直接连；
+ *   - **本地和远程允许只配一个**，另一个留空即可；两个都留空不允许。
  */
 
-const { invoke } = window.__TAURI__.core;
+import {
+  DEFAULT_CONFIG,
+  MODE_LABEL,
+  buildConfig,
+  normalizeUrl,
+  urlOf,
+  validateConfig,
+} from "./config-rules.js";
 
-/** 与 Rust `AppConfig` 一一对应的默认值（Rust 侧也会兜底）。 */
-const DEFAULT_CONFIG = {
-  configured: false,
-  localUrl: "http://127.0.0.1:8080",
-  remoteUrl: "https://dsh.example.com",
-  autoStartLocal: false,
-  localStartCommand: "",
-};
+const { invoke } = window.__TAURI__.core;
 
 const el = (id) => document.getElementById(id);
 
@@ -33,6 +38,7 @@ const ui = {
   labelLocal: el("label-local"),
   labelRemote: el("label-remote"),
   badgeLocal: el("badge-local"),
+  badgeRemote: el("badge-remote"),
   inputLocal: el("input-local"),
   inputRemote: el("input-remote"),
   inputAutostart: el("input-autostart"),
@@ -40,6 +46,7 @@ const ui = {
   fieldCommand: el("field-command"),
   status: el("status"),
   footConfig: el("foot-config"),
+  footVersion: el("foot-version"),
   toggleSettings: el("toggle-settings"),
   saveSetup: el("save-setup"),
   cancelSetup: el("cancel-setup"),
@@ -48,10 +55,12 @@ const ui = {
 };
 
 let config = { ...DEFAULT_CONFIG };
-/** "first-run" | "edit" | null —— 决定“保存”按钮的行为 */
+/** "first-run" | "edit" | null —— 决定「保存」按钮的行为 */
 let setupMode = null;
-/** 首次配置时，保存完成后要连接的模式 */
+/** 首次配置 / 补配置时，保存完成后要连接的模式 */
 let pendingMode = null;
+/** 连接进行中，禁用两个卡片 */
+let busy = false;
 
 /* ------------------------------------------------------------------ utils */
 
@@ -60,28 +69,40 @@ function setStatus(message, kind = "") {
   ui.status.className = "status" + (kind ? " " + kind : "");
 }
 
-function setBusy(busy) {
-  ui.pickLocal.disabled = busy;
-  ui.pickRemote.disabled = busy;
+function setBusy(value) {
+  busy = value;
+  render();
 }
 
-function normalizeUrl(raw) {
-  return String(raw || "").trim().replace(/\/+$/, "");
-}
-
-function isHttpUrl(value) {
-  return /^https?:\/\/[^\s]+$/i.test(value);
-}
+/* ----------------------------------------------------------------- render */
 
 function render() {
-  ui.labelLocal.textContent = config.localUrl;
-  ui.labelRemote.textContent = config.remoteUrl;
-  ui.badgeLocal.textContent = config.autoStartLocal && config.localStartCommand.trim()
-    ? "自动启动本地服务"
-    : "需手动启动服务";
-  ui.footConfig.textContent = config.configured
-    ? `已记住地址：本地 ${config.localUrl} ｜ 远程 ${config.remoteUrl}`
-    : "首次使用：点击任一方式以填写并保存地址（之后每次启动直接选择即可）";
+  const hasLocal = Boolean(config.localUrl);
+  const hasRemote = Boolean(config.remoteUrl);
+
+  // 未配置的一侧仍然可点——点了会打开设置面板去补，而不是死按钮。
+  ui.pickLocal.disabled = busy;
+  ui.pickRemote.disabled = busy;
+  ui.pickLocal.classList.toggle("is-off", !hasLocal);
+  ui.pickRemote.classList.toggle("is-off", !hasRemote);
+
+  ui.labelLocal.textContent = hasLocal ? config.localUrl : "未配置（点击填写）";
+  ui.labelRemote.textContent = hasRemote ? config.remoteUrl : "未配置（点击填写）";
+
+  ui.badgeLocal.textContent = !hasLocal
+    ? "未配置"
+    : config.autoStartLocal && config.localStartCommand.trim()
+      ? "自动启动本地服务"
+      : "需手动启动服务";
+  ui.badgeRemote.textContent = hasRemote ? "直接加载远程页面" : "未配置";
+
+  if (!hasLocal && !hasRemote) {
+    ui.footConfig.textContent = "还没配置地址：点「设置」填写本地或远程地址（至少填一个）";
+  } else {
+    ui.footConfig.textContent = `已记住地址：本地 ${hasLocal ? config.localUrl : "（未配置）"} ｜ 远程 ${
+      hasRemote ? config.remoteUrl : "（未配置）"
+    }`;
+  }
 }
 
 /* ------------------------------------------------------------- setup panel */
@@ -94,7 +115,7 @@ function openSetup(mode, hint) {
   ui.inputCommand.value = config.localStartCommand;
   ui.setupHint.textContent =
     hint ||
-    "修改地址后会写入配置文件（下次启动仍然生效）。";
+    "本地和远程**至少填一个**，另一个留空即可。保存后写入配置文件，下次启动仍然生效。";
   ui.setup.hidden = false;
   ui.picker.hidden = mode === "first-run";
   syncCommandVisibility();
@@ -110,28 +131,21 @@ function closeSetup() {
 }
 
 function syncCommandVisibility() {
-  const on = ui.inputAutostart.checked;
+  // 没填本地地址时，「自动启动本地服务」没有意义。
+  const hasLocal = Boolean(normalizeUrl(ui.inputLocal.value));
+  const on = ui.inputAutostart.checked && hasLocal;
+  ui.inputAutostart.disabled = !hasLocal;
   ui.fieldCommand.style.opacity = on ? "1" : "0.45";
   ui.inputCommand.disabled = !on;
 }
 
 function readForm() {
-  return {
-    configured: true,
-    localUrl: normalizeUrl(ui.inputLocal.value),
-    remoteUrl: normalizeUrl(ui.inputRemote.value),
+  return buildConfig({
+    localUrl: ui.inputLocal.value,
+    remoteUrl: ui.inputRemote.value,
     autoStartLocal: ui.inputAutostart.checked,
-    localStartCommand: ui.inputCommand.value.trim(),
-  };
-}
-
-function validate(candidate) {
-  if (!isHttpUrl(candidate.localUrl)) return "本地 URL 无效，必须是 http:// 或 https:// 开头的地址。";
-  if (!isHttpUrl(candidate.remoteUrl)) return "远程 URL 无效，必须是 http:// 或 https:// 开头的地址。";
-  if (candidate.autoStartLocal && !candidate.localStartCommand) {
-    return "勾选了自动启动本地服务，但启动命令为空。";
-  }
-  return null;
+    localStartCommand: ui.inputCommand.value,
+  });
 }
 
 async function persist(candidate) {
@@ -172,7 +186,12 @@ async function waitForService(url) {
 }
 
 async function connect(mode) {
-  const url = mode === "local" ? config.localUrl : config.remoteUrl;
+  const url = urlOf(config, mode);
+  if (!url) {
+    openSetup("edit", `还没有配置${MODE_LABEL[mode]}地址，填写并保存后即可连接。`);
+    return;
+  }
+
   const startCommand =
     mode === "local" && config.autoStartLocal && config.localStartCommand.trim()
       ? config.localStartCommand.trim()
@@ -200,15 +219,26 @@ async function connect(mode) {
 }
 
 async function pick(mode) {
-  // 首次使用（或配置被清空）时，先让用户提供地址并落盘，之后直接连接。
+  if (busy) return;
+
+  // ① 首次使用：让用户填写 / 确认地址，保存后立即连接。
   if (!config.configured) {
     pendingMode = mode;
     openSetup(
       "first-run",
-      `首次使用：请确认${mode === "local" ? "本地" : "远程"}地址，保存后立即连接，以后点击即可直接进入。`,
+      `首次使用：请填写${MODE_LABEL[mode]}地址（本地和远程至少填一个，另一个可以留空），保存后立即连接。`,
     );
     return;
   }
+
+  // ② 已配置过，但这一侧没填地址：引导去补。
+  if (!urlOf(config, mode)) {
+    pendingMode = mode;
+    openSetup("edit", `还没有配置${MODE_LABEL[mode]}地址，填写并保存后即可连接。`);
+    return;
+  }
+
+  // ③ 正常连接。
   await connect(mode);
 }
 
@@ -225,10 +255,11 @@ ui.toggleSettings.addEventListener("click", () => {
 ui.cancelSetup.addEventListener("click", closeSetup);
 
 ui.inputAutostart.addEventListener("change", syncCommandVisibility);
+ui.inputLocal.addEventListener("input", syncCommandVisibility);
 
 ui.saveSetup.addEventListener("click", async () => {
   const candidate = readForm();
-  const problem = validate(candidate);
+  const problem = validateConfig(candidate);
   if (problem) {
     setStatus(problem, "err");
     return;
@@ -240,12 +271,12 @@ ui.saveSetup.addEventListener("click", async () => {
     return;
   }
 
-  if (setupMode === "first-run" && pendingMode) {
-    const mode = pendingMode;
-    closeSetup();
-    await connect(mode);
+  // 保存后如果明确知道用户想连哪一侧，就直接连。
+  const target = pendingMode && urlOf(config, pendingMode) ? pendingMode : null;
+  closeSetup();
+  if (target) {
+    await connect(target);
   } else {
-    closeSetup();
     setStatus("配置已保存。", "ok");
   }
 });
@@ -256,15 +287,25 @@ ui.saveSetup.addEventListener("click", async () => {
   try {
     const loaded = await invoke("load_config");
     config = { ...DEFAULT_CONFIG, ...loaded };
-    render();
-    // 语义：每次启动都要选「本地 / 远程」，但地址只需在首次设置一次。
-    setStatus(
-      config.configured
-        ? "请选择连接方式（地址已记住，点右上角「设置」可修改）。"
-        : "请选择连接方式。",
-    );
   } catch (err) {
-    render();
     setStatus(`读取配置失败，使用默认值：${err}`, "err");
+  }
+
+  // 版本号（v.A.B.C GenX）由 Rust 侧编译进去，这里只负责显示。
+  try {
+    ui.footVersion.textContent = await invoke("app_version");
+  } catch {
+    ui.footVersion.textContent = "";
+  }
+
+  render();
+
+  if (!config.localUrl && !config.remoteUrl) {
+    setStatus("请选择连接方式；首次使用需要先填写地址（本地 / 远程至少填一个）。");
+  } else if (!config.configured) {
+    setStatus("请选择连接方式。");
+  } else {
+    // 语义：每次启动都要选「本地 / 远程」，但地址只需在首次设置一次。
+    setStatus("请选择连接方式（地址已记住，点右上角「设置」可修改）。");
   }
 })();

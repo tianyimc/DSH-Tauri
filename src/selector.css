@@ -130,6 +130,22 @@ h1 {
   cursor: progress;
 }
 
+/* 未配置的一侧：仍然可点（点了会打开设置去补），只是视觉上弱化 */
+.card.is-off {
+  opacity: 0.6;
+  border-style: dashed;
+}
+
+.card.is-off:hover {
+  opacity: 1;
+}
+
+.card.is-off .card-icon {
+  background: transparent;
+  border: 1px dashed var(--border);
+  color: var(--muted);
+}
+
 .card-icon {
   display: grid;
   place-items: center;
@@ -200,6 +216,11 @@ h1 {
 .field-label {
   font-size: 12px;
   color: var(--muted);
+}
+
+.field-label .opt {
+  font-weight: 400;
+  opacity: 0.75;
 }
 
 input[type="text"],
@@ -300,12 +321,25 @@ button.ghost:hover {
 }
 
 .foot {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
   margin-top: auto;
   font-size: 11px;
   color: var(--muted);
   border-top: 1px solid var(--border);
   padding-top: 8px;
+}
+
+.foot #foot-config {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.foot .ver {
+  flex: none;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  opacity: 0.85;
 }

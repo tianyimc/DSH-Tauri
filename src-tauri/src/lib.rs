@@ -25,6 +25,16 @@ pub const SELECTOR_LABEL: &str = "selector";
 /// 主窗口的 label（选择完成后由 Rust 动态创建）。
 pub const MAIN_LABEL: &str = "main";
 
+/// 版本号（`v.A.B.C GenX`），由 `build.rs` 从 `Cargo.toml` + `version.json` 生成。
+///
+/// - `APP_VERSION`：`1.1.1`
+/// - `APP_GENERATION`：`GenX` 里的 X，Gen1 时不在界面上显示
+/// - `APP_DISPLAY_VERSION`：`v1.1.1` 或 `v1.1.1 Gen2`
+mod version_info {
+    include!(concat!(env!("OUT_DIR"), "/version_info.rs"));
+}
+pub use version_info::{APP_DISPLAY_VERSION, APP_GENERATION, APP_VERSION};
+
 const SELECTOR_TITLE: &str = "选择 DSH 连接方式";
 const SELECTOR_WIDTH: f64 = 560.0;
 const SELECTOR_HEIGHT: f64 = 460.0;
@@ -39,8 +49,13 @@ const TRAY_ID: &str = "dshtauri-tray";
 const MENU_SHOW: &str = "show";
 const MENU_QUIT: &str = "quit";
 
-const DEFAULT_LOCAL_URL: &str = "http://127.0.0.1:8080";
-const DEFAULT_REMOTE_URL: &str = "https://dsh.example.com";
+/// 本地 / 远程地址的**示例**（只出现在界面的占位符里，不写进默认配置）。
+///
+/// 默认配置里两个地址都是空字符串：本地和远程**允许只配一个**，
+/// 由用户在首次启动时按需填写。示例值见 `src/index.html` 的 placeholder。
+pub const EXAMPLE_LOCAL_URL: &str = "http://127.0.0.1:3080";
+pub const EXAMPLE_REMOTE_URL: &str = "https://dsh.example.com";
+pub const EXAMPLE_LOCAL_COMMAND: &str = "dsh web";
 
 /// 托盘是否创建成功。
 ///
@@ -58,29 +73,19 @@ const TRAY_ICON_ON_LIGHT: &[u8] = include_bytes!("../icons/tray-light.png");
 ///
 /// 前端首次点击「本地 / 远程」时会要求用户确认地址，保存后再连接；
 /// 之后的每次启动都读取这里，直接点击即可。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AppConfig {
     /// 是否已经完成首次配置。
     pub configured: bool,
+    /// 本地地址。**默认为空**——本地和远程允许只配一个，由用户首次启动时按需填写。
     pub local_url: String,
+    /// 远程地址。默认为空，理由同上。
     pub remote_url: String,
     /// 选择「本地」时是否自动执行 `local_start_command`。
     pub auto_start_local: bool,
     /// 启动本地 DSH 服务的命令（Windows 下通过 PowerShell 后台执行）。
     pub local_start_command: String,
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            configured: false,
-            local_url: DEFAULT_LOCAL_URL.to_string(),
-            remote_url: DEFAULT_REMOTE_URL.to_string(),
-            auto_start_local: false,
-            local_start_command: String::new(),
-        }
-    }
 }
 
 /// 前端 `open_main_window({ request })` 的载荷。
@@ -219,7 +224,7 @@ fn setup_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let menu = Menu::with_items(app, &[&show_item, &separator, &quit_item])?;
 
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
-        .tooltip(MAIN_TITLE)
+        .tooltip(format!("{MAIN_TITLE} {APP_DISPLAY_VERSION}"))
         .menu(&menu)
         // 左键单击直接唤出窗口，右键才弹菜单。
         .show_menu_on_left_click(false)
@@ -293,6 +298,12 @@ fn probe_url(url: String) -> Result<bool, String> {
     Ok(probe_tcp(host, port))
 }
 
+/// 返回显示用版本号：`v1.1.1` 或 `v1.1.1 Gen2`。
+#[tauri::command]
+fn app_version() -> String {
+    APP_DISPLAY_VERSION.to_string()
+}
+
 /// 打开主窗口并加载 `request.url`，最后关闭选择窗口。
 #[tauri::command]
 fn open_main_window(app: AppHandle, request: OpenRequest) -> Result<(), String> {
@@ -341,7 +352,8 @@ pub fn run() {
             save_config,
             start_local_service,
             probe_url,
-            open_main_window
+            open_main_window,
+            app_version
         ])
         .setup(|app| {
             match setup_tray(app.handle()) {
@@ -439,12 +451,38 @@ mod tests {
     }
 
     #[test]
-    fn default_config_points_at_local_and_remote() {
+    fn default_config_has_empty_urls() {
         let config = AppConfig::default();
         assert!(!config.configured, "默认应为「未配置」，前端才会弹首次配置表单");
-        assert!(config.local_url.starts_with("http://127.0.0.1"));
-        assert!(config.remote_url.starts_with("https://"));
+        // 地址留空：本地和远程允许只配一个，由用户首次启动时填写。
+        assert!(config.local_url.is_empty());
+        assert!(config.remote_url.is_empty());
         assert!(!config.auto_start_local);
+        assert!(config.local_start_command.is_empty());
+        // 示例值只用于界面占位符，不该混进默认配置。
+        assert_eq!(EXAMPLE_LOCAL_URL, "http://127.0.0.1:3080");
+        assert_eq!(EXAMPLE_REMOTE_URL, "https://dsh.example.com");
+        assert_eq!(EXAMPLE_LOCAL_COMMAND, "dsh web");
+    }
+
+    /// 只配一个地址也必须能正常存取（这是明确的产品需求）。
+    #[test]
+    fn config_allows_only_one_url() {
+        for (local, remote) in [("http://127.0.0.1:3080", ""), ("", "https://dsh.example.com")] {
+            let json = format!(
+                r#"{{"configured":true,"localUrl":"{local}","remoteUrl":"{remote}"}}"#
+            );
+            let config: AppConfig = serde_json::from_str(&json).unwrap();
+            assert_eq!(config.local_url, local);
+            assert_eq!(config.remote_url, remote);
+
+            // 再序列化回去，空的那一侧应该保持空字符串（而不是变成 null）。
+            let back = serde_json::to_string(&config).unwrap();
+            assert!(back.contains(r#""localUrl":""#) || !local.is_empty());
+            let again: AppConfig = serde_json::from_str(&back).unwrap();
+            assert_eq!(again.local_url, local);
+            assert_eq!(again.remote_url, remote);
+        }
     }
 
     /// 前端用 camelCase 读写配置（见 src/selector.js），这个契约不能破。
@@ -464,12 +502,42 @@ mod tests {
         assert_eq!(back.local_url, AppConfig::default().local_url);
     }
 
+    /// `Cargo.toml` 与 `tauri.conf.json` 的版本号必须一致，
+    /// 否则「安装包版本」和「程序自报版本」会对不上。
+    #[test]
+    fn app_version_matches_tauri_config() {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(
+            conf["version"].as_str().unwrap(),
+            APP_VERSION,
+            "版本号不一致，用 `node scripts/version.mjs --set X.Y.Z` 同步"
+        );
+        // 绑到变量，避免 clippy 把常量断言判成无意义断言。
+        let generation: u32 = APP_GENERATION;
+        assert!(generation >= 1, "GenX 最小为 1");
+    }
+
+    /// 版本显示规则：Gen1 不显示；从 Gen2 起显示 ` GenX`。
+    #[test]
+    fn display_version_hides_gen1() {
+        let expected = if APP_GENERATION >= 2 {
+            format!("v{APP_VERSION} Gen{APP_GENERATION}")
+        } else {
+            format!("v{APP_VERSION}")
+        };
+        assert_eq!(APP_DISPLAY_VERSION, expected);
+        if APP_GENERATION == 1 {
+            assert!(!APP_DISPLAY_VERSION.contains("Gen"), "Gen1 不该显示 Gen");
+        }
+    }
+
     /// 配置文件缺字段 / 是坏 JSON 时，必须退回默认值而不是崩掉。
     #[test]
     fn config_deserializes_leniently() {
         let partial: AppConfig = serde_json::from_str(r#"{"localUrl":"http://x:1"}"#).unwrap();
         assert_eq!(partial.local_url, "http://x:1");
-        assert_eq!(partial.remote_url, DEFAULT_REMOTE_URL, "缺失字段应取默认值");
+        assert!(partial.remote_url.is_empty(), "缺失字段应取默认值（空）");
         assert!(!partial.configured);
 
         assert!(serde_json::from_str::<AppConfig>("{ not json").is_err());

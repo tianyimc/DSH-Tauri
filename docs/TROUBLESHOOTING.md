@@ -220,14 +220,14 @@ npm run tauri dev
 
 按顺序排查：
 
-1. **URL 本身打不开**。先在 Windows 上用 Edge 打开同一个 URL。注意本项目的「本地」地址是 `http://127.0.0.1:8080`，指**运行 DSHTauri 的那台 Windows 机器自己**，不是 Debian 开发机。
+1. **URL 本身打不开**。先在 Windows 上用 Edge 打开同一个 URL。注意本项目的「本地」地址是 `http://127.0.0.1:3080`，指**运行 DSHTauri 的那台 Windows 机器自己**，不是 Debian 开发机。
 2. **本地服务没起来**。如果勾选了自动启动，命令是异步执行的，服务可能需要几秒。本项目在拉起服务后由**前端轮询** `probe_url`（`lib.rs` 里的单次 TCP 探测，300ms 超时）直到端口可连接，最多等 20 秒，然后才加载页面。若 20 秒后仍未就绪，说明命令本身失败了：
    - PowerShell 里的命令必须**非交互**：加 `-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden`（本项目已加）。
-   - 命令里如果依赖某个工作目录，先 `Set-Location`：`Set-Location C:\dsh; dsh web --port 8080`。
+   - 命令里如果依赖某个工作目录，先 `Set-Location`：`Set-Location C:\dsh; dsh web`。
    - 想看它到底报什么错：把命令改成先重定向日志，例如
-     `dsh web --port 8080 *> $env:TEMP\dshtauri-service.log`，然后看那个文件。
+     `dsh web *> $env:TEMP\dshtauri-service.log`，然后看那个文件。
 3. **HTTPS 证书不受信任**（自签名证书）→ WebView2 会拦截，表现为白屏或 `NET::ERR_CERT_AUTHORITY_INVALID`。用可信证书，或在开发期改用 `http://`。
-4. **混合内容**：页面是 `https://`，内部又请求 `http://127.0.0.1:8080` → 被浏览器内核拦掉。反过来（`http` 页面请求 `https`）没问题。
+4. **混合内容**：页面是 `https://`，内部又请求 `http://127.0.0.1:3080` → 被浏览器内核拦掉。反过来（`http` 页面请求 `https`）没问题。
 5. **CSP**：本项目 `app.security.csp = null`，即**不注入任何 CSP**，所以不会因为 CSP 白屏。如果你自己设置了 `csp`，远程页面的 `script-src` / `connect-src` 必须显式放行，否则白屏 + 控制台报 `Refused to ...`。
 6. **想开 DevTools 看真实错误**：`WebviewWindowBuilder` 上链一个 `.devtools(true)`（debug 构建默认可用），或临时用 `tauri dev` 跑，然后在窗口里按 `F12`。这是定位白屏最快的手段。
 7. **代理 / 企业网络**：WebView2 走系统代理。若需要独立代理，可在窗口配置里用 `proxyUrl`，或给 WebView2 传 `additionalBrowserArgs`。
@@ -246,18 +246,17 @@ npm run tauri dev
 
 Tauri 2 会把 JS 的 **camelCase 参数名转成 Rust 的 snake_case**。踩坑点在于字段名：
 
-- Rust：`pub start_command: Option<String>` + `#[serde(rename_all = "camelCase")]` → JS 传 `startCommand`。
-- 命令参数本身用了单词名 `request`，避免歧义。
+- Rust：`#[serde(rename_all = "camelCase")]` 的结构体字段 `local_url` → JS 侧 `localUrl`。
+- 命令参数本身用了单词名（`request` / `config` / `command` / `url`），避免歧义。
 
 正确调用（见 `src/selector.js`）：
 
 ```js
-await invoke("open_main_window", {
-  request: { url: "http://127.0.0.1:8080", startCommand: null },
-});
+await invoke("open_main_window", { request: { url: "http://127.0.0.1:3080" } });
 ```
 
 如果字段名写错，Tauri 会直接报 `invalid args`，并在 `tauri dev` 的终端里打印缺失字段名。
+`AppConfig` 的 camelCase 契约有单测守着（`npm run test:rust` 的 `config_serializes_as_camel_case`）。
 
 ### 7.2 点了按钮完全没反应
 
@@ -268,6 +267,7 @@ await invoke("open_main_window", {
 ### 7.3 主窗口打开了但 URL 不对
 
 - 前端传的是 `config.localUrl` / `config.remoteUrl`，来自 `load_config`。如果配置文件里是旧值，点「设置」改完**必须点保存**（保存后页面底部会显示 `配置已保存。`）。
+- **只配了一个地址时**，另一侧是空的：点那一侧的卡片不会连接，而是打开设置面板让你补地址——这是设计行为，不是 bug。
 - 配置文件位置：
   - Windows：`%APPDATA%\com.dsh.dshtauri\config.json`
   - Linux：`~/.config/com.dsh.dshtauri/config.json`

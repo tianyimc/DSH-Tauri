@@ -5,7 +5,7 @@
   "windows": ["main"],
   "local": false,
   "remote": {
-    "urls": ["http://127.0.0.1:8080", "https://dsh.example.com"]
+    "urls": ["http://127.0.0.1:3080", "https://dsh.example.com"]
   },
   "permissions": ["core:default"]
 }

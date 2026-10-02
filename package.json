@@ -1,7 +1,7 @@
 {
   "name": "dshtauri",
   "private": true,
-  "version": "0.1.0",
+  "version": "1.1.1",
   "description": "DSHTauri - lightweight Tauri 2 desktop shell for the DSH WebUI (WebView2, system tray, local/remote selector)",
   "type": "module",
   "engines": {
@@ -13,7 +13,13 @@
     "build": "tauri build",
     "build:nsis": "tauri build --bundles nsis",
     "icon": "tauri icon app-icon.png",
-    "posticon": "node scripts/post-icon.mjs"
+    "posticon": "node scripts/post-icon.mjs",
+    "check": "node scripts/check-env.mjs",
+    "ver": "node scripts/version.mjs",
+    "test": "npm run test:js && npm run test:rust",
+    "test:js": "node --test scripts/test-rules.mjs",
+    "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "smoke": "bash scripts/smoke-linux.sh"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.12.1"

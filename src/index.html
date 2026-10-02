@@ -24,35 +24,45 @@
           <span class="card-icon" aria-hidden="true">⌂</span>
           <span class="card-body">
             <span class="card-title">本地</span>
-            <span class="card-url" id="label-local">http://127.0.0.1:8080</span>
+            <span class="card-url" id="label-local">未配置（点击填写）</span>
           </span>
-          <span class="card-badge" id="badge-local">可选自动启动服务</span>
+          <span class="card-badge" id="badge-local">未配置</span>
         </button>
 
         <button id="pick-remote" class="card" type="button">
           <span class="card-icon" aria-hidden="true">☁</span>
           <span class="card-body">
             <span class="card-title">远程</span>
-            <span class="card-url" id="label-remote">https://dsh.example.com</span>
+            <span class="card-url" id="label-remote">未配置（点击填写）</span>
           </span>
-          <span class="card-badge">直接加载远程页面</span>
+          <span class="card-badge" id="badge-remote">未配置</span>
         </button>
       </section>
 
       <!-- ============ 首次配置 / 设置面板 ============ -->
       <section id="setup" class="setup" hidden>
         <p class="setup-hint" id="setup-hint">
-          首次使用，请确认下面的地址。保存后会写入配置文件，之后直接点击“本地 / 远程”即可连接。
+          本地和远程<strong>至少填一个</strong>，另一个留空即可。保存后写入配置文件，之后每次启动直接选择即可。
         </p>
 
         <label class="field">
-          <span class="field-label">本地 URL</span>
-          <input id="input-local" type="text" spellcheck="false" placeholder="http://127.0.0.1:8080" />
+          <span class="field-label">本地 URL<span class="opt">（可留空）</span></span>
+          <input
+            id="input-local"
+            type="text"
+            spellcheck="false"
+            placeholder="示例：http://127.0.0.1:3080"
+          />
         </label>
 
         <label class="field">
-          <span class="field-label">远程 URL</span>
-          <input id="input-remote" type="text" spellcheck="false" placeholder="https://dsh.example.com" />
+          <span class="field-label">远程 URL<span class="opt">（可留空）</span></span>
+          <input
+            id="input-remote"
+            type="text"
+            spellcheck="false"
+            placeholder="示例：https://dsh.example.com"
+          />
         </label>
 
         <label class="check">
@@ -66,7 +76,7 @@
             id="input-command"
             rows="3"
             spellcheck="false"
-            placeholder="dsh web --port 8080"
+            placeholder="示例：dsh web"
           ></textarea>
           <span class="field-help">
             通过 <code>powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "…"</code>
@@ -83,10 +93,12 @@
       <p id="status" class="status" role="status"></p>
       <footer class="foot">
         <span id="foot-config">配置未加载</span>
+        <span id="foot-version" class="ver"></span>
       </footer>
     </main>
 
-    <!-- Tauri 2 全局 API（tauri.conf.json -> app.withGlobalTauri = true） -->
-    <script src="selector.js"></script>
+    <!-- Tauri 2 全局 API（tauri.conf.json -> app.withGlobalTauri = true）。
+         用 ES module：selector.js 从 config-rules.js 引入可测试的配置校验逻辑。 -->
+    <script type="module" src="selector.js"></script>
   </body>
 </html>

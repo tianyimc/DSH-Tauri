@@ -24,8 +24,15 @@ jobs:
   build-windows:
     name: Build NSIS installer (Windows x86_64)
     runs-on: windows-latest
+    # 版本号全部由 scripts/version.mjs 统一推导（v.A.B.C GenX）
     outputs:
       version: ${{ steps.app.outputs.version }}
+      generation: ${{ steps.app.outputs.generation }}
+      display: ${{ steps.app.outputs.display }}
+      release_name: ${{ steps.app.outputs.release_name }}
+      asset_name: ${{ steps.app.outputs.asset_name }}
+      tag: ${{ steps.app.outputs.tag }}
+      title: ${{ steps.app.outputs.title }}
 
     steps:
       - name: Checkout
@@ -49,15 +56,18 @@ jobs:
           # 缓存 key 里带上目标三元组，避免与其它平台缓存串味
           key: windows-x86_64-msvc
 
-      - name: Read app version
+      - name: Resolve version (v.A.B.C GenX)
         id: app
         shell: pwsh
-        run: |
-          $conf = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
-          "version=$($conf.version)" >> $env:GITHUB_OUTPUT
+        run: node scripts/version.mjs --github
 
       - name: Install frontend dependencies
         run: npm ci
+
+      - name: Run tests (JS config rules + Rust unit tests)
+        run: |
+          npm run test:js
+          npm run test:rust
 
       - name: Build NSIS bundle
         run: npm run tauri build -- --bundles nsis
@@ -69,7 +79,8 @@ jobs:
       - name: Upload NSIS installer
         uses: actions/upload-artifact@v4
         with:
-          name: dshtauri-nsis-${{ steps.app.outputs.version }}-${{ github.sha }}
+          # 名字里带 Gen，同一个 C 版本的多代包不会互相覆盖
+          name: ${{ steps.app.outputs.release_name }}-nsis
           path: src-tauri/target/release/bundle/nsis/*
           if-no-files-found: error
           retention-days: 30
@@ -85,20 +96,25 @@ jobs:
       - name: Download installer artifact
         uses: actions/download-artifact@v4
         with:
-          pattern: dshtauri-nsis-*
+          pattern: ${{ needs.build-windows.outputs.release_name }}-nsis
           path: dist
           merge-multiple: true
 
-      - name: Show files
-        run: ls -l dist
+      - name: Rename installer to release asset name
+        run: |
+          set -euo pipefail
+          asset="${{ needs.build-windows.outputs.asset_name }}"
+          src="$(ls dist/*.exe | head -1)"
+          mv "$src" "dist/$asset"
+          ls -l dist
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          # 由 action 自动创建该 tag（指向本次运行的 commit）
-          tag_name: v${{ needs.build-windows.outputs.version }}
+          # 同一 C 版本的多代包各自一个 tag（v1.1.11 / v1.1.11Gen2），不会互相覆盖
+          tag_name: ${{ needs.build-windows.outputs.tag }}
           target_commitish: ${{ github.sha }}
-          name: DSHTauri v${{ needs.build-windows.outputs.version }}
+          name: ${{ needs.build-windows.outputs.title }}
           draft: false
           prerelease: false
           files: dist/*.exe

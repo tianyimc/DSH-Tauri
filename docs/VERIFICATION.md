@@ -3,9 +3,11 @@
 本文档记录「点『网页对话』卡死」与「顶栏错位」两个缺陷的**根因、修复与验证证据**，
 并明确列出**哪些结论还没有被验证**（只能靠 Windows 真机 / CI 确认）。
 
-> 结论先行：**代码层面的修复已完成并通过本地全部可跑的检查；
-> Windows 真机上的顶栏几何与「网页对话」不卡死由 CI 的 `windows-latest` 冒烟测试把关。**
-> 详见文末「尚未验证的部分」。
+> 结论先行：**修复已完成，并已在目标平台（Windows）上通过真机冒烟测试验证。**
+> CI run [`37038131957`](https://github.com/tianyimc/DSH-Tauri/actions/runs/37038131957)
+> 在 `windows-latest` 上：**冒烟测试 37 通过 / 0 失败**，NSIS 安装包构建成功，
+> 单测（Rust + JS + 静态校验）全绿。
+> 仍然只能靠人工确认的只有**观感与手感**（见文末）。
 
 ---
 
@@ -116,6 +118,29 @@ Window "main"（纯 Window，不加载页面，decorations(false)）
   `IsHungAppWindow == false`、`WM_NULL` 不超时、进程存活、**子 webview 数量 +1**，
   再点一次收起后仍响应。
 
+#### 真机实测结果（CI run 37038131957，`windows-latest`，37/37 通过）
+
+枚举主窗口子窗口的实际几何（`WRY_WEBVIEW` 是 Tauri 为每个子 webview 建的容器）：
+
+```text
+客户区=1028x779 DPI=96 scale=1.00 期望顶栏高=40px(±6)
+  子窗口 class=WRY_WEBVIEW rect=(0,0)   1028x40     ← 顶栏
+  子窗口 class=WRY_WEBVIEW rect=(0,40)  1028x739    ← 内容
+[PASS] 顶栏子 webview 位于客户区顶部且高≈40×scale（未被 DPI 双重缩放）
+[PASS] 内容子 webview 在顶栏下方且占据主体高度
+```
+
+- 顶栏 `(0,0) 1028x40`、内容 `(0,40) 1028x739`，**正好差 40**，尺寸精确吻合 ——
+  **DPI 双重缩放已消除**（旧实现这里会是 80 而不是 40）。
+- 缺陷 1 的回归断言全绿，且运行日志里能看到命令链**走完了**：
+
+```text
+[DSHTauri] 顶栏 webview 已创建
+[DSHTauri] 主窗口已创建：pos=Ok(PhysicalPosition { x: 0, y: 0 }) size=Ok(PhysicalSize { width: 1044, height: 788 })
+[DSHTauri] 对话侧栏 webview 已创建     ← add_child 返回了，没有在主线程死锁
+[DSHTauri] 对话侧栏已隐藏             ← 第二次点击（收起）也正常返回
+```
+
 ### 2.4 一个必须记录的负面结果：Linux 上的子 webview 布局不正确
 
 在 Xvfb 里实拍（`.analysis/shots/run-1-connected.png`）可见：
@@ -135,17 +160,23 @@ Window "main"（纯 Window，不加载页面，decorations(false)）
 
 ---
 
-## 3. 尚未验证的部分（需要 Windows 真机 / CI）
+## 3. 尚未验证的部分（需要人工确认）
 
-1. **Windows 上子 webview 的几何是否真的等于传入的逻辑坐标**
-   （`scripts/smoke-windows.ps1` §6.5 会在 CI 上判定）。
-2. **Windows 上点「网页对话」是否真的不再卡死**
-   （§6.6 用 `IsHungAppWindow` + 反复切换判定）。
-3. **视觉细节是否与官方桌面端一致**：底色 `#1b1b1c`、无分隔线、
-   按钮 hover（关闭为 `#c42b1c`）、顶栏在系统深色/浅色主题下的实际观感。
-   代码与实测色值已对齐（见 `src/titlebar/titlebar.css` 的注释），但**观感需人工确认**。
-4. **鼠标交互手感**：拖动窗口、双击最大化、最大化时禁用拖动。
-5. **`prefers-color-scheme`**：Xvfb 下报的是浅色主题，Windows 深色主题未实测。
+以下**已经由 CI 在 `windows-latest` 上验证通过**（见 2.3 的真机实测结果），不再列为待验证：
+
+- ~~Windows 上子 webview 的几何是否等于传入的逻辑坐标~~ → **已验证**：顶栏 `1028x40 @ (0,0)`。
+- ~~Windows 上点「网页对话」是否真的不再卡死~~ → **已验证**：命令链走完、`IsHungAppWindow=false`、
+  可反复切换。
+
+仍然只能靠**人工**确认的：
+
+1. **观感**：底色 `#1b1b1c`、无分隔线、按钮 hover（关闭为 `#c42b1c`）、
+   以及在系统深色/浅色主题下的实际效果。色值已按 P3 实测对齐（见
+   `src/titlebar/titlebar.css` 注释），但好不好看要人看。
+2. **手感**：拖动窗口、双击最大化、最大化时禁用拖动、菜单弹出位置。
+3. **`prefers-color-scheme`**：CI 的 Xvfb/Windows runner 主题与用户机器不同，
+   深色主题下的实际渲染未单独断言。
+4. **顶栏按钮宽度 46px、菜单 hover 色** -- 官方 P3 未测到这两个值，属合理推断。
 
 ### 已知的、有意接受的取舍
 

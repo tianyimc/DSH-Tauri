@@ -59,6 +59,7 @@ public static class Win32 {
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
   [DllImport("user32.dll")] public static extern void mouse_event(uint flags, int dx, int dy, uint data, UIntPtr extra);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
 
   [DllImport("user32.dll", SetLastError = true)]
   public static extern IntPtr SendMessageTimeout(IntPtr h, uint msg, IntPtr w, IntPtr l, uint flags, uint timeout, out IntPtr result);
@@ -263,6 +264,8 @@ try {
     Check "主窗口可见" ([Win32]::IsWindowVisible($main))
     Start-Sleep -Seconds 3
     Check "本地服务($Port)收到 WebView2 的请求" ((Get-Content $LOG_A -Raw) -match "GET /") "日志：'$(Get-Content $LOG_A -Raw)'"
+    # 这条走的是 Tauri 自己的 show/hide，可见性状态同步，断言有效
+    Check "首次连接后选择窗口已隐藏" (-not [Win32]::IsWindowVisible($sel))
 
     Write-Host "== 7. 关闭主窗口 = 隐藏到托盘 =="
     [void][Win32]::PostMessage($main, [Win32]::WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero)
@@ -295,7 +298,13 @@ try {
     $logB = Get-Content $LOG_B -Raw
     Check "新地址($Port2)收到 WebView2 的请求（确实切过去了）" ($logB -match "GET /") "日志：'$logB'"
   }
-  Check "切换后选择窗口重新隐藏" (-not [Win32]::IsWindowVisible($sel))
+  # 这里**不**断言「选择窗口重新隐藏」：本测试是用外部 ShowWindow 把它显示出来的，
+  # 绕过了 Tauri/tao 内部的可见性状态；tao 认为它「本来就是隐藏的」，
+  # set_visible(false) 不产生差异所以不会调用 ShowWindow —— 这是测试手段的限制，
+  # 不是产品问题（真实流程走托盘 -> selector.show()，状态是同步的；
+  # 「连接后选择窗口隐藏」已在第 6 节用有效路径断言过）。
+  Check "切换后主窗口仍是活动窗口" ([Win32]::GetForegroundWindow() -eq $main) `
+    "foreground=$([Win32]::GetForegroundWindow()) main=$main"
 
   Stop-App $proc
   Start-Sleep -Seconds 3

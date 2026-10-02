@@ -1,7 +1,7 @@
 {
   "name": "dshtauri",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "DSHTauri - lightweight Tauri 2 desktop shell for the DSH WebUI (WebView2, system tray, local/remote selector)",
   "type": "module",
   "engines": {

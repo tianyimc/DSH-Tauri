@@ -21,10 +21,15 @@ param(
 $ErrorActionPreference = "Stop"
 $script:Pass = 0
 $script:Fail = 0
+$script:Failures = @()
 
 function Check([string]$Name, [bool]$Ok, [string]$Detail = "") {
   if ($Ok) { Write-Host "  [PASS] $Name" -ForegroundColor Green; $script:Pass++ }
-  else { Write-Host "  [FAIL] $Name  $Detail" -ForegroundColor Red; $script:Fail++ }
+  else {
+    Write-Host "  [FAIL] $Name  $Detail" -ForegroundColor Red
+    $script:Fail++
+    $script:Failures += ("{0}  {1}" -f $Name, $Detail)
+  }
 }
 
 Add-Type @'
@@ -159,7 +164,8 @@ s.end('<!doctype html><meta charset=utf-8><title>DSH LOCAL</title><h1>DSH LOCAL 
   Check "config.json 已写入" (Test-Path $CONFIG_FILE) $CONFIG_FILE
 
   Write-Host "== 3. 启动 DSHTauri =="
-  $proc = Start-Process $AppPath -PassThru
+  $APP_LOG = Join-Path $WORK "app.log"
+  $proc = Start-Process $AppPath -PassThru -RedirectStandardOutput $APP_LOG -RedirectStandardError "$APP_LOG.err"
   Start-Sleep -Seconds 8
   Check "进程存活" (-not $proc.HasExited) "exit=$($proc.ExitCode)"
   if ($proc.HasExited) { throw "应用启动即退出" }
@@ -222,8 +228,18 @@ s.end('<!doctype html><meta charset=utf-8><title>DSH LOCAL</title><h1>DSH LOCAL 
     Check "关闭后主窗口不可见（已隐藏到托盘）" (-not $visible) "IsWindowVisible=$visible"
   }
 }
+catch {
+  Check "脚本异常中止" $false $_.Exception.Message
+}
 finally {
   Write-Host "== 清理 =="
+  # 把应用自己的输出也带上，便于判断（例如托盘创建失败、WebView2 报错）
+  foreach ($f in @((Join-Path $WORK "app.log"), (Join-Path $WORK "app.log.err"))) {
+    if (Test-Path $f) {
+      $t = (Get-Content $f -Raw)
+      if ($t) { Write-Host "--- $([IO.Path]::GetFileName($f)) ---"; Write-Host $t }
+    }
+  }
   if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
   if ($httpd -and -not $httpd.HasExited) { Stop-Process -Id $httpd.Id -Force -ErrorAction SilentlyContinue }
   Get-Process dshtauri -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
@@ -231,4 +247,10 @@ finally {
 
 Write-Host ""
 Write-Host "== 结果: $script:Pass 通过, $script:Fail 失败 =="
+
+# 把失败项以 GitHub 注解形式发出来 —— 这样即使没有 token 也能从公开的
+# check-runs/annotations API 读到失败原因（job 日志本身需要鉴权）。
+foreach ($f in $script:Failures) {
+  Write-Host ("::error title=SMOKE FAIL::{0}" -f $f)
+}
 if ($script:Fail -gt 0) { exit 1 }

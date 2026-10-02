@@ -43,29 +43,29 @@
 
 | 位 | 含义 | 当前值 |
 | --- | --- | --- |
-| `A` | 文集网页核心版本。只有网页核心发生重大变化时才提升。 | `1` |
-| `B` | 重要功能版本。当前 GUI 管理器属于重要更新，因此是 `1.1.x`。 | `1` |
+| `A` | 文集网页核心版本。只有网页核心发生重大变化时才提升。 | `0` |
+| `B` | 重要功能版本。当前 GUI 管理器属于重要更新，因此是 `0.1.x`。 | `1` |
 | `C` | 普通更新，例如小功能、优化和修复。 | `1` |
 | `GenX` | **同一个 `C` 小版本内部**更小的修复快照（补丁位），只增不减。 | `1` |
 
 **硬性规则**
 
-- 一旦 `C` 提升（例如 `1.1.10 → 1.1.11`），`Gen` **立即重置为 1**——`Gen` 只在 `1.1.11` 内部递增（`Gen1 → Gen2 → Gen3 …`）。
-  不同 `C` 的 `Gen` 互不相干：`1.1.10 Gen3` 的下一版是 `1.1.11`（即 `1.1.11 Gen1`），**不是** `1.1.11 Gen4`。
-- `Gen1` 不显示：`generation` 为 `1` 或缺失时显示 `v1.1.11`；从 `2` 起才显示 `v1.1.11 Gen2`、`v1.1.11 Gen3`。
+- 一旦 `C` 提升（例如 `0.1.10 → 0.1.11`），`Gen` **立即重置为 1**——`Gen` 只在 `0.1.11` 内部递增（`Gen1 → Gen2 → Gen3 …`）。
+  不同 `C` 的 `Gen` 互不相干：`0.1.10 Gen3` 的下一版是 `0.1.11`（即 `0.1.11 Gen1`），**不是** `0.1.11 Gen4`。
+- `Gen1` 不显示：`generation` 为 `1` 或缺失时显示 `v0.1.11`；从 `2` 起才显示 `v0.1.11 Gen2`、`v0.1.11 Gen3`。
 - 发布包文件名同样按这个规则，因此同一个 `C` 版本的多代包不会互相覆盖：
 
 | generation | 显示版本 | 发布包文件名 | Git tag |
 | --- | --- | --- | --- |
-| `1` | `v1.1.11` | `DSHTauri-v1.1.11-setup.exe` | `v1.1.11` |
-| `2` | `v1.1.11 Gen2` | `DSHTauri-v1.1.11Gen2-setup.exe` | `v1.1.11Gen2` |
-| `3` | `v1.1.11 Gen3` | `DSHTauri-v1.1.11Gen3-setup.exe` | `v1.1.11Gen3` |
+| `1` | `v0.1.11` | `DSHTauri-v0.1.11-setup.exe` | `v0.1.11` |
+| `2` | `v0.1.11 Gen2` | `DSHTauri-v0.1.11Gen2-setup.exe` | `v0.1.11Gen2` |
+| `3` | `v0.1.11 Gen3` | `DSHTauri-v0.1.11Gen3-setup.exe` | `v0.1.11Gen3` |
 
-> 规则里的示例项目名是 `ProjectMe`（`ProjectMe-v1.1.11.zip` / `ProjectMe-v1.1.11Gen2.zip`）；
+> 规则原文里的示例项目名是 `ProjectMe`（`ProjectMe-v1.1.11.zip` / `ProjectMe-v1.1.11Gen2.zip`）；
 > 本项目的应用名是 **DSHTauri**，产物是 NSIS 安装包而不是 zip，所以对应成
-> `DSHTauri-v1.1.11-setup.exe` / `DSHTauri-v1.1.11Gen2-setup.exe`。
+> `DSHTauri-v0.1.11-setup.exe` / `DSHTauri-v0.1.11Gen2-setup.exe`。
 
-**当前版本：`v1.1.1`**（Gen1，不显示后缀）。
+**当前版本：`v0.1.1`**（Gen1，不显示后缀）。
 
 **怎么用**
 
@@ -73,7 +73,7 @@
 npm run ver                                # 打印当前版本 / Gen / 发布包名 / tag
 node scripts/version.mjs --json            # 同上，JSON 格式
 node scripts/version.mjs --bump-gen        # 同一个 C 内做新快照：Gen +1
-node scripts/version.mjs --set 1.1.2       # 提升 C（会同时把 Gen 重置为 1）
+node scripts/version.mjs --set 0.1.2       # 提升 C（会同时把 Gen 重置为 1）
 ```
 
 `--set` 会一次性同步三处版本号：`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`package.json`，
@@ -87,8 +87,14 @@ node scripts/version.mjs --set 1.1.2       # 提升 C（会同时把 Gen 重置�
 CI 用 `node scripts/version.mjs --github` 推导 artifact 名、Release tag、标题和安装包文件名，
 所以**发布包名和 tag 永远跟着版本规则走**，不用手工改 workflow。
 
-**在程序里也看得到**：选择窗口右下角显示 `v1.1.1`；托盘悬浮提示是 `DSHTauri v1.1.1`。
+**在程序里也看得到**：选择窗口右下角显示 `v0.1.1`；托盘悬浮提示是 `DSHTauri v0.1.1`。
 Gen 号由 `src-tauri/build.rs` 在编译期读 `version.json` 塞进二进制。
+
+**每次发版要做的三件事**（详见 [CHANGELOG.md](CHANGELOG.md)）：
+
+1. 改版本号：`node scripts/version.mjs --set 0.1.2`（提升 C）或 `--bump-gen`（同一个 C 内做快照）
+2. 在 [CHANGELOG.md](CHANGELOG.md) 顶部加一条对应版本的记录
+3. 提交推送；CI 会自动用新版本号出包
 
 ---
 
@@ -130,6 +136,7 @@ DSHTauri/
 ├── deepseek_harness.ico            # 官方白底版本（7 档）—— 安装包/exe/应用图标，原样使用
 ├── deepseek.ico                    # 早期深色版（单帧 225×225）—— 托盘图标的生成源，保留备查
 ├── version.json                    # 版本号里的 GenX（A.B.C 在 tauri.conf.json）
+├── CHANGELOG.md                    # 按版本号记录的更新日志
 ├── package.json                    # 第 2 项
 ├── package-lock.json               # `npm ci` 依赖它
 ├── .gitignore
@@ -876,7 +883,7 @@ git push -u origin main
 2. 点 `Build NSIS installer (Windows x86_64)` job，展开每一步看日志。
 3. 关键步骤：
    - `Install frontend dependencies` → 应显示 `added N packages`
-   - `Build NSIS bundle` → 最后应有 `Finished 1 bundle at: ...\bundle\nsis\DSHTauri_1.1.1_x64-setup.exe`
+   - `Build NSIS bundle` → 最后应有 `Finished 1 bundle at: ...\bundle\nsis\DSHTauri_0.1.1_x64-setup.exe`
    - `List bundle output` → 打印产物全路径和大小
 4. 失败了先看 **红叉那一步的最后 30 行**，对照 [TROUBLESHOOTING](docs/TROUBLESHOOTING.md)。
 
@@ -886,18 +893,18 @@ git push -u origin main
 
 | 方式 | 步骤 | 适合 |
 | --- | --- | --- |
-| **Artifact**（每次运行都有） | 运行详情页最下方 **Artifacts** → 点 `DSHTauri-v1.1.1-nsis` 下载 zip → 解压得到 `DSHTauri_1.1.1_x64-setup.exe`（Tauri 自己的命名） | 自己测试 |
+| **Artifact**（每次运行都有） | 运行详情页最下方 **Artifacts** → 点 `DSHTauri-v0.1.1-nsis` 下载 zip → 解压得到 `DSHTauri_0.1.1_x64-setup.exe`（Tauri 自己的命名） | 自己测试 |
 | **Release**（勾了 `create_release` 才有） | 仓库页右侧 **Releases** → 点对应版本 → **Assets** 里直接下 `.exe` | 发给别人 |
 
-Release 里的文件名按 [§0.5 版本规则](#05-版本规则vabc-genx) 命名，例如 `DSHTauri-v1.1.1-setup.exe`；
-同一 `C` 版本做第二份快照时是 `DSHTauri-v1.1.1Gen2-setup.exe`，**不会覆盖前一份**。
+Release 里的文件名按 [§0.5 版本规则](#05-版本规则vabc-genx) 命名，例如 `DSHTauri-v0.1.1-setup.exe`；
+同一 `C` 版本做第二份快照时是 `DSHTauri-v0.1.1Gen2-setup.exe`，**不会覆盖前一份**。
 
 > Tauri 自己产出的文件始终叫 `DSHTauri_<A.B.C>_x64-setup.exe`（它不认识 `Gen`），
 > Release 步骤会把它改名成规则里的名字再上传。
 
 **在 Windows 11 上安装验证**
 
-1. 双击 `DSHTauri_1.1.1_x64-setup.exe`。因为是 `installMode: currentUser`，**不需要管理员权限**，装到 `%LOCALAPPDATA%\DSHTauri`。
+1. 双击 `DSHTauri_0.1.1_x64-setup.exe`。因为是 `installMode: currentUser`，**不需要管理员权限**，装到 `%LOCALAPPDATA%\DSHTauri`。
 2. 首次启动若系统缺 WebView2，安装器会自动下载引导安装（`downloadBootstrapper`）。
 3. 验收：
    - 弹出「选择 DSH 连接方式」窗口；
@@ -948,7 +955,7 @@ npm run tauri build -- --bundles nsis --verbose 2>&1 | tail -100   # 完整打�
 | 首次点击要求用户提供配置并记录 | ✅ 已验证 | 地址默认为空；无 `config.json` 时点击「本地」：**不打开主窗口、不写配置**；填入地址并保存后才生成 `config.json` 并打开主窗口 |
 | **本地 / 远程允许只配一个** | ✅ 已验证（端到端 + 单测） | 冒烟测试分两轮：只填本地 → 连上，`config.json` 里 `"remoteUrl":""`；清空重来只填远程 → 同样连上，`"localUrl":""`。另有 17 条 JS 单测覆盖校验规则 |
 | 推送到 GitHub 后 Actions 在 `windows-latest` 成功运行 | ✅ 已验证 | [run #36974080393](https://github.com/tianyimc/DSH-Tauri/actions/runs/36974080393) @ `4ac4267`：全部步骤绿（含 `Resolve version` / `Run tests` / `Build NSIS bundle` / `Upload NSIS installer`） |
-| Artifact 中存在 NSIS `.exe` | ✅ 已验证 | Artifact **`DSHTauri-v1.1.1-nsis`**，1.21 MB，未过期。`Upload NSIS installer` 设了 `if-no-files-found: error`，步骤成功即证明 `bundle/nsis/` 非空。（下载 artifact 走 API 需要 token，我没法直接取包内文件） |
+| Artifact 中存在 NSIS `.exe` | ✅ 已验证 | Artifact **`DSHTauri-v0.1.1-nsis`**，1.21 MB，未过期。`Upload NSIS installer` 设了 `if-no-files-found: error`，步骤成功即证明 `bundle/nsis/` 非空。（下载 artifact 走 API 需要 token，我没法直接取包内文件） |
 | Windows 11 安装后功能正常 | ⏳ 需要你在 Windows 上确认 | 安装包已产出，实机验收只能由你完成 |
 
 复现方式：`npm run smoke`（需要 `xvfb xdotool wmctrl openbox dbus-x11`）。当前结果：**21 通过 / 0 失败**。

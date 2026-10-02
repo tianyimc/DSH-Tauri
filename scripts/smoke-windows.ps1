@@ -400,22 +400,32 @@ try {
     # --- v0.3.0：侧栏开/关过渡动画（overlay 模式）---
     #
     # 动画是**逐帧改 x**（180ms、约 60fps）。这里等它放完，然后断言侧栏
-    # **停在它该在的位置**：overlay 模式下侧栏右边缘应贴客户区右边缘，
-    # 左边缘 = 客户区宽 - CHAT_WIDTH×scale。
+    # **停在它该在的位置**：overlay 模式下侧栏左边缘 = 客户区宽 - CHAT_WIDTH×scale。
     # 若动画终点算错（把 offscreen 当终点、或物理/逻辑单位混用），这条会失败。
     Start-Sleep -Seconds 1
     $chatW = [int](420 * $scale)      # CHAT_WIDTH = 420 逻辑 px
-    $tbRects = @([Win32]::Descendants($main) |
-      Where-Object { [Win32]::IsWindowVisible($_) -and [Win32]::ClassName($_) -eq "WRY_WEBVIEW" } |
-      ForEach-Object { [Win32]::RectInClient($main, $_) })
-    # 侧栏 = 那个「高度占满内容区、且左边缘在客户区右半部」的 webview
+    # ⚠️ 必须用 `,@(...)` 包一层：PowerShell 会把 `int[]` 在管道里**展开**成
+    # 4 个独立整数，`$_[0]` 就不再是「矩形」而是一个标量（上一次 CI 就是栽在这）。
+    $tbRects = @(
+      [Win32]::Descendants($main) |
+        Where-Object { [Win32]::IsWindowVisible($_) -and [Win32]::ClassName($_) -eq "WRY_WEBVIEW" } |
+        ForEach-Object { ,@([Win32]::RectInClient($main, $_)) }
+    )
+    $sbDesc = ($tbRects | ForEach-Object { "($($_[0]),$($_[1])) $($_[2])x$($_[3])" }) -join '; '
+
+    # 侧栏 = 那个「在内容区（y≈40）、左边缘在客户区右半部」的 webview。
     $sidebars = @($tbRects | Where-Object {
       $_[1] -ge ($expectTbH - $tol) -and $_[0] -ge [int]($ms[0] / 2)
     })
-    $sbDesc = ($tbRects | ForEach-Object { "($($_[0]),$($_[1])) $($_[2])x$($_[3])" }) -join '; '
-    Check "动画结束后侧栏停在客户区右侧（overlay 目标位置）" ($sidebars.Count -ge 1) `
+    $expectChatX = $ms[0] - $chatW
+    $sidebarOk = $false
+    foreach ($sb in $sidebars) {
+      # 允许 ±6px：动画终点会精确落在目标，但窗口边框/取整可能差一两像素。
+      if ([math]::Abs($sb[0] - $expectChatX) -le 6) { $sidebarOk = $true }
+    }
+    Check "动画结束后侧栏停在客户区右侧（overlay 目标位置）" $sidebarOk `
       ("期望左边缘≈{0}（客户区宽 {1} - 侧栏宽 {2}）；实际子 webview：{3}" -f `
-        ($ms[0] - $chatW), $ms[0], $chatW, $sbDesc)
+        $expectChatX, $ms[0], $chatW, $sbDesc)
 
     # 再点一次收起，确认反复切换也不会卡
     [Win32]::ClickClient($main, [int](148 * $scale), [int](20 * $scale))

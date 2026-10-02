@@ -258,3 +258,59 @@ $ grep -n "installer_hooks\|MUI_PAGE_FINISH" installer.nsi
   改由「真解析 lib.rs 的契约对账」+「capability 覆盖 settings」两条断言覆盖。
 - **安装器完成页复选框的实际显示状态**：已用「模板插入顺序」在静态层面证明，
   但没在真机跑一遍安装向导看那一页。
+
+---
+
+# v0.3.1 验证记录
+
+CI run [`37056298132`](https://github.com/tianyimc/DSH-Tauri/actions/runs/37056298132)
+在 `windows-latest` 上：**冒烟 38 通过 / 0 失败**；NSIS 构建成功；
+新增的「统一 logo 接线」校验步骤通过；单测全绿（Rust 44、JS 76、静态校验 39）。
+
+## 1. 统一 logo（任务 3）
+
+| 检查 | 证据 |
+| --- | --- |
+| 素材同源 | `tray-light.png` 与 `deepseek.ico` 的 artwork `compare -metric AE` = **0**（逐像素一致） |
+| 配色正确 | `tray-dark` 仅含 `(255,0)`/`(255,255)`（白+透明）；`tray-light` 主色 `(2,14,54,255)` = `#020E36` |
+| icon.ico 合法 | ICO 头 `reserved=0 type=1 count=7`（256/128/64/48/32/24/16） |
+| 安装包/卸载器图标 | `nsis.installerIcon` / `uninstallerIcon` 已显式设置（**此前从未设置** ⇒ 一直是 Tauri 默认图标） |
+| CI 校验 | 新增步骤 `Verify unified logo is wired into the bundle` **PASS** |
+| 运行时主题切换 | `apply_theme_icons()` 在启动、主窗口创建、`ThemeChanged` 三处调用 |
+
+> **Windows 的固有限制**：资源管理器/桌面上的文件图标**不会**随系统主题换色
+> （一个 `.ico` 只能存一份图像）。所以文件图标固定用深藏青版；
+> **运行时**的窗口/任务栏/托盘图标才按主题自动切换。
+
+## 2. 侧栏动画：白闪与卡顿（任务 4）
+
+改动与**可验证的**证据：
+
+| 改动 | 怎么证明的 |
+| --- | --- |
+| 子 webview 预绘制底色（深 `#1b1b1c` / 浅 `#f3f3f3`） | 与 `titlebar.css` 的 `--dsht-bg` 逐位一致；`ThemeChanged` 时刷新 |
+| 中间帧不再投递 `set_size` | 单测 `animation_never_resizes_between_first_and_last_frame`：中间帧 `set_size` 次数 == **0** |
+| 投递次数下降 | 单测 `per_frame_call_count_drops_versus_v0_3_0`：**26 → 15** 被锁死，防回退 |
+| 几何独占（动画中 layout 不碰侧栏） | 消除「先摆到终点」的跳变；`anim::is_animating()` |
+| 时间戳驱动抗抖动 | 单测 `timestamp_driven_does_not_drift_under_jitter_but_accumulating_does`：31ms 抖动下累加驱动被拉到 ≥2× 时长，时间戳驱动不受影响 |
+| 末帧精确落点 | 单测 `final_frame_lands_exactly_on_target` |
+| 代次 CAS 防竞态 | 单测 `stale_animation_cannot_release_newer_ownership` |
+| 真机终点位置 | CI 冒烟 `[PASS] 动画结束后侧栏停在客户区右侧（overlay 目标位置）` |
+
+### 已核实的**边界**（不粉饰）
+
+`SetPosition` 与 `SetSize` 最终**都**走到 `webview.set_bounds()` →
+`controller.SetBounds()`，而该 RECT 的 `left/top` **硬编码为 0**
+（`wry-0.57.0/src/webview2/mod.rs:1532`），位置实际由 `SetWindowPos` 施加。
+
+⇒ 本次优化省掉的是**每帧重复的那一次**尺寸投递，**并未**把网页重排从动画路径中
+彻底移除。真正「零重排」需要绕过 Tauri 直接操作子 webview 的 HWND，
+而公开 API 拿不到（`Window::hwnd()` 只给主窗口），本版不做。
+
+### 仍未验证（只能人工）
+
+- **动画观感**（是否「丝滑」）：Linux 上 wry 忽略子 webview 坐标，无法验证；
+  CI 只能断言终点位置与不卡死，看不出流畅度。
+- **白闪是否完全消除**：底色已按「与页面底色接近」取值（`#1b1b1c`），
+  但 `chat.deepseek.com` 的真实背景色无法在本容器读取（访问超时）。
+- **安装向导完成页复选框**：仍只做了静态层面的插入顺序证明。

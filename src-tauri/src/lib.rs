@@ -375,3 +375,103 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running DSHTauri");
 }
+
+/* ------------------------------------------------------------------- tests */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 两个内嵌的托盘 PNG 必须能解码。
+    /// 解不出来不会报错，只会静默退回 bundle 默认图标——所以必须测。
+    #[test]
+    fn embedded_tray_icons_decode() {
+        for theme in [Theme::Dark, Theme::Light] {
+            let icon = tray_icon(Some(theme))
+                .unwrap_or_else(|| panic!("托盘图标解码失败：{theme:?}"));
+            assert_eq!(icon.width(), 64, "托盘图标宽度应为 64");
+            assert_eq!(icon.height(), 64, "托盘图标高度应为 64");
+        }
+    }
+
+    /// 主题探测不到时按深色处理（Windows 11 默认深色任务栏）。
+    #[test]
+    fn tray_icon_falls_back_to_white_version() {
+        assert!(tray_icon(None).is_some());
+    }
+
+    /// 深色版应该是白鲸鱼，浅色版应该是深色鲸鱼——反色确实生效了。
+    #[test]
+    fn tray_icons_are_inverted_versions_of_each_other() {
+        let dark = tray_icon(Some(Theme::Dark)).unwrap();
+        let light = tray_icon(Some(Theme::Light)).unwrap();
+        let dark_rgba = dark.rgba();
+        let light_rgba = light.rgba();
+
+        assert_eq!(dark_rgba.len(), light_rgba.len(), "两版尺寸应一致");
+
+        // 只比较不透明像素，透明区域两版都是 0。
+        let mut compared = 0usize;
+        for px in 0..dark_rgba.len() / 4 {
+            let i = px * 4;
+            if light_rgba[i + 3] < 200 {
+                continue;
+            }
+            compared += 1;
+            // 浅色版是深藏青 #020E36，深色版是纯白，两者应当差异明显。
+            assert!(
+                light_rgba[i] < 60,
+                "浅色版应是深色 logo，实际 R={}",
+                light_rgba[i]
+            );
+            assert!(
+                dark_rgba[i] > 200,
+                "深色版应是白色 logo，实际 R={}",
+                dark_rgba[i]
+            );
+            // 透明背景保持不变。
+            assert_eq!(
+                dark_rgba[i + 3], light_rgba[i + 3],
+                "反色不应改变 alpha 通道"
+            );
+        }
+        assert!(compared > 500, "参与比较的不透明像素太少：{compared}");
+    }
+
+    #[test]
+    fn default_config_points_at_local_and_remote() {
+        let config = AppConfig::default();
+        assert!(!config.configured, "默认应为「未配置」，前端才会弹首次配置表单");
+        assert!(config.local_url.starts_with("http://127.0.0.1"));
+        assert!(config.remote_url.starts_with("https://"));
+        assert!(!config.auto_start_local);
+    }
+
+    /// 前端用 camelCase 读写配置（见 src/selector.js），这个契约不能破。
+    #[test]
+    fn config_serializes_as_camel_case() {
+        let json = serde_json::to_string(&AppConfig::default()).unwrap();
+        for key in [
+            "configured",
+            "localUrl",
+            "remoteUrl",
+            "autoStartLocal",
+            "localStartCommand",
+        ] {
+            assert!(json.contains(key), "序列化结果缺少 {key}：{json}");
+        }
+        let back: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.local_url, AppConfig::default().local_url);
+    }
+
+    /// 配置文件缺字段 / 是坏 JSON 时，必须退回默认值而不是崩掉。
+    #[test]
+    fn config_deserializes_leniently() {
+        let partial: AppConfig = serde_json::from_str(r#"{"localUrl":"http://x:1"}"#).unwrap();
+        assert_eq!(partial.local_url, "http://x:1");
+        assert_eq!(partial.remote_url, DEFAULT_REMOTE_URL, "缺失字段应取默认值");
+        assert!(!partial.configured);
+
+        assert!(serde_json::from_str::<AppConfig>("{ not json").is_err());
+    }
+}

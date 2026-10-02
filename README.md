@@ -217,13 +217,20 @@ fn tray_icon(theme: Option<Theme>) -> Option<Image<'static>> {
 **换图标**：
 
 ```bash
-# 换安装包/exe 图标：直接替换根目录的官方 ico，再跑一次 posticon
+# 换安装包/exe 图标：替换根目录的官方 ico，再跑一次 posticon
 cp 你的.ico deepseek_harness.ico && node scripts/post-icon.mjs
 
-# 换托盘图标：替换 app-icon.png 后重新派生（托盘两版由深色原图生成）
+# 换托盘图标（由 deepseek.ico 的深色原图生成两版）
 convert 'deepseek.ico[0]' -resize 64x64 src-tauri/icons/tray-light.png
-convert src-tauri/icons/tray-light.png -channel RGB -fill white -colorize 100% src-tauri/icons/tray-dark.png
+convert 'deepseek.ico[0]' -resize 64x64 -alpha extract /tmp/mask.png
+convert -size 64x64 xc:'#FFFFFF' /tmp/mask.png -alpha off -compose CopyOpacity -composite \
+        src-tauri/icons/tray-dark.png
 ```
+
+> ⚠️ 反色**必须用上面的「alpha 掩码 + CopyOpacity」写法**，不要用 `-colorize`：
+> 后者会让抗锯齿边缘的 alpha 偏移 1（实测 340 个像素），破坏「透明背景不变」的要求。
+> 单元测试 `tray_icons_are_inverted_versions_of_each_other` 会断言两版 alpha 完全一致，
+> 写错了 `cargo test` 会直接失败。
 
 不要直接把 `.png` 改名成 `.ico` —— 文件头不对，`makensis` 会拒绝（见 [TROUBLESHOOTING §4](docs/TROUBLESHOOTING.md#4-图标格式错误)）。
 
@@ -840,6 +847,7 @@ npm run tauri build -- --bundles nsis --verbose 2>&1 | tail -100   # 完整打�
 | Windows 目标可编译 | `cargo check --target x86_64-pc-windows-msvc` | ✅ `Finished` |
 | Linux 目标可编译 | `cargo build` | ✅ `Finished` |
 | Clippy 无告警 | `cargo clippy --all-targets` | ✅ 0 warning |
+| 单元测试 | `cd src-tauri && cargo test` | ✅ 6 通过（托盘 PNG 解码、反色 alpha 一致性、配置 camelCase 契约、坏配置容错） |
 | 图标 | `npm run icon` → `icons/icon.ico` | ✅ 6 档 16/24/32/48/64/256，内嵌 PNG |
 | 工作流 YAML | `python3 -c "yaml.safe_load(...)"` | ✅ 解析通过，`permissions: contents: write` 就位 |
 | 端到端冒烟 | `bash scripts/smoke-linux.sh` | ✅ 15 通过 / 0 失败 |

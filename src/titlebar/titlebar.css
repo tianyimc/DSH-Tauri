@@ -1,0 +1,176 @@
+/*
+ * DSHTauri 顶栏样式 —— 官方 DeepSeek Harness 桌面端（截图 P3）对齐版。
+ *
+ * 这是一个**本地页面**（src/titlebar.html），由 Rust 作为主窗口上方那条 40px 高的
+ * webview 加载。因为它是独立页面，不需要 Shadow DOM 之类的隔离：
+ * body 铺满整个 40px 视口即可（与改造前的 chrome.css 同一套路）。
+ *
+ * 视觉基线 = Lead 对官方 P3 的逐像素测量（见 .analysis/DIAGNOSIS.md「问题 3」）：
+ *   背景 (27,27,28) -> #1b1b1c ；菜单文字 (170,173,176) -> #aaadb0 ；高 40px ；
+ *   **无底部边框线**（改造前 chrome.css 那道 (51,51,51) 的分隔线在这里被去掉）。
+ * 刻意**不**包含官方最左边那个 45,45,46 的圆角「侧边栏展开」按钮 —— 用户明确不要。
+ */
+
+:root {
+  /* --- 深色（官方默认，实测值） --- */
+  --dsht-bg: #1b1b1c; /* 实测 (27,27,28) */
+  --dsht-fg: #aaadb0; /* 实测 (170,173,176) */
+  --dsht-fg-hover: #f0f1f2;
+  --dsht-hover: rgba(255, 255, 255, 0.06);
+  --dsht-active: rgba(255, 255, 255, 0.1);
+  --dsht-focus: #4a9eff;
+  --dsht-close-hover: #c42b1c; /* Windows 标准关闭红 */
+  --dsht-close-active: #b02718;
+  --dsht-close-fg-hover: #ffffff;
+  --dsht-h: 40px;
+  --dsht-btn-w: 46px;
+}
+
+/* 浅色系统主题：同一套层级关系的等价取值（官方 UI 是深色，这里保证浅色下也可用） */
+@media (prefers-color-scheme: light) {
+  :root {
+    --dsht-bg: #f3f3f3;
+    --dsht-fg: #4b4f54;
+    --dsht-fg-hover: #1f2328;
+    --dsht-hover: rgba(0, 0, 0, 0.06);
+    --dsht-active: rgba(0, 0, 0, 0.1);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+body {
+  background: var(--dsht-bg);
+  color: var(--dsht-fg);
+  font: 13px/1 "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: default;
+}
+
+/* --------------------------------------------------------------- 顶栏主体 */
+
+.bar {
+  display: flex;
+  align-items: stretch;
+  width: 100%;
+  height: var(--dsht-h);
+  /* 官方 P3：没有任何 border / box-shadow 分隔线，靠底色与内容区色差区分 */
+  border: 0;
+  background: var(--dsht-bg);
+}
+
+/* ----------------------------------------------------------- 菜单按钮 */
+
+.menu {
+  display: flex;
+  align-items: center;
+  height: 100%;
+  margin: 0;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color 90ms linear, color 90ms linear;
+}
+
+.menu:hover {
+  background: var(--dsht-hover);
+  color: var(--dsht-fg-hover);
+}
+
+.menu:active,
+.menu[aria-expanded="true"] {
+  background: var(--dsht-active);
+  color: var(--dsht-fg-hover);
+}
+
+.menu:focus-visible {
+  outline: 1px solid var(--dsht-focus);
+  outline-offset: -2px;
+}
+
+/* 空白处：拖动窗口用；不要用 app-region:drag（会吞掉 dblclick） */
+.spacer {
+  flex: 1 1 auto;
+  min-width: 20px;
+  height: 100%;
+}
+
+/* ----------------------------------------------------------- 窗口按钮 */
+
+.controls {
+  display: flex;
+  align-items: stretch;
+  flex: 0 0 auto;
+  height: 100%;
+}
+
+.ctl {
+  /* 官方窗口按钮：透明背景、无边框 */
+  width: var(--dsht-btn-w);
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+  font-family: "Segoe Fluent Icons", "Segoe MDL2 Assets", "Segoe UI Symbol", sans-serif;
+  font-size: 10px;
+  line-height: 1;
+  cursor: default;
+  transition: background-color 90ms linear, color 90ms linear;
+}
+
+.ctl:hover {
+  background: var(--dsht-hover);
+  color: var(--dsht-fg-hover);
+}
+
+.ctl:active {
+  background: var(--dsht-active);
+}
+
+.ctl:focus-visible {
+  outline: 1px solid var(--dsht-focus);
+  outline-offset: -2px;
+}
+
+/* 关闭：Windows 标准红色，hover 时图标转白 */
+.ctl.close:hover {
+  background: var(--dsht-close-hover);
+  color: var(--dsht-close-fg-hover);
+}
+
+.ctl.close:active {
+  background: var(--dsht-close-active);
+  color: var(--dsht-close-fg-hover);
+}
+
+/* 高对比度模式：别把按钮画没了 */
+@media (forced-colors: active) {
+  .bar {
+    border-bottom: 1px solid CanvasText;
+  }
+  .ctl:hover,
+  .menu:hover {
+    background: Highlight;
+    color: HighlightText;
+  }
+}

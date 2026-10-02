@@ -64,9 +64,10 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Run tests (JS config rules + Rust unit tests)
+      - name: Run tests (JS 单测 + 顶栏静态校验 + Rust 单测)
         run: |
           npm run test:js
+          npm run verify
           npm run test:rust
 
       - name: Build NSIS bundle

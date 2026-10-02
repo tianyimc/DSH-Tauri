@@ -22,11 +22,22 @@ use tauri::{
 
 /// 启动选择窗口的 label（在 `setup()` 里创建）。
 pub const SELECTOR_LABEL: &str = "selector";
-/// 主窗口的 label（选择完成后由 Rust 动态创建）。
+/// 主窗口的 label。
+///
+/// **这是一个纯 `Window`（容器），本身不加载任何页面。** 页面由它的子 webview 承载：
+/// 顶栏 [`TITLEBAR_LABEL`] + 内容 [`CONTENT_LABEL`]（+ 可选的对话侧栏 [`CHAT_LABEL`]）。
 pub const MAIN_LABEL: &str = "main";
-/// 自定义标题栏窗口的 label（覆盖在主窗口顶部，承载「应用 / 操作 / 网页对话」菜单）。
-pub const CHROME_LABEL: &str = "chrome";
-/// 右侧「网页对话」侧栏的 label。
+/// 主窗口顶部自定义标题栏子 webview 的 label。
+///
+/// 它加载**本地页面** `titlebar.html`，因此命中 `capabilities/default.json`
+/// （`webviews: ["titlebar"]` + `local: true`），**拥有 IPC 权限**。
+/// 这是它能调 `chrome_action` / `window_control` 等命令的前提。
+pub const TITLEBAR_LABEL: &str = "titlebar";
+/// 主窗口内容子 webview 的 label（加载用户配置的**远程** DSH 页面）。
+///
+/// 远程页面**故意不授予任何 capability** —— 见 `docs/TROUBLESHOOTING.md §5`。
+pub const CONTENT_LABEL: &str = "content";
+/// 右侧「网页对话」侧栏子 webview 的 label。
 pub const CHAT_LABEL: &str = "chat";
 /// 「关于」窗口的 label。
 pub const ABOUT_LABEL: &str = "about";
@@ -51,11 +62,15 @@ const MAIN_HEIGHT: f64 = 800.0;
 const MAIN_MIN_WIDTH: f64 = 640.0;
 const MAIN_MIN_HEIGHT: f64 = 480.0;
 
-/// 自定义标题栏高度（逻辑像素）。主窗口不再用系统标题栏，改为顶部这条自绘菜单栏。
-const CHROME_HEIGHT: f64 = 40.0;
+/// 自定义标题栏高度（**逻辑**像素）。
+///
+/// ⚠️ 这是一个**逻辑**值，直接传给 `LogicalSize` / `LogicalPosition`。
+/// **绝对不要再乘以 `scale_factor`** —— Tauri 的 `inner_size(f64)` 等 API 收的就是逻辑单位，
+/// 框架内部会自己乘一次。旧实现手算 `CHROME_HEIGHT * scale` 再当逻辑值传，
+/// 导致顶栏被缩放两次（用户截图 P1 实测 158 device px ≈ 40×2×2，而正确的 P2 是 78 ≈ 40×2）。
+const TITLEBAR_HEIGHT: f64 = 40.0;
 
-/// 右侧「网页对话」侧栏。
-const CHAT_TITLE: &str = "DSH 对话";
+/// 右侧「网页对话」侧栏（现在是主窗口内右侧的一个子 webview，不再是独立窗口）。
 const CHAT_URL: &str = "https://chat.deepseek.com/";
 const CHAT_WIDTH: f64 = 420.0;
 
@@ -312,166 +327,207 @@ fn create_selector_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     Ok(())
 }
 
-/// 创建（或复用）主窗口顶部的自定义标题栏窗口。
+/// 主窗口客户区的**逻辑**尺寸。
 ///
-/// 用 `parent(&main)` 把它做成主窗口的 **owned window**：
-/// Windows 会保证它永远在主窗口之上（但不会盖到别的应用上）、随主窗口最小化，
-/// 主窗口销毁时一起销毁。位置和宽度需要我们自己跟着主窗口同步。
-fn ensure_chrome_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
-    if app.get_webview_window(CHROME_LABEL).is_some() {
+/// 统一在这里做「物理 → 逻辑」换算，避免任何地方手算 `* scale`。
+/// 旧实现手算 `CHROME_HEIGHT * scale` 又把它当逻辑值传给 Tauri，
+/// 被框架再乘一次 scale ⇒ 顶栏被缩放两次（用户截图 P1 实测 158 device px）。
+fn main_logical_size<R: Runtime>(window: &tauri::Window<R>) -> Option<(f64, f64)> {
+    let scale = window.scale_factor().ok()?;
+    let size = window.inner_size().ok()?.to_logical::<f64>(scale);
+    Some((size.width, size.height))
+}
+
+/// 给子 webview 构造器套上共享的 WebView2 数据目录。
+///
+/// 所有 webview 共用同一份 profile ⇒ 登录态共享，且 cookie 仍然落盘
+/// （会话 cookie 转持久 cookie 的 keeper 依赖这一点）。
+fn child_webview_builder<R: Runtime>(
+    app: &AppHandle<R>,
+    label: &str,
+    url: WebviewUrl,
+) -> tauri::webview::WebviewBuilder<R> {
+    let builder = tauri::webview::WebviewBuilder::new(label, url);
+    match webview_data_dir(app) {
+        Some(dir) => builder.data_directory(dir),
+        None => builder,
+    }
+}
+
+/// 摆放主窗口里的子 webview（顶栏 / 内容 / 对话侧栏）。
+///
+/// 这里**只做 `set_position` / `set_size`**：它们是非阻塞的消息投递，
+/// 可以在窗口事件（主线程）里安全调用。**绝不在这里创建 webview**
+/// （`add_child` 会阻塞等主线程 ⇒ 主线程里调用必然死锁）。
+///
+/// 全部使用**逻辑**单位；Tauri 会自己换算成物理像素。
+fn layout_main_webviews<R: Runtime>(app: &AppHandle<R>) {
+    let Some(main) = app.get_window(MAIN_LABEL) else {
+        return;
+    };
+    let Some((width, height)) = main_logical_size(&main) else {
+        return;
+    };
+    let content_height = (height - TITLEBAR_HEIGHT).max(1.0);
+
+    if let Some(titlebar) = app.get_webview(TITLEBAR_LABEL) {
+        let _ = titlebar.set_position(tauri::LogicalPosition::new(0.0, 0.0));
+        let _ = titlebar.set_size(tauri::LogicalSize::new(width, TITLEBAR_HEIGHT));
+    }
+    if let Some(content) = app.get_webview(CONTENT_LABEL) {
+        let _ = content.set_position(tauri::LogicalPosition::new(0.0, TITLEBAR_HEIGHT));
+        let _ = content.set_size(tauri::LogicalSize::new(width, content_height));
+    }
+    if let Some(chat) = app.get_webview(CHAT_LABEL) {
+        let chat_width = CHAT_WIDTH.min(width).max(1.0);
+        let _ = chat.set_position(tauri::LogicalPosition::new(
+            width - chat_width,
+            TITLEBAR_HEIGHT,
+        ));
+        let _ = chat.set_size(tauri::LogicalSize::new(chat_width, content_height));
+    }
+}
+
+/// 把窗口状态推给顶栏 webview，让它把「最大化」按钮切成「还原」图标。
+///
+/// 这**只是锦上添花**：顶栏在没有收到任何事件时依然完全可用
+/// （前端对「收不到事件」做了降级）。所以这里失败也不报错。
+///
+/// 「最大化时不允许拖动」不依赖这个事件 —— 那个判断放在 `start_drag` 里做。
+fn emit_window_state<R: Runtime>(app: &AppHandle<R>, window: &tauri::Window<R>) {
+    let payload = serde_json::json!({
+        "maximized": window.is_maximized().unwrap_or(false),
+        "fullscreen": window.is_fullscreen().unwrap_or(false),
+    });
+    let _ = app.emit_to(TITLEBAR_LABEL, "dsht:window-state", payload);
+}
+
+/// 在主窗口里挂上顶栏子 webview（**本地**页面 ⇒ 命中 capability ⇒ 有 IPC）。
+///
+/// 创建失败时调用方会把窗口退回系统标题栏，保证用户至少还能移动 / 关闭窗口。
+fn ensure_titlebar_webview<R: Runtime>(
+    app: &AppHandle<R>,
+    main: &tauri::Window<R>,
+) -> Result<(), String> {
+    if app.get_webview(TITLEBAR_LABEL).is_some() {
         return Ok(());
     }
-    let main = app
-        .get_webview_window(MAIN_LABEL)
-        .ok_or_else(|| "主窗口尚未创建".to_string())?;
-    let position = main.outer_position().map_err(|e| e.to_string())?;
-    let size = main.outer_size().map_err(|e| e.to_string())?;
-    let scale = main.scale_factor().unwrap_or(1.0);
-    let chrome_height = (CHROME_HEIGHT * scale).round().max(1.0) as u32;
-
-    let builder = WebviewWindowBuilder::new(app, CHROME_LABEL, WebviewUrl::App("chrome.html".into()))
-        .title("")
-        .decorations(false)
-        .resizable(false)
-        .maximizable(false)
-        .minimizable(false)
-        .closable(false)
-        .skip_taskbar(true)
-        .shadow(false)
-        .position(position.x as f64, position.y as f64)
-        .inner_size(size.width as f64, chrome_height as f64)
-        .visible(true)
-        .parent(&main)
-        .map_err(|e| format!("设置标题栏 owner 失败：{e}"))?;
-
-    with_shared_profile(app, builder)
-        .build()
-        .map_err(|e| format!("创建标题栏窗口失败：{e}"))?;
+    let (width, _) =
+        main_logical_size(main).ok_or_else(|| "无法读取主窗口尺寸".to_string())?;
+    main.add_child(
+        child_webview_builder(app, TITLEBAR_LABEL, WebviewUrl::App("titlebar.html".into())),
+        tauri::LogicalPosition::new(0.0, 0.0),
+        tauri::LogicalSize::new(width, TITLEBAR_HEIGHT),
+    )
+    .map_err(|e| format!("创建顶栏 webview 失败：{e}"))?;
     Ok(())
 }
 
-/// 让标题栏窗口跟随主窗口的位置与宽度。
-fn sync_chrome_window<R: Runtime>(app: &AppHandle<R>) {
-    let (Some(main), Some(chrome)) = (
-        app.get_webview_window(MAIN_LABEL),
-        app.get_webview_window(CHROME_LABEL),
-    ) else {
-        return;
-    };
-    let (Ok(position), Ok(size)) = (main.outer_position(), main.outer_size()) else {
-        return;
-    };
-    let scale = main.scale_factor().unwrap_or(1.0);
-    let chrome_height = (CHROME_HEIGHT * scale).round().max(1.0) as u32;
-    let _ = chrome.set_position(tauri::PhysicalPosition::new(position.x, position.y));
-    let _ = chrome.set_size(tauri::PhysicalSize::new(size.width, chrome_height));
+/// 在主窗口里挂上内容子 webview（**远程**页面 ⇒ 按设计不授予任何 capability）。
+fn ensure_content_webview<R: Runtime>(
+    app: &AppHandle<R>,
+    main: &tauri::Window<R>,
+    url: tauri::Url,
+) -> Result<(), String> {
+    if app.get_webview(CONTENT_LABEL).is_some() {
+        return Ok(());
+    }
+    let (width, height) =
+        main_logical_size(main).ok_or_else(|| "无法读取主窗口尺寸".to_string())?;
+    main.add_child(
+        child_webview_builder(app, CONTENT_LABEL, WebviewUrl::External(url)),
+        tauri::LogicalPosition::new(0.0, TITLEBAR_HEIGHT),
+        tauri::LogicalSize::new(width, (height - TITLEBAR_HEIGHT).max(1.0)),
+    )
+    .map_err(|e| format!("创建内容 webview 失败：{e}"))?;
+    Ok(())
 }
 
-/// 主窗口（含标题栏、侧栏）整体隐藏 —— 「关闭 = 隐藏到托盘」走这里。
+/// 内容 webview 导航到新地址（托盘「重新选择连接方式」切换地址时用）。
+///
+/// 复用同一个 webview 而不是销毁重建：销毁「正在执行 IPC 的 webview」会让
+/// Windows 的消息处理进入坏状态（历史 bug，见 CHANGELOG v0.1.x）。
+fn navigate_content<R: Runtime>(app: &AppHandle<R>, url: tauri::Url) -> Result<(), String> {
+    let content = app
+        .get_webview(CONTENT_LABEL)
+        .ok_or_else(|| "内容页面尚未就绪".to_string())?;
+    content
+        .navigate(url)
+        .map_err(|e| format!("切换连接地址失败：{e}"))
+}
+
+/// 主窗口（连同顶栏、内容、侧栏）整体隐藏 —— 「关闭 = 隐藏到托盘」走这里。
+///
+/// 子 webview 随父窗口一起隐藏，不需要逐个处理。
 fn hide_main_windows<R: Runtime>(app: &AppHandle<R>) {
-    for label in [CHROME_LABEL, CHAT_LABEL, MAIN_LABEL] {
-        if let Some(window) = app.get_webview_window(label) {
-            let _ = window.hide();
-        }
+    if let Some(main) = app.get_window(MAIN_LABEL) {
+        let _ = main.hide();
     }
 }
 
-/// 主窗口（含标题栏、侧栏）整体显示 —— 托盘「显示主窗口」走这里。
+/// 主窗口整体显示 —— 托盘「显示主窗口」走这里。
 fn show_main_windows<R: Runtime>(app: &AppHandle<R>) {
-    if app.get_webview_window(MAIN_LABEL).is_none() {
-        return;
-    }
-    if let Some(main) = app.get_webview_window(MAIN_LABEL) {
-        let _ = main.unminimize();
-        let _ = main.show();
-        let _ = main.set_focus();
-    }
-    if app.get_webview_window(CHROME_LABEL).is_some() {
-        sync_chrome_window(app);
-        if let Some(chrome) = app.get_webview_window(CHROME_LABEL) {
-            let _ = chrome.show();
-        }
-    }
-    if let Some(chat) = app.get_webview_window(CHAT_LABEL) {
-        if chat.is_visible().unwrap_or(false) {
-            position_chat_window(app);
-            let _ = chat.show();
-        }
-    }
-}
-
-/// 把侧栏贴到主窗口右侧（顶部让开标题栏）。
-fn position_chat_window<R: Runtime>(app: &AppHandle<R>) {
-    let (Some(main), Some(chat)) = (
-        app.get_webview_window(MAIN_LABEL),
-        app.get_webview_window(CHAT_LABEL),
-    ) else {
+    let Some(main) = app.get_window(MAIN_LABEL) else {
         return;
     };
-    let (Ok(position), Ok(size)) = (main.outer_position(), main.outer_size()) else {
-        return;
-    };
-    let scale = main.scale_factor().unwrap_or(1.0);
-    let chrome_height = (CHROME_HEIGHT * scale).round().max(1.0) as i32;
-    let width = (CHAT_WIDTH * scale).round().max(1.0) as u32;
-    let height = size.height.saturating_sub(chrome_height as u32).max(1);
-
-    let _ = chat.set_position(tauri::PhysicalPosition::new(
-        position.x + size.width as i32 - width as i32,
-        position.y + chrome_height,
-    ));
-    let _ = chat.set_size(tauri::PhysicalSize::new(width, height));
+    let _ = main.unminimize();
+    let _ = main.show();
+    let _ = main.set_focus();
+    // 显示后重新摆一次子 webview：窗口可能在隐藏期间被改过尺寸。
+    layout_main_webviews(app);
 }
 
-/// 「网页对话」：创建 / 显示 / 隐藏右侧侧栏。
-fn toggle_chat_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
-    let main = app
-        .get_webview_window(MAIN_LABEL)
-        .ok_or_else(|| "还没有主窗口，请先连接".to_string())?;
+/// 对话侧栏当前是否可见。
+///
+/// `Webview`（子 webview）**没有** `is_visible()`（那是 `WebviewWindow` 才有的），
+/// 所以自己记一份状态。它只在命令路径上被读写，用 `AtomicBool` 足够。
+static CHAT_VISIBLE: AtomicBool = AtomicBool::new(false);
 
-    if let Some(chat) = app.get_webview_window(CHAT_LABEL) {
-        if chat.is_visible().unwrap_or(false) {
+/// 「网页对话」：创建 / 显示 / 隐藏右侧侧栏子 webview。
+///
+/// ⚠️ **必须从异步命令调用**：`add_child` 内部是 `run_on_main_thread` + `recv()`，
+/// 在 Windows 上从主线程（同步命令 / 事件处理器）调用会**死锁**。
+/// 这正是用户报告的「点『网页对话』整个程序卡死、只能任务管理器强杀」的根因。
+fn toggle_chat_webview<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    let Some(main) = app.get_window(MAIN_LABEL) else {
+        return Err("还没有主窗口，请先连接".to_string());
+    };
+
+    // 已创建：切换显示 / 隐藏。
+    if let Some(chat) = app.get_webview(CHAT_LABEL) {
+        if CHAT_VISIBLE.load(Ordering::Relaxed) {
             let _ = chat.hide();
-            return Ok(());
+            CHAT_VISIBLE.store(false, Ordering::Relaxed);
+            eprintln!("[DSHTauri] 对话侧栏已隐藏");
+        } else {
+            layout_main_webviews(app);
+            chat.show().map_err(|e| e.to_string())?;
+            CHAT_VISIBLE.store(true, Ordering::Relaxed);
+            eprintln!("[DSHTauri] 对话侧栏已显示");
         }
-        position_chat_window(app);
-        chat.show().map_err(|e| e.to_string())?;
-        let _ = chat.set_focus();
         return Ok(());
     }
 
-    let position = main.outer_position().map_err(|e| e.to_string())?;
-    let size = main.outer_size().map_err(|e| e.to_string())?;
-    let scale = main.scale_factor().unwrap_or(1.0);
-    let chrome_height = (CHROME_HEIGHT * scale).round().max(1.0) as i32;
-    let width = (CHAT_WIDTH * scale).round().max(1.0) as u32;
-    let height = size.height.saturating_sub(chrome_height as u32).max(1);
+    // 首次打开：创建子 webview。
+    let (width, height) =
+        main_logical_size(&main).ok_or_else(|| "无法读取主窗口尺寸".to_string())?;
+    let chat_width = CHAT_WIDTH.min(width).max(1.0);
+    let content_height = (height - TITLEBAR_HEIGHT).max(1.0);
+    let url = CHAT_URL
+        .parse()
+        .map_err(|e| format!("对话页地址无效：{e}"))?;
 
-    let builder = WebviewWindowBuilder::new(
-        app,
-        CHAT_LABEL,
-        WebviewUrl::External(CHAT_URL.parse().map_err(|e| format!("对话页地址无效：{e}"))?),
+    main.add_child(
+        child_webview_builder(app, CHAT_LABEL, WebviewUrl::External(url)),
+        tauri::LogicalPosition::new(width - chat_width, TITLEBAR_HEIGHT),
+        tauri::LogicalSize::new(chat_width, content_height),
     )
-    .title(CHAT_TITLE)
-    .decorations(false)
-    .resizable(false)
-    .maximizable(false)
-    .minimizable(false)
-    .closable(false)
-    .skip_taskbar(true)
-    .shadow(false)
-    .position(
-        (position.x + size.width as i32 - width as i32) as f64,
-        (position.y + chrome_height) as f64,
-    )
-    .inner_size(width as f64, height as f64)
-    .visible(true)
-    .parent(&main)
-    .map_err(|e| format!("设置侧栏 owner 失败：{e}"))?;
+    .map_err(|e| format!("打开对话侧栏失败：{e}"))?;
 
-    with_shared_profile(app, builder)
-        .build()
-        .map_err(|e| format!("打开对话侧栏失败：{e}"))?;
+    CHAT_VISIBLE.store(true, Ordering::Relaxed);
+    // 这行日志是「缺陷 B 已修复」的运行时证据：能打印出来说明
+    // `add_child` 返回了（没有在主线程上死锁），命令链顺利走完。
+    eprintln!("[DSHTauri] 对话侧栏 webview 已创建");
     Ok(())
 }
 
@@ -500,7 +556,7 @@ fn show_about_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
 /// 托盘「显示主窗口」/ 左键点击托盘：优先主窗口（连同标题栏和侧栏），
 /// 其次选择窗口，都没有就重建选择窗口。
 fn reveal_window<R: Runtime>(app: &AppHandle<R>) {
-    if app.get_webview_window(MAIN_LABEL).is_some() {
+    if app.get_window(MAIN_LABEL).is_some() {
         show_main_windows(app);
         return;
     }
@@ -611,16 +667,16 @@ fn spawn_cookie_keeper<R: Runtime>(app: AppHandle<R>) {
         loop {
             std::thread::sleep(std::time::Duration::from_secs(if first { 5 } else { 20 }));
             first = false;
-            for label in [MAIN_LABEL, CHAT_LABEL] {
-                let Some(window) = app.get_webview_window(label) else {
+            for label in [CONTENT_LABEL, CHAT_LABEL] {
+                let Some(webview) = app.get_webview(label) else {
                     continue;
                 };
-                let Ok(url) = window.url() else { continue };
+                let Ok(url) = webview.url() else { continue };
                 let url = url.to_string();
                 if !url.starts_with("http") {
                     continue;
                 }
-                persist_session_cookies(window.as_ref(), &url);
+                persist_session_cookies(&webview, &url);
             }
         }
     });
@@ -744,8 +800,11 @@ fn app_version() -> String {
 }
 
 /// 自定义标题栏的窗口按钮。
+///
+/// `async`：这些动作会间接触发窗口事件链（最大化 / 关闭 → `Resized` / `CloseRequested`），
+/// 放到异步运行时执行，避免占住主线程。
 #[tauri::command]
-fn window_control(app: AppHandle, action: String) -> Result<(), String> {
+async fn window_control(app: AppHandle, action: String) -> Result<(), String> {
     // 关于窗口自己就能关自己，不需要主窗口存在
     if action == "hide-about" {
         if let Some(about) = app.get_webview_window(ABOUT_LABEL) {
@@ -755,7 +814,7 @@ fn window_control(app: AppHandle, action: String) -> Result<(), String> {
     }
 
     let main = app
-        .get_webview_window(MAIN_LABEL)
+        .get_window(MAIN_LABEL)
         .ok_or_else(|| "主窗口不存在".to_string())?;
     match action.as_str() {
         "minimize" => main.minimize().map_err(|e| e.to_string()),
@@ -772,34 +831,43 @@ fn window_control(app: AppHandle, action: String) -> Result<(), String> {
     }
 }
 
-/// 拖动窗口：标题栏窗口自己不能拖（那只会移动它自己），
-/// 所以由它发起，真正拖的是主窗口；chrome 会跟着 Moved 事件同步过来。
+/// 拖动窗口：顶栏是主窗口里的**子 webview**，拖它自己不会移动窗口，
+/// 所以由它发起命令，真正 `start_dragging()` 的是主窗口。
+///
+/// 最大化状态下直接忽略：让用户拖动一个最大化窗口，在 Windows 上行为很怪。
+/// 这个判断刻意放在 Rust 侧 —— 不依赖前端是否及时收到了窗口状态事件。
 #[tauri::command]
 fn start_drag(app: AppHandle) -> Result<(), String> {
     let main = app
-        .get_webview_window(MAIN_LABEL)
+        .get_window(MAIN_LABEL)
         .ok_or_else(|| "主窗口不存在".to_string())?;
+    if main.is_maximized().unwrap_or(false) {
+        return Ok(());
+    }
     main.start_dragging().map_err(|e| e.to_string())
 }
 
 /// 自定义标题栏的菜单动作（按钮直接触发，例如「网页对话」）。
+///
+/// ⚠️ **必须 `async`**。`chat` 会创建子 webview（`Window::add_child`），
+/// 而 `add_child` 在 Windows 上内部是 `run_on_main_thread` + `recv()`：
+/// 同步命令本身就跑在主线程上，从那里调用会**死锁** —— 这正是用户报告的
+/// 「点『网页对话』整个程序卡死、不报未响应、只能任务管理器强杀」的根因。
 #[tauri::command]
-fn chrome_action(app: AppHandle, action: String) -> Result<(), String> {
+async fn chrome_action(app: AppHandle, action: String) -> Result<(), String> {
     run_action(&app, &action)
 }
 
 /// 弹出原生下拉菜单。
 ///
-/// 为什么用原生菜单而不是 HTML 下拉：标题栏窗口只有 40px 高，
-/// HTML 下拉会被窗口边界裁掉；原生菜单可以正常溢出到窗口外，而且外观跟随系统。
+/// 继续用原生菜单而不是 HTML 下拉：外观跟随系统，且不受 webview 边界裁剪。
 #[tauri::command]
 async fn popup_menu(app: AppHandle, menu: String, x: f64) -> Result<(), String> {
     use tauri::menu::ContextMenu;
 
-    let main = app
-        .get_webview_window(MAIN_LABEL)
+    let window = app
+        .get_window(MAIN_LABEL)
         .ok_or_else(|| "主窗口不存在".to_string())?;
-    let window = main.as_ref().window();
 
     let item = |id: &str, label: &str| -> Result<MenuItem<tauri::Wry>, String> {
         MenuItem::with_id(&app, id, label, true, None::<&str>).map_err(|e| e.to_string())
@@ -829,7 +897,7 @@ async fn popup_menu(app: AppHandle, menu: String, x: f64) -> Result<(), String> 
     };
 
     // 位置相对于主窗口左上角：横向对齐按钮，纵向正好在标题栏下面
-    let position = tauri::LogicalPosition::new(x, CHROME_HEIGHT);
+    let position = tauri::LogicalPosition::new(x, TITLEBAR_HEIGHT);
     popup
         .popup_at(window, position)
         .map_err(|e| format!("弹出菜单失败：{e}"))
@@ -851,14 +919,15 @@ fn run_action<R: Runtime>(app: &AppHandle<R>, action: &str) -> Result<(), String
             Ok(())
         }
         "refresh" => {
-            let main = app
-                .get_webview_window(MAIN_LABEL)
-                .ok_or_else(|| "主窗口不存在".to_string())?;
-            main.reload().map_err(|e| e.to_string())
+            // 刷新的是**内容 webview**（用户看的那个页面），不是窗口。
+            let content = app
+                .get_webview(CONTENT_LABEL)
+                .ok_or_else(|| "内容页面尚未就绪".to_string())?;
+            content.reload().map_err(|e| e.to_string())
         }
         "undo" => send_ctrl_key(app, 0x5A), // Ctrl+Z
         "redo" => send_ctrl_key(app, 0x59), // Ctrl+Y
-        "chat" => toggle_chat_window(app),
+        "chat" => toggle_chat_webview(app),
         other => Err(format!("未知的菜单操作：{other}")),
     }
 }
@@ -890,10 +959,15 @@ fn send_ctrl_key<R: Runtime>(app: &AppHandle<R>, vk: u16) -> Result<(), String> 
         }
     }
 
-    let main = app
-        .get_webview_window(MAIN_LABEL)
-        .ok_or_else(|| "主窗口不存在".to_string())?;
-    let _ = main.set_focus();
+    // 焦点要回到**内容 webview**（点完顶栏菜单后焦点在顶栏那个子 webview 上），
+    // Ctrl+Z / Ctrl+Y 才会作用到用户看的页面上。
+    if let Some(content) = app.get_webview(CONTENT_LABEL) {
+        let _ = content.set_focus();
+    } else if let Some(main) = app.get_window(MAIN_LABEL) {
+        let _ = main.set_focus();
+    } else {
+        return Err("主窗口不存在".to_string());
+    }
     std::thread::sleep(Duration::from_millis(120));
 
     let inputs = [
@@ -956,25 +1030,31 @@ async fn open_main_window_inner(app: &AppHandle, request: OpenRequest) -> Result
     }
 
     // 已经有主窗口（用户从托盘「重新选择连接方式」回来切地址）：
-    // **直接导航过去**，不要 destroy 再重建。
+    // **直接让内容 webview 导航过去**，不要 destroy 再重建。
     // 重建同 label 的窗口要等旧窗口从 Tauri 的注册表里摘掉，而 WebView2 的销毁是异步的，
     // 很容易出现「新窗口建不出来 / 卡住」，表现为点了没反应。
-    if let Some(existing) = app.get_webview_window(MAIN_LABEL) {
-        existing
-            .navigate(url)
-            .map_err(|e| format!("切换连接地址失败：{e}"))?;
-        let _ = existing.unminimize();
-        let _ = existing.show();
-        let _ = existing.set_focus();
+    if app.get_window(MAIN_LABEL).is_some() {
+        navigate_content(app, url)?;
+        if let Some(main) = app.get_window(MAIN_LABEL) {
+            let _ = main.unminimize();
+            let _ = main.show();
+            let _ = main.set_focus();
+        }
+        layout_main_webviews(app);
     } else {
-        // 无边框：系统标题栏被顶部的自绘菜单栏（chrome 窗口）取代。
-        // tao 在 Windows 上关掉 decorations 时只去掉 WS_CAPTION，保留 WS_THICKFRAME，
-        // 所以窗口仍然可以拖边缘缩放，只是没有可见边框。
-        // WebView2 建窗口偶发失败（环境/COM 初始化是异步的），重试几次比直接报错好。
+        // 主窗口是一个**纯 `Window`（容器，本身不加载页面）**，页面交给子 webview：
+        //   · `titlebar` → 本地 `titlebar.html`，命中 capability ⇒ **有 IPC**
+        //   · `content`  → 用户配置的远程 URL ⇒ 按设计**无** IPC
+        // 这样顶栏跑在本地上下文里，位置又由客户区坐标决定 —— 一次性解决
+        // 「顶栏错位」和「远程页面拿不到 IPC」两个问题。
+        //
+        // tao 在 Windows 上关掉 decorations 时只去掉 WS_CAPTION、保留 WS_THICKFRAME，
+        // 所以窗口仍可拖边缘缩放，只是没有可见边框。
+        // 创建会偶发失败（WebView2 环境初始化是异步的），重试几次比直接报错好。
         let mut created = None;
         let mut last_err = String::new();
         for attempt in 1..=3 {
-            let builder = WebviewWindowBuilder::new(app, MAIN_LABEL, WebviewUrl::External(url.clone()))
+            let builder = tauri::window::WindowBuilder::new(app, MAIN_LABEL)
                 .title(MAIN_TITLE)
                 .inner_size(MAIN_WIDTH, MAIN_HEIGHT)
                 .min_inner_size(MAIN_MIN_WIDTH, MAIN_MIN_HEIGHT)
@@ -986,7 +1066,7 @@ async fn open_main_window_inner(app: &AppHandle, request: OpenRequest) -> Result
                 .center()
                 .visible(true);
 
-            match with_shared_profile(app, builder).build() {
+            match builder.build() {
                 Ok(window) => {
                     created = Some(window);
                     break;
@@ -1001,6 +1081,26 @@ async fn open_main_window_inner(app: &AppHandle, request: OpenRequest) -> Result
         let window =
             created.ok_or_else(|| format!("创建主窗口失败（已重试 3 次）：{last_err}"))?;
 
+        // 内容 webview 先建：它是用户唯一必须看到的东西。
+        ensure_content_webview(app, &window, url)?;
+
+        // 顶栏 webview。万一建不出来，就退回**系统标题栏** ——
+        // 否则会留下一个既没标题栏又没按钮、只能靠托盘操作的无边框窗口。
+        if let Err(err) = ensure_titlebar_webview(app, &window) {
+            eprintln!("[DSHTauri] 顶栏 webview 创建失败：{err}；已回退为系统标题栏。");
+            let _ = window.set_decorations(true);
+            // 没有自绘顶栏时内容要占满整个客户区，不能白空出 40px。
+            if let (Some(content), Some((width, height))) =
+                (app.get_webview(CONTENT_LABEL), main_logical_size(&window))
+            {
+                let _ = content.set_position(tauri::LogicalPosition::new(0.0, 0.0));
+                let _ = content.set_size(tauri::LogicalSize::new(width, height));
+            }
+        } else {
+            eprintln!("[DSHTauri] 顶栏 webview 已创建");
+        }
+
+        layout_main_webviews(app);
         let _ = window.set_focus();
         eprintln!(
             "[DSHTauri] 主窗口已创建：pos={:?} size={:?} visible={:?}",
@@ -1013,17 +1113,6 @@ async fn open_main_window_inner(app: &AppHandle, request: OpenRequest) -> Result
     // 主窗口起来了，再开始定期把会话 cookie 转成持久 cookie。
     // 放在这里（而不是 setup）是为了避开启动阶段，只在确实有网页在跑时才动手。
     spawn_cookie_keeper(app.clone());
-
-    // 顶部自绘菜单栏。万一建不出来，就退回系统标题栏，别留一个既没标题栏
-    // 又没按钮、只能靠托盘操作的无边框窗口。
-    if let Err(err) = ensure_chrome_window(app) {
-        eprintln!("[DSHTauri] 自定义标题栏创建失败：{err}；已回退为系统标题栏。");
-        if let Some(main) = app.get_webview_window(MAIN_LABEL) {
-            let _ = main.set_decorations(true);
-        }
-    } else {
-        eprintln!("[DSHTauri] 自定义标题栏已创建");
-    }
 
     // 选择窗口使命完成：**隐藏**而不是销毁。
     // 销毁会干掉「正在执行这条 IPC 的 webview」，Windows 上会让消息处理进入坏状态。
@@ -1086,16 +1175,18 @@ pub fn run() {
                     }
                 }
             }
-            // 主窗口移动 / 缩放时，让标题栏和侧栏跟上
-            WindowEvent::Moved(_) | WindowEvent::Resized(_) => {
+            // 主窗口缩放 / DPI 变化时，重新摆放子 webview（顶栏恒 40 逻辑 px、内容占满剩余）。
+            //
+            // ⚠️ 这里**只做 `set_position` / `set_size`**（非阻塞的消息投递），
+            // **绝不创建 webview** —— `add_child` 会阻塞等主线程，在事件处理器里调用必然死锁。
+            //
+            // 不需要处理 `Moved`：子 webview 用的是**客户区坐标**，
+            // 窗口整体移动不会改变它们的相对位置（旧实现正是错在这里）。
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
                 if window.label() == MAIN_LABEL {
                     let app = window.app_handle();
-                    sync_chrome_window(app);
-                    if let Some(chat) = app.get_webview_window(CHAT_LABEL) {
-                        if chat.is_visible().unwrap_or(false) {
-                            position_chat_window(app);
-                        }
-                    }
+                    layout_main_webviews(app);
+                    emit_window_state(app, window);
                 }
             }
             // 系统在浅色 / 深色之间切换时，同步把托盘图标换成对应版本。
@@ -1265,5 +1356,65 @@ mod tests {
         assert!(!partial.configured);
 
         assert!(serde_json::from_str::<AppConfig>("{ not json").is_err());
+    }
+
+    /// **能力清单必须覆盖顶栏 webview，且不能覆盖主窗口本身。**
+    ///
+    /// 这是本项目最容易被静默搞坏的一处接线：
+    /// - 顶栏是主窗口 `main` 里的**子 webview**（label = `titlebar`）。
+    ///   Tauri 的匹配规则是「webview label 命中 `webviews`」**或**「window label 命中 `windows`」，
+    ///   所以 label 必须写在 `webviews` 里 —— 写成 `windows: ["titlebar"]` 是**不匹配**的
+    ///   （窗口 label 是 `main`），会让顶栏的按钮全部静默失效（只在 devtools 里能看到拒绝）。
+    /// - 反过来，把 `main` 放进 `windows` 会让**所有**子 webview（含加载远程 DSH 页面的
+    ///   `content`）都被这条 capability 覆盖，等于放开了远程页面的授权面。
+    #[test]
+    fn capability_covers_titlebar_webview_but_not_main_window() {
+        let cap: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
+
+        let empty = Vec::new();
+        let webviews: Vec<&str> = cap["webviews"]
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        let windows: Vec<&str> = cap["windows"]
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+
+        assert!(
+            webviews.contains(&TITLEBAR_LABEL),
+            "capabilities/default.json 的 webviews 必须包含顶栏 label `{TITLEBAR_LABEL}`，\
+             否则顶栏拿不到 IPC、按钮全静默失效。当前 webviews={webviews:?}"
+        );
+        assert!(
+            !windows.contains(&MAIN_LABEL),
+            "不要把主窗口 `{MAIN_LABEL}` 放进 windows：那会顺带把远程 content 子 webview 也覆盖。\
+             当前 windows={windows:?}"
+        );
+        assert!(
+            !windows.contains(&"chrome"),
+            "chrome 独立窗口已删除，windows 里不该再出现它。当前 windows={windows:?}"
+        );
+        // 顶栏与内容是同一个窗口里的两个不同 webview，label 不能撞。
+        assert_ne!(TITLEBAR_LABEL, CONTENT_LABEL);
+        assert_ne!(TITLEBAR_LABEL, CHAT_LABEL);
+    }
+
+    /// 顶栏高度是逻辑值，必须原样交给 Tauri（**不许**再乘 scale）。
+    #[test]
+    fn titlebar_height_is_logical_and_equals_40() {
+        assert_eq!(TITLEBAR_HEIGHT, 40.0);
+        // 作为逻辑值它应当在合理范围内；若有人误把它改成设备像素（例如 80），
+        // 配合 Tauri 的内部换算就会得到 160 device px —— 正是用户截图 P1 的现象。
+        let logical: f64 = TITLEBAR_HEIGHT;
+        assert!(
+            (1.0..=60.0).contains(&logical),
+            "TITLEBAR_HEIGHT 看起来不像逻辑像素值：{logical}"
+        );
     }
 }

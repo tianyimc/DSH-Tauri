@@ -61,6 +61,11 @@ public static class Win32 {
   [DllImport("user32.dll")] public static extern void mouse_event(uint flags, int dx, int dy, uint data, UIntPtr extra);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] public static extern bool ScreenToClient(IntPtr h, ref POINT p);
+  [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr h);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder s, int max);
 
   [DllImport("user32.dll", SetLastError = true)]
   public static extern IntPtr SendMessageTimeout(IntPtr h, uint msg, IntPtr w, IntPtr l, uint flags, uint timeout, out IntPtr result);
@@ -109,6 +114,39 @@ public static class Win32 {
     IntPtr result;
     IntPtr ok = SendMessageTimeout(h, WM_NULL, IntPtr.Zero, IntPtr.Zero, SMTO_ABORTIFHUNG, timeoutMs, out result);
     return ok != IntPtr.Zero && !IsHungAppWindow(h);
+  }
+
+  public const uint GW_CHILD = 5;
+  public const uint GW_HWNDNEXT = 2;
+
+  public static string ClassName(IntPtr h) {
+    var sb = new StringBuilder(256);
+    GetClassNameW(h, sb, sb.Capacity);
+    return sb.ToString();
+  }
+
+  /// 直接子窗口（Tauri 的 multiwebview 会把每个 webview 做成主窗口的子 HWND）
+  public static IntPtr[] DirectChildren(IntPtr parent) {
+    var list = new List<IntPtr>();
+    IntPtr c = GetWindow(parent, GW_CHILD);
+    while (c != IntPtr.Zero) { list.Add(c); c = GetWindow(c, GW_HWNDNEXT); }
+    return list.ToArray();
+  }
+
+  /// 所有后代窗口（WebView2 内部还会再嵌容器，顶栏/内容可能是更深一层）
+  public static IntPtr[] Descendants(IntPtr parent) {
+    var list = new List<IntPtr>();
+    EnumChildWindows(parent, delegate(IntPtr h, IntPtr l) { list.Add(h); return true; }, IntPtr.Zero);
+    return list.ToArray();
+  }
+
+  /// 子窗口相对**父窗口客户区**的矩形：{x, y, w, h}
+  public static int[] RectInClient(IntPtr parent, IntPtr child) {
+    RECT r;
+    if (!GetWindowRect(child, out r)) return new int[] { 0, 0, 0, 0 };
+    var tl = new POINT { X = r.Left, Y = r.Top };
+    ScreenToClient(parent, ref tl);
+    return new int[] { tl.X, tl.Y, r.Right - r.Left, r.Bottom - r.Top };
   }
 
   // 按「客户区坐标」点击，自动换算到屏幕坐标
@@ -300,6 +338,67 @@ try {
     Check "本地服务($Port)收到 WebView2 的请求" ((Get-Content $LOG_A -Raw) -match "GET /") "日志：'$(Get-Content $LOG_A -Raw)'"
     # 这条走的是 Tauri 自己的 show/hide，可见性状态同步，断言有效
     Check "首次连接后选择窗口已隐藏" (-not [Win32]::IsWindowVisible($sel))
+
+    Write-Host "== 6.5 顶栏子 webview（新架构：主窗口内的子 webview）=="
+    # 这一段专门盯住用户报告的缺陷 2（顶栏错位）与缺陷 1（点「网页对话」卡死）。
+    #
+    # 关键断言是「顶栏在客户区顶部、高 ≈ 40 × scale」：
+    # 改造前顶栏是**独立窗口** + 手工 `* scale` 同步，实测被缩放两次
+    # （截图 P1 顶栏 158 device px ≈ 40×2×2，而正确的 P2 是 78 ≈ 40×2）。
+    $dpi = [Win32]::GetDpiForWindow($main)
+    if ($dpi -eq 0) { $dpi = 96 }
+    $scale = $dpi / 96.0
+    $expectTbH = [int][math]::Round(40 * $scale)
+    $tol = [int][math]::Max(6.0, 4 * $scale)
+
+    $visDesc = @([Win32]::Descendants($main) | Where-Object { [Win32]::IsWindowVisible($_) })
+    $describe = (($visDesc | ForEach-Object {
+      $r = [Win32]::RectInClient($main, $_)
+      "$([Win32]::ClassName($_))=$($r[2])x$($r[3])@$($r[0]),$($r[1])"
+    }) -join '; ')
+
+    Write-Host ("  客户区={0}x{1} DPI={2} scale={3:N2} 期望顶栏高={4}px(±{5})" -f `
+      $ms[0], $ms[1], $dpi, $scale, $expectTbH, $tol)
+    foreach ($k in $visDesc) {
+      $r = [Win32]::RectInClient($main, $k)
+      Write-Host ("    子窗口 0x{0:X} class={1} rect=({2},{3}) {4}x{5}" -f `
+        $k.ToInt64(), [Win32]::ClassName($k), $r[0], $r[1], $r[2], $r[3])
+    }
+
+    # 顶栏：贴着客户区顶部、高度≈40×scale、宽度≥客户区 90%
+    $tbHit = @($visDesc | Where-Object {
+      $r = [Win32]::RectInClient($main, $_)
+      $r[1] -le 2 -and [math]::Abs($r[3] - $expectTbH) -le $tol -and $r[2] -ge [int]($ms[0] * 0.9)
+    })
+    $tbDetail = "期望高 {0}px(±{1})；实际可见子窗口：{2}" -f $expectTbH, $tol, $describe
+    Check "顶栏子 webview 位于客户区顶部且高≈40×scale（未被 DPI 双重缩放）" ($tbHit.Count -ge 1) $tbDetail
+
+    # 内容 webview：在顶栏下方，且占掉大部分客户区剩余高度
+    $contentHit = @($visDesc | Where-Object {
+      $r = [Win32]::RectInClient($main, $_)
+      $r[1] -ge ($expectTbH - $tol) -and $r[3] -ge [int]($ms[1] * 0.5)
+    })
+    $contentDetail = "客户区高 {0}；实际：{1}" -f $ms[1], $describe
+    Check "内容子 webview 在顶栏下方且占据主体高度" ($contentHit.Count -ge 1) $contentDetail
+
+    Write-Host "== 6.6 点「网页对话」不得卡死（缺陷 1 回归）=="
+    # 标题栏「网页对话」按钮中心：菜单在左侧，应用(0-54) 操作(54-108) 网页对话(≈108-190)
+    # 客户区坐标 = 逻辑坐标 × scale
+    $before = @([Win32]::Descendants($main) | Where-Object { [Win32]::IsWindowVisible($_) }).Count
+    [Win32]::ClickClient($main, [int](148 * $scale), [int](20 * $scale))
+    Start-Sleep -Seconds 8
+    $hungNow = [Win32]::IsHungAppWindow($main)
+    Check "点「网页对话」后主窗口没有卡死（IsHungAppWindow=false）" (-not $hungNow) "IsHungAppWindow=$hungNow"
+    Check "点「网页对话」后主窗口仍响应 WM_NULL（未死锁）" ([Win32]::IsResponsive($main, 5000)) `
+      "若失败说明 add_child 在主线程上死锁 —— 正是用户报告的「卡死、只能任务管理器强杀」"
+    Check "点「网页对话」后进程仍存活" (-not $proc.HasExited)
+    $after = @([Win32]::Descendants($main) | Where-Object { [Win32]::IsWindowVisible($_) }).Count
+    Check "点「网页对话」后多出侧栏子 webview" ($after -gt $before) `
+      "点击前可见子窗口 $before 个，点击后 $after 个"
+    # 再点一次收起，确认反复切换也不会卡
+    [Win32]::ClickClient($main, [int](148 * $scale), [int](20 * $scale))
+    Start-Sleep -Seconds 4
+    Check "再次点击收起侧栏后仍响应（可反复切换）" ([Win32]::IsResponsive($main, 5000))
 
     Write-Host "== 7. 关闭主窗口 = 隐藏到托盘 =="
     [void][Win32]::PostMessage($main, [Win32]::WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero)

@@ -20,3 +20,6 @@ Thumbs.db
 
 # headless smoke-test scratch (scripts/smoke-linux.sh uses mktemp, kept for manual runs)
 .devhome/
+
+# 本地分析/探针产物（诊断脚本、截图、一次性验证脚本），不入库
+.analysis/

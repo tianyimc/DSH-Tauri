@@ -16,8 +16,9 @@
     "posticon": "node scripts/post-icon.mjs",
     "check": "node scripts/check-env.mjs",
     "ver": "node scripts/version.mjs",
-    "test": "npm run test:js && npm run test:rust",
-    "test:js": "node --test scripts/test-rules.mjs",
+    "test": "npm run test:js && npm run verify && npm run test:rust",
+    "test:js": "node --test scripts/test-rules.mjs scripts/test-titlebar.mjs scripts/test-titlebar-wiring.mjs",
+    "verify": "node scripts/verify-titlebar.mjs",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
     "smoke": "bash scripts/smoke-linux.sh"
   },

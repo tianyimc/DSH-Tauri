@@ -119,11 +119,12 @@ DSHTauri/
 ├── src/                            # 前端（无框架、无构建步骤，直接嵌入二进制）
 │   ├── index.html / selector.css / selector.js   # 启动选择界面
 │   ├── config-rules.js             # 配置校验纯函数（浏览器与 Node 共用，可单测）
-│   ├── chrome.html / chrome.css / chrome.js      # 主窗口顶部的自定义标题栏
+│   ├── titlebar.html               # 主窗口顶部的自定义标题栏（本地页面 = 有 IPC）
+│   ├── titlebar/                   #   顶栏的 CSS / JS / 纯函数规则 + 说明
 │   └── about.html / about.css / about.js         # 「关于 / 检查更新」窗口
 ├── src-tauri/
 │   ├── capabilities/
-│   │   ├── default.json            # 第 7 项：选择窗口权限
+│   │   ├── default.json            # 第 7 项：选择窗口 / 关于窗口 / 顶栏子 webview 的权限
 │   │   └── remote-main.json.example# 第 7 项：远程页面 IPC 权限（可选，默认不生效）
 │   ├── icons/                      # 由 `npm run icon` 生成（含 icon.ico）
 │   ├── src/
@@ -649,18 +650,20 @@ fn spawn_local_service(command: &str) -> Result<(), String> {
 
 ## 6.5 自定义标题栏 / 右侧对话侧栏 / 关于窗口
 
-主窗口**没有系统标题栏**（`decorations(false)`），顶部 40px 换成自绘的菜单栏：
+主窗口**没有系统标题栏**（`decorations(false)`），顶部 40px 换成自绘的菜单栏。
+主窗口本身是一个**纯 `Window` 容器（不加载页面）**，页面由它的**子 webview**承载：
 
 ```text
+主窗口 main（纯 Window，1200x800，decorations(false)）
 ┌──────────────────────────────────────────────────────────────────────┐
-│ 应用 ▾   操作 ▾   网页对话              （拖动区域）      ─   □   ✕   │  ← chrome 窗口（40px）
+│ 应用 ▾   操作 ▾   网页对话              （拖动区域）      ─   □   ✕   │  ← 子 webview「titlebar」40px
 ├──────────────────────────────────────────────────────────────────────┤
 │                                                                      │
-│                   主窗口 webview（远程 WebUI）                        │
+│              子 webview「content」（远程 DSH WebUI，无 IPC）           │
 │                                                                      │
 │                                          ┌────────────────────────┐  │
-│                                          │  DSH 对话（侧栏）      │  │
-│                                          │  chat.deepseek.com     │  │
+│                                          │ 子 webview「chat」      │  │
+│                                          │ chat.deepseek.com       │  │
 │                                          └────────────────────────┘  │
 └──────────────────────────────────────────────────────────────────────┘
 ```
@@ -668,25 +671,41 @@ fn spawn_local_service(command: &str) -> Result<(), String> {
 | 菜单 | 展开项 | 行为 |
 | --- | --- | --- |
 | **应用** | 关于 / 检查更新 / 重新连接 | 关于 → 打开「关于」窗口；检查更新 → 打开并自动检查；重新连接 → 与托盘「重新选择连接方式」**完全相同** |
-| **操作** | 刷新 / 撤销 / 重做 | 刷新 = `webview.reload()`（等同 F5）；撤销 / 重做 = 发真实的 **Ctrl+Z / Ctrl+Y** |
-| **网页对话** | （无下拉，直接动作） | 切换右侧侧栏，加载 <https://chat.deepseek.com/> |
+| **操作** | 刷新 / 撤销 / 重做 | 刷新 = 内容 webview `.reload()`（等同 F5）；撤销 / 重做 = 发真实的 **Ctrl+Z / Ctrl+Y** |
+| **网页对话** | （无下拉，直接动作） | 切换右侧侧栏子 webview，加载 <https://chat.deepseek.com/> |
 
 **实现要点**
 
-- 标题栏是一个**独立的 40px 无边框窗口**（label `chrome`），用 `parent(&main)` 做成主窗口的
-  **owned window**：Windows 保证它永远在主窗口之上（但不会盖到别的应用上）、随主窗口最小化、
-  主窗口销毁时一起销毁。位置/宽度由主窗口的 `Moved` / `Resized` 事件同步。
+- 顶栏是主窗口内的一个**子 webview**（label `titlebar`），由 Rust 在 `add_child` 时
+  用**客户区逻辑坐标**摆放到 `(0, 0)`、尺寸 `(宽, 40)`；内容 webview（label `content`）
+  摆在 `(0, 40)`、尺寸 `(宽, 高-40)`。窗口 `Resized` / DPI 变化时重排一次。
+  - **为什么用客户区坐标**：子 webview 的坐标是相对父窗口**客户区左上角**的，
+    窗口整体移动不改变相对位置 ⇒ **不需要**任何 `Moved` 同步，从根上消除了
+    「拖动窗口后顶栏错位」。
+  - **绝不要手算 `× scale_factor`**：`LogicalSize` / `LogicalPosition` 收的就是逻辑单位，
+    Tauri 内部会自己乘一次。手动再乘一次会让高度变成 2 倍（实测顶栏 158 device px ≈ 40×2×2）。
+    静态校验脚本 `npm run verify` 里有专门的断言盯着这条。
+  - `Window::add_child` 是 Tauri 的 multiwebview API，需要 `tauri` 的 **`unstable`** feature。
+- **顶栏必须是本地页面**（`src/titlebar.html`）：只有本地来源才命中 `capabilities/default.json`，
+  才有 IPC 权限去调 `chrome_action` / `window_control` 等命令。
+  远程的 `content` 子 webview 按设计**不授予**任何 capability（见第 7 项）。
+- **所有会创建 webview 的命令都必须是 `async`**：`add_child` 内部会阻塞等主线程，
+  在同步命令（跑在主线程）或事件处理器里调用会**死锁** —— 表现为「点网页对话整个程序卡住、
+  不报未响应、只能任务管理器强杀」。这是 Tauri 官方文档写明的坑。
 - 主窗口虽然无边框，但 tao 只去掉 `WS_CAPTION`、保留 `WS_THICKFRAME`，所以**仍然可以拖边缘缩放**。
-- 下拉菜单用**系统原生菜单**（`Menu::popup_at`），不是 HTML：标题栏只有 40px 高，
-  HTML 下拉会被窗口边界裁掉；原生菜单能正常溢出，外观也跟随系统。
-- 拖动窗口由标题栏发起、拖的却是**主窗口**（`start_drag` 命令）：如果直接拖标题栏窗口，
-  只会把它自己拖走、和主窗口脱节。
+- 下拉菜单用**系统原生菜单**（`Menu::popup_at`），不是 HTML：外观跟随系统、不受裁剪。
+- 拖动窗口由顶栏发起、拖的却是**主窗口**（`start_drag` 命令）；主窗口最大化时 Rust 侧直接忽略拖动。
 - 撤销/重做**不能**用 `eval` 合成键盘事件 —— 合成事件不受信任，浏览器不会拿它触发 undo/redo。
-  这里用 Win32 `SendInput` 发真实按键（先把焦点切回主窗口）。
-- 标题栏窗口万一创建失败，会自动把主窗口退回系统标题栏，不会留下一个既没标题栏又没按钮的无边框窗口。
+  这里用 Win32 `SendInput` 发真实按键（先把焦点切回内容 webview）。
+- 顶栏 webview 万一创建失败，会自动把主窗口退回**系统标题栏**，并把内容铺满客户区，
+  不会留下一个既没标题栏又没按钮的无边框窗口。
 
-**右侧对话侧栏**：同样是主窗口的 owned window，贴在主窗口右侧（顶部让开标题栏），
-随主窗口移动/缩放同步；「网页对话」再次点击即隐藏。
+**右侧对话侧栏**：主窗口内的第三个子 webview（首次点击时创建），贴在右侧、顶部让开顶栏；
+「网页对话」再次点击即隐藏。
+
+> **平台差异**：Linux（WebKitGTK）把子 webview 塞进一个竖向 `GtkBox`，会**忽略**指定的坐标与尺寸，
+> 所以 Linux 下顶栏不会正确贴在顶部 40px。目标平台 Windows 走真正的子 HWND，坐标按传入值生效。
+> Linux 只用于开发机自测。
 
 ---
 
@@ -700,11 +719,34 @@ fn spawn_local_service(command: &str) -> Result<(), String> {
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "选择窗口（本地 index.html）的默认权限：调用应用自定义命令（load_config / save_config / start_local_service / probe_url / open_main_window）+ Tauri 核心 API。",
-  "windows": ["selector"],
+  "description": "本地窗口 / 本地 webview 的权限：调用应用自定义命令 + Tauri 核心 API。",
+  "windows": ["selector", "about"],
+  "webviews": ["titlebar"],
   "permissions": ["core:default"]
 }
 ```
+
+**这里为什么用 `webviews` 而不是 `windows`（很容易搞错，后果是静默失效）**
+
+顶栏是主窗口 `main` 里的一个**子 webview**，label 是 `titlebar`。capability 的匹配规则是
+「**webview label** 命中 `webviews`」**或**「**window label** 命中 `windows`」二者之一
+（见 tauri 的 `RuntimeAuthority::resolve_access`）：
+
+```rust
+cmd.webviews.iter().any(|w| w.matches(webview))
+  || cmd.windows.iter().any(|w| w.matches(window))
+```
+
+所以 `titlebar` **必须**写在 `webviews` 里；写成 `windows: ["titlebar"]` 是**不匹配**的
+（窗口 label 是 `main`），顶栏所有按钮会**静默失效**，只在 devtools 里能看到
+`not allowed` 之类的拒绝。
+
+**另外，故意不把 `main` 放进 `windows`**：那会让主窗口的**所有**子 webview
+（包括加载远程 DSH 页面的 `content`）都被这条 capability 覆盖。虽然 `local: true`
+的来源检查仍会挡住远程来源，但显式只授权 `titlebar` 更清晰、更安全。
+
+> `cargo test` 里有一条 `capability_covers_titlebar_webview_but_not_main_window`
+> 专门盯住这个接线；改 label 或改权限会立刻测挂。
 
 ### `capabilities/remote-main.json.example`（默认不生效）
 
@@ -714,7 +756,7 @@ Tauri 只加载 `capabilities/*.json`，所以 `.example` 后缀天然是「关�
 {
   "identifier": "remote-main",
   "description": "主窗口加载远程页面时的权限（remote.urls 必须与窗口实际加载的 URL 完全一致）。",
-  "windows": ["main"],
+  "windows": ["content"],
   "local": false,
   "remote": {
     "urls": ["http://127.0.0.1:3080", "https://dsh.example.com"]
@@ -726,7 +768,8 @@ Tauri 只加载 `capabilities/*.json`，所以 `.example` 后缀天然是「关�
 要点：
 
 1. **主窗口即使没有任何 capability 也能正常渲染网页**。capability 只控制 IPC / 插件权限，不控制页面加载。
-2. 应用**自定义命令**（`load_config` 等）不需要在 `permissions` 里逐条列出；只要该窗口被任一 capability 覆盖，就能 `invoke`。
+   远程的 `content` 子 webview 就是这种情况：无权限 → 正好符合「远程页面不需要本地能力」的默认假设。
+2. 应用**自定义命令**（`load_config` 等）不需要在 `permissions` 里逐条列出；只要该 webview 被任一 capability 覆盖，就能 `invoke`。
 3. 远程页面要用 Tauri API，必须 `"local": false` + `"remote": { "urls": [...] }`，且 **URL 必须完全匹配**（scheme + host + port）。改地址就要改这里。
 4. 本项目 URL 是运行时可配置的，所以默认不启用——否则用户换个地址就会遇到「静默没权限」。这是有意的安全取舍，详见 [TROUBLESHOOTING §5](docs/TROUBLESHOOTING.md)。
 

@@ -11,6 +11,63 @@
 
 ---
 
+## v0.2.0 Gen2
+
+修掉 v0.2.0 实机反馈的两个问题：**点「网页对话」程序卡死**、**顶栏位置/高度错乱**；
+并把顶栏样式对齐官方 DeepSeek Harness 桌面端。
+
+### 修复
+
+- **点「网页对话」后整个程序卡死**（不报「未响应」，但无法关窗、无法拖动、
+  托盘也退不掉，只能任务管理器强杀）
+  - 根因：`chrome_action` 是**同步命令**，跑在主线程上；它调到的
+    `toggle_chat_window` 又在主线程里**同步** `WebviewWindowBuilder::build()`
+    去建新的 WebView2。Tauri 官方文档对这个坑写得很明确：
+    「On Windows, this function deadlocks when used in a synchronous command **or event handlers**」
+    —— 嵌套在另一个 WebView2 的 IPC 回调里建 webview 会永远初始化不完。
+    这正是「不报未响应、但点 × 没反应、只能强杀」的成因。
+  - 现在：所有会创建 webview 的命令一律 `async`（`chrome_action` 等），
+    并且**创建子 webview 只在异步路径上做**。
+  - 「关于」窗口走的是同一条分发链（`show_about_window`），**同样会卡**，一并修掉。
+
+- **顶栏位置与高度错乱**（仅在登录后 / 拖动窗口后尤其明显）
+  - 根因：`CHROME_HEIGHT` 被 DPI **缩放两次**。Tauri 的 `inner_size(f64)` / `set_size`
+    收的是**逻辑**像素，框架内部会自己乘 `scale_factor`；而旧代码先手算了
+    `CHROME_HEIGHT * scale` 再当逻辑值传进去 ⇒ 实际物理高度 = `40 × 2 × 2`。
+    实测截图里顶栏是 **158 device px**（≈40×2×2），而正确值应是 **78**（≈40×2）。
+    另外位置用了 `outer_position()` 的**物理**坐标却按**逻辑**坐标解释，又放大一次。
+  - 现在：顶栏不再是独立窗口，改为**主窗口内的一个子 webview**，
+    位置用**客户区逻辑坐标**（`LogicalPosition(0, 0)` + `LogicalSize(宽, 40)`），
+    **全文件不再有任何手算 `* scale`**；窗口缩放时在 `Resized` 里重排（只做非阻塞的
+    `set_position`/`set_size`）。子 webview 用客户区坐标 ⇒ **窗口整体移动不影响它**，
+    从根上消除了「拖动后错位」。
+
+### 变更
+
+- **顶栏样式对齐官方桌面端**：底色 `#1b1b1c`、文字色 `#aaadb0`、高 40px、
+  **去掉**原来的分隔线；窗口按钮透明无边框，关闭按钮 hover 用 Windows 标准红 `#c42b1c`。
+  保留「应用 / 操作 / 网页对话」与最小化 / 最大化 / 关闭、空白处拖动、双击最大化。
+  **不包含**官方最左边那个侧边栏展开按钮（按需求刻意去掉）。
+- **主窗口改为「纯容器窗口 + 子 webview」**：`titlebar` 加载本地 `titlebar.html`
+  （因此命中 capability，**有 IPC**），`content` 加载用户配置的远程 DSH 页面
+  （按设计**不授予**任何 capability）。右侧「网页对话」也改成主窗口内的子 webview。
+- 顶栏页面从 `src/chrome.*` 迁移到 `src/titlebar.html` + `src/titlebar/`；
+  `chrome` 独立窗口与 `CHROME_LABEL` 已彻底删除。
+- Windows 冒烟测试新增两段：**顶栏子 webview 几何**（顶部、高≈40×scale，
+  可直接抓出 DPI 双重缩放复发）与**点「网页对话」不得卡死**（`IsHungAppWindow` + 反复切换）。
+
+### 说明
+
+- 主窗口子 webview 依赖 Tauri 的 multiwebview API（`Window::add_child`），
+  需要 `tauri` 的 **`unstable`** feature。它已是 Tauri 2 稳定版里的既有能力，
+  但官方仍标注为 unstable，升级 Tauri 时需复查。
+- **已知平台差异**：该 API 在 Linux（WebKitGTK）上把子 webview 塞进一个竖向
+  `GtkBox`，**会忽略我们指定的坐标与尺寸**，因此 Linux 下顶栏不会正确地贴在顶部 40px。
+  目标平台 Windows（WebView2）走的是真正的子 HWND，坐标按传入值生效。
+  Linux 仅用于开发机自测，不影响发布产物。
+
+---
+
 ## v0.2.0
 
 自定义标题栏 + 右侧对话侧栏；彻底解决「每次启动都要重新登录」。

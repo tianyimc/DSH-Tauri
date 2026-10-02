@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="color-scheme" content="dark light" />
+    <title>DSHTauri 顶栏</title>
+    <link rel="stylesheet" href="titlebar/titlebar.css" />
+  </head>
+  <body>
+    <!--
+      主窗口是无边框的，这条 40px 高的横条就是它的标题栏。
+      它是**本地页面**（tauri://localhost），因此命中 capabilities/default.json，
+      可以正常 invoke 自定义命令；这也是它必须独立成一个 webview 的原因
+      （远程页面按 docs/TROUBLESHOOTING.md §5 没有任何 IPC 权限）。
+
+      这里刻意**没有**官方最左边那个「侧边栏展开」按钮 —— 用户明确不要。
+    -->
+    <div class="bar" id="bar">
+      <button class="menu" id="btn-app" type="button" aria-haspopup="menu" aria-expanded="false">
+        应用
+      </button>
+      <button class="menu" id="btn-actions" type="button" aria-haspopup="menu" aria-expanded="false">
+        操作
+      </button>
+      <!-- 「网页对话」是直接动作，没有下拉 -->
+      <button class="menu" id="btn-chat" type="button">网页对话</button>
+
+      <div class="spacer" id="spacer"></div>
+
+      <div class="controls" id="controls">
+        <button class="ctl" id="btn-min" type="button" title="最小化" aria-label="最小化">
+          &#xE921;
+        </button>
+        <button class="ctl" id="btn-max" type="button" title="最大化" aria-label="最大化">
+          &#xE922;
+        </button>
+        <button class="ctl close" id="btn-close" type="button" title="关闭到托盘" aria-label="关闭到托盘">
+          &#xE8BB;
+        </button>
+      </div>
+    </div>
+
+    <script type="module" src="titlebar/titlebar.js"></script>
+  </body>
+</html>

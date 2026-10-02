@@ -947,9 +947,9 @@ npm run tauri build -- --bundles nsis --verbose 2>&1 | tail -100   # 完整打�
 | 托盘菜单可以重新显示窗口或退出 | ✅ 代码已实现（托盘创建已实测成功） | 应用日志无「系统托盘创建失败」告警 ⇒ `setup_tray` 返回 `Ok`；而「关闭即隐藏」只在托盘就绪时生效，它确实生效了 ⇒ 托盘已建好。菜单项点击本身需要真实桌面面板，无法在无头环境自动化 |
 | 首次点击要求用户提供配置并记录 | ✅ 已验证 | 地址默认为空；无 `config.json` 时点击「本地」：**不打开主窗口、不写配置**；填入地址并保存后才生成 `config.json` 并打开主窗口 |
 | **本地 / 远程允许只配一个** | ✅ 已验证（端到端 + 单测） | 冒烟测试分两轮：只填本地 → 连上，`config.json` 里 `"remoteUrl":""`；清空重来只填远程 → 同样连上，`"localUrl":""`。另有 17 条 JS 单测覆盖校验规则 |
-| 推送到 GitHub 后 Actions 在 `windows-latest` 成功运行 | ⏳ 需要你推送后确认 | 工作流 YAML 已通过解析校验；本地已验证 `cargo check --target x86_64-pc-windows-msvc` 通过（等价于 CI 的编译步骤） |
-| Artifact 中存在 NSIS `.exe` | ⏳ 需要 CI 运行后确认 | `upload-artifact` 路径 = `src-tauri/target/release/bundle/nsis/*`，`if-no-files-found: error` |
-| Windows 11 安装后功能正常 | ⏳ 需要你在 Windows 上确认 | — |
+| 推送到 GitHub 后 Actions 在 `windows-latest` 成功运行 | ✅ 已验证 | [run #36974080393](https://github.com/tianyimc/DSH-Tauri/actions/runs/36974080393) @ `4ac4267`：全部步骤绿（含 `Resolve version` / `Run tests` / `Build NSIS bundle` / `Upload NSIS installer`） |
+| Artifact 中存在 NSIS `.exe` | ✅ 已验证 | Artifact **`DSHTauri-v1.1.1-nsis`**，1.21 MB，未过期。`Upload NSIS installer` 设了 `if-no-files-found: error`，步骤成功即证明 `bundle/nsis/` 非空。（下载 artifact 走 API 需要 token，我没法直接取包内文件） |
+| Windows 11 安装后功能正常 | ⏳ 需要你在 Windows 上确认 | 安装包已产出，实机验收只能由你完成 |
 
 复现方式：`npm run smoke`（需要 `xvfb xdotool wmctrl openbox dbus-x11`）。当前结果：**21 通过 / 0 失败**。
 

@@ -522,6 +522,108 @@ fn reveal_selector<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
+
+/// 把 WebView2 里的**会话 cookie** 改成持久 cookie。
+///
+/// Chromium 的会话 cookie（没有 Expires 的那种）只活在内存里，浏览器进程一退就没了。
+/// Cloudflare Access 的 `CF_Authorization` 正是会话 cookie —— 这就是「每次开程序都要重新登录」
+/// 的原因（持久 cookie 我们已经在冒烟测试里验证过能跨重启保留）。
+///
+/// 做法：取出该页面可见的 cookie，凡是 `IsSession == true` 的，把 `Expires` 设成正数
+/// （WebView2 里 Expires >= 0 即视为持久 cookie），再 `AddOrUpdateCookie` 写回去。
+#[cfg(windows)]
+fn persist_session_cookies<R: Runtime>(webview: &tauri::Webview<R>, page_url: &str) {
+    use webview2_com::GetCookiesCompletedHandler;
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2Cookie, ICoreWebView2CookieList, ICoreWebView2_2,
+    };
+    use windows_core::{Interface, BOOL, HSTRING};
+
+    /// 转换后的有效期
+    const KEEP_DAYS: f64 = 30.0;
+
+    let uri = HSTRING::from(page_url);
+    let _ = webview.with_webview(move |platform| {
+        let controller = platform.controller();
+        let core = match unsafe { controller.CoreWebView2() } {
+            Ok(core) => core,
+            Err(_) => return,
+        };
+        // CookieManager 是在 ICoreWebView2_2 上新增的，需要从 ICoreWebView2 cast 过去
+        let core2: ICoreWebView2_2 = match core.cast() {
+            Ok(core2) => core2,
+            Err(_) => return,
+        };
+        let manager = match unsafe { core2.CookieManager() } {
+            Ok(manager) => manager,
+            Err(_) => return,
+        };
+        let manager_in_handler = manager.clone();
+
+        // 注意：webview2-com 已经把 HRESULT 转成 Result 再传给闭包（见 ClosureArg for HRESULT）
+        let handler = GetCookiesCompletedHandler::create(Box::new(
+            move |result: windows_core::Result<()>,
+                  cookies: Option<ICoreWebView2CookieList>|
+                  -> windows_core::Result<()> {
+            result?;
+            let Some(cookies) = cookies else {
+                return Ok(());
+            };
+            let mut count = 0u32;
+            unsafe { cookies.Count(&mut count)? };
+
+            let expires = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0)
+                + KEEP_DAYS * 24.0 * 3600.0;
+
+            for index in 0..count {
+                let cookie: ICoreWebView2Cookie = unsafe { cookies.GetValueAtIndex(index)? };
+                let mut is_session = BOOL(0);
+                unsafe { cookie.IsSession(&mut is_session)? };
+                if is_session.as_bool() {
+                    unsafe { cookie.SetExpires(expires)? };
+                    unsafe { manager_in_handler.AddOrUpdateCookie(&cookie)? };
+                }
+            }
+            Ok(())
+        }));
+
+        let _ = unsafe { manager.GetCookies(&uri, &handler) };
+    });
+}
+
+/// 非 Windows 上没有 WebView2，什么都不做。
+#[cfg(not(windows))]
+fn persist_session_cookies<R: Runtime>(_webview: &tauri::Webview<R>, _page_url: &str) {}
+
+/// 后台定期把会话 cookie 转成持久 cookie。
+///
+/// 不能只在页面加载完成时做一次：Cloudflare Access 的授权 cookie 往往是在
+/// 跳转/异步请求之后才落下来的。所以起一个轻量线程，启动后很快跑一次，之后每 20 秒一次
+/// （`GetCookies` 很便宜，开销可以忽略）。
+fn spawn_cookie_keeper<R: Runtime>(app: AppHandle<R>) {
+    std::thread::spawn(move || {
+        let mut first = true;
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(if first { 3 } else { 20 }));
+            first = false;
+            for label in [MAIN_LABEL, CHAT_LABEL] {
+                let Some(window) = app.get_webview_window(label) else {
+                    continue;
+                };
+                let Ok(url) = window.url() else { continue };
+                let url = url.to_string();
+                if !url.starts_with("http") {
+                    continue;
+                }
+                persist_session_cookies(window.as_ref(), &url);
+            }
+        }
+    });
+}
+
 /* -------------------------------------------------------------------- tray */
 
 /// 按系统主题挑托盘图标：深色任务栏用反转成白色的 logo，浅色任务栏用原始深色 logo。
@@ -915,6 +1017,7 @@ pub fn run() {
             if let Err(err) = create_selector_window(app.handle()) {
                 eprintln!("[DSHTauri] 创建选择窗口失败：{err}");
             }
+            spawn_cookie_keeper(app.handle().clone());
             match setup_tray(app.handle()) {
                 Ok(()) => TRAY_READY.store(true, Ordering::Relaxed),
                 Err(err) => eprintln!(

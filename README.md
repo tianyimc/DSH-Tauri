@@ -65,7 +65,7 @@
 > 本项目的应用名是 **DSHTauri**，产物是 NSIS 安装包而不是 zip，所以对应成
 > `DSHTauri-v0.1.11-setup.exe` / `DSHTauri-v0.1.11Gen2-setup.exe`。
 
-**当前版本：`v0.1.2`**（Gen1，不显示后缀）。
+**当前版本：`v0.2.0`**（Gen1，不显示后缀）。
 
 **怎么用**
 
@@ -87,7 +87,7 @@ node scripts/version.mjs --set 0.1.2       # 提升 C（会同时把 Gen 重置�
 CI 用 `node scripts/version.mjs --github` 推导 artifact 名、Release tag、标题和安装包文件名，
 所以**发布包名和 tag 永远跟着版本规则走**，不用手工改 workflow。
 
-**在程序里也看得到**：选择窗口右下角显示 `v0.1.2`；托盘悬浮提示是 `DSHTauri v0.1.2`。
+**在程序里也看得到**：选择窗口右下角显示 `v0.2.0`；托盘悬浮提示是 `DSHTauri v0.2.0`。
 Gen 号由 `src-tauri/build.rs` 在编译期读 `version.json` 塞进二进制。
 
 **每次发版要做的三件事**（详见 [CHANGELOG.md](CHANGELOG.md)）：

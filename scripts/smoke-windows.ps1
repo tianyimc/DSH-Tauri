@@ -414,9 +414,10 @@ setInterval(() => {}, 1000);
   $run2 = Open-MainViaLocal "cookie2"
   $log2 = Get-Content $COOKIE_LOG -Raw
   $before = (($log2 -split "`n") | Where-Object { $_ -like "/before*" } | Select-Object -First 1)
-  $sessSurvived = ($before -match "sess%3D1")
   Check "持久 cookie 跨重启保留" ($before -match "persist%3D1") "第二次启动的 /before：'$before'"
-  Write-Host ("  会话 cookie 是否保留：{0}" -f $(if ($sessSurvived) { "是" } else { "否（Chromium 默认行为，Cloudflare Access 的 CF_Authorization 就是会话 cookie）" }))
+  # Chromium 默认会丢掉会话 cookie，Cloudflare Access 的 CF_Authorization 就是这种。
+  # 应用里有个 cookie keeper 会把它转成持久 cookie，所以这里必须是「保留」。
+  Check "会话 cookie 也被转成持久 cookie（跨重启保留）" ($before -match "sess%3D1") "第二次启动的 /before：'$before'"
   Stop-App $run2
 }
 catch {

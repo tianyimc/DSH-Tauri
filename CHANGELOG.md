@@ -11,6 +11,44 @@
 
 ---
 
+## v0.2.0
+
+自定义标题栏 + 右侧对话侧栏；彻底解决「每次启动都要重新登录」。
+
+### 新增
+
+- **自定义标题栏**：主窗口不再显示系统标题栏，顶部改为 40px 的自绘菜单栏
+  - **应用**：关于 / 检查更新 / 重新连接（与托盘「重新选择连接方式」相同）
+  - **操作**：刷新 / 撤销 / 重做（撤销重做发送真实的 Ctrl+Z / Ctrl+Y）
+  - **网页对话**：点击后在**右侧打开应用级侧栏**，加载 <https://chat.deepseek.com/>
+  - 右侧还有最小化 / 最大化 / 关闭按钮；标题栏空白处可拖动窗口，双击最大化
+  - 下拉菜单用**系统原生菜单**（标题栏只有 40px，HTML 下拉会被窗口裁掉）
+  - 「关闭」= 隐藏到托盘，与系统标题栏行为一致
+  - 万一标题栏窗口建不出来，会自动退回系统标题栏，不会留下一个无法操作的无边框窗口
+- **「关于」窗口**：显示版本号，并可在窗口内检查更新（直接查 GitHub Releases）
+
+### 修复
+
+- **每次启动都要重新登录（Cloudflare Access 等）**
+  - 原因有两层，实测确认：
+    1. 之前没有显式指定 WebView2 用户数据目录（`data_directory` 为 `None`，wry 会把空字符串
+       传给 `CreateCoreWebView2EnvironmentWithOptions`），数据目录落到默认位置，且不保证
+       各窗口共用同一份 profile。→ 现在统一固定到 `%LOCALAPPDATA%\<identifier>\webview2`。
+    2. 更关键的是：**Chromium 默认不持久化「会话 cookie」**（没有 `Expires` 的那种），
+       而 Cloudflare Access 的 `CF_Authorization` 正是会话 cookie —— 进程一退就没了。
+       → 现在有一个 cookie keeper，定期把会话 cookie 的 `Expires` 设成正数并写回，
+       让它变成持久 cookie（保留 30 天）。
+  - 验证：Windows 冒烟测试新增一段，页面先上报已有 cookie 再写入，重启后断言
+    **持久 cookie 与会话 cookie 都还在**。
+
+### 说明
+
+- 会话 cookie 转持久意味着**关闭程序后登录态仍然保留**（这正是本应用想要的）；
+  如果要「关掉就退出登录」，目前需要手动清理 `%LOCALAPPDATA%\com.dsh.dshtauri\webview2`。
+- 撤销 / 重做目前只在 Windows 上实现（用 Win32 `SendInput`）。
+
+---
+
 ## v0.1.2
 
 修掉 v0.1.1 实机测试发现的两个问题。

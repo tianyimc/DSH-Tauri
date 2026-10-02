@@ -937,6 +937,17 @@ fn send_ctrl_key<R: Runtime>(_app: &AppHandle<R>, _vk: u16) -> Result<(), String
 /// 创建窗口时会走 `proxy.send_event` 交给主线程处理（主线程此时空闲），不再有嵌套回调问题。
 #[tauri::command]
 async fn open_main_window(app: AppHandle, request: OpenRequest) -> Result<(), String> {
+    match open_main_window_inner(&app, request).await {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            // 前端只会把错误显示在状态行里；同时写一份到 stderr，CI 上才查得到
+            eprintln!("[DSHTauri] 打开主窗口失败：{err}");
+            Err(err)
+        }
+    }
+}
+
+async fn open_main_window_inner(app: &AppHandle, request: OpenRequest) -> Result<(), String> {
     let raw = request.url.trim();
     let url = tauri::Url::parse(raw).map_err(|e| format!("URL 无效（{raw}）：{e}"))?;
     match url.scheme() {
@@ -959,23 +970,44 @@ async fn open_main_window(app: AppHandle, request: OpenRequest) -> Result<(), St
         // 无边框：系统标题栏被顶部的自绘菜单栏（chrome 窗口）取代。
         // tao 在 Windows 上关掉 decorations 时只去掉 WS_CAPTION，保留 WS_THICKFRAME，
         // 所以窗口仍然可以拖边缘缩放，只是没有可见边框。
-        let builder = WebviewWindowBuilder::new(&app, MAIN_LABEL, WebviewUrl::External(url))
-            .title(MAIN_TITLE)
-            .inner_size(MAIN_WIDTH, MAIN_HEIGHT)
-            .min_inner_size(MAIN_MIN_WIDTH, MAIN_MIN_HEIGHT)
-            .resizable(true)
-            .maximizable(true)
-            .minimizable(true)
-            .closable(true)
-            .decorations(false)
-            .center()
-            .visible(true);
+        // WebView2 建窗口偶发失败（环境/COM 初始化是异步的），重试几次比直接报错好。
+        let mut created = None;
+        let mut last_err = String::new();
+        for attempt in 1..=3 {
+            let builder = WebviewWindowBuilder::new(app, MAIN_LABEL, WebviewUrl::External(url.clone()))
+                .title(MAIN_TITLE)
+                .inner_size(MAIN_WIDTH, MAIN_HEIGHT)
+                .min_inner_size(MAIN_MIN_WIDTH, MAIN_MIN_HEIGHT)
+                .resizable(true)
+                .maximizable(true)
+                .minimizable(true)
+                .closable(true)
+                .decorations(false)
+                .center()
+                .visible(true);
 
-        let window = with_shared_profile(&app, builder)
-            .build()
-            .map_err(|e| format!("创建主窗口失败：{e}"))?;
+            match with_shared_profile(app, builder).build() {
+                Ok(window) => {
+                    created = Some(window);
+                    break;
+                }
+                Err(err) => {
+                    last_err = err.to_string();
+                    eprintln!("[DSHTauri] 创建主窗口失败（第 {attempt} 次）：{last_err}");
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            }
+        }
+        let window =
+            created.ok_or_else(|| format!("创建主窗口失败（已重试 3 次）：{last_err}"))?;
 
         let _ = window.set_focus();
+        eprintln!(
+            "[DSHTauri] 主窗口已创建：pos={:?} size={:?} visible={:?}",
+            window.outer_position(),
+            window.outer_size(),
+            window.is_visible()
+        );
     }
 
     // 主窗口起来了，再开始定期把会话 cookie 转成持久 cookie。
@@ -984,11 +1016,13 @@ async fn open_main_window(app: AppHandle, request: OpenRequest) -> Result<(), St
 
     // 顶部自绘菜单栏。万一建不出来，就退回系统标题栏，别留一个既没标题栏
     // 又没按钮、只能靠托盘操作的无边框窗口。
-    if let Err(err) = ensure_chrome_window(&app) {
+    if let Err(err) = ensure_chrome_window(app) {
         eprintln!("[DSHTauri] 自定义标题栏创建失败：{err}；已回退为系统标题栏。");
         if let Some(main) = app.get_webview_window(MAIN_LABEL) {
             let _ = main.set_decorations(true);
         }
+    } else {
+        eprintln!("[DSHTauri] 自定义标题栏已创建");
     }
 
     // 选择窗口使命完成：**隐藏**而不是销毁。

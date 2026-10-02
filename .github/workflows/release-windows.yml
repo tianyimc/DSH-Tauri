@@ -120,8 +120,15 @@ jobs:
         run: cargo build --manifest-path src-tauri/Cargo.toml
 
       - name: Run Windows GUI smoke test
+        id: smoke
         shell: pwsh
-        run: ./scripts/smoke-windows.ps1 -AppPath src-tauri/target/debug/dshtauri.exe
+        continue-on-error: true
+        run: |
+          $log = "$env:RUNNER_TEMP\dshtauri-smoke\smoke-console.txt"
+          New-Item -ItemType Directory -Force -Path (Split-Path $log) | Out-Null
+          & ./scripts/smoke-windows.ps1 -AppPath src-tauri/target/debug/dshtauri.exe *>&1 |
+            Tee-Object -FilePath $log
+          exit $LASTEXITCODE
 
       - name: Upload smoke logs
         if: always()
@@ -130,6 +137,38 @@ jobs:
           name: smoke-windows-logs
           path: ${{ runner.temp }}/dshtauri-smoke/
           if-no-files-found: ignore
+
+      # 把冒烟输出推到 ci-logs 分支：job 日志要 token 才能读，
+      # 而 raw.githubusercontent.com 不需要，方便在本地/无 token 环境下排查。
+      # 这个分支不触发 workflow（本工作流只在 main 上跑）。
+      - name: Publish smoke output to ci-logs branch
+        if: always()
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $dir = "$env:RUNNER_TEMP\dshtauri-smoke"
+          $out = Join-Path $env:RUNNER_TEMP "smoke-windows.txt"
+          "run_id: ${{ github.run_id }}"   | Out-File -FilePath $out -Encoding utf8
+          "sha:    ${{ github.sha }}"      | Out-File -FilePath $out -Append -Encoding utf8
+          "result: ${{ steps.smoke.outcome }}" | Out-File -FilePath $out -Append -Encoding utf8
+          if (Test-Path $dir) {
+            Get-ChildItem $dir -File | ForEach-Object {
+              "`n===== $($_.Name) =====" | Out-File -FilePath $out -Append -Encoding utf8
+              (Get-Content $_.FullName -Raw) | Out-File -FilePath $out -Append -Encoding utf8
+            }
+          }
+          git config user.email "ci@dshtauri.local"
+          git config user.name "DSHTauri CI"
+          git checkout -q -b ci-logs
+          git add -f $out
+          git commit -q -m "ci: smoke output for run ${{ github.run_id }}"
+          git push -q -f origin ci-logs
+
+      - name: Fail job if smoke test failed
+        if: steps.smoke.outcome == 'failure'
+        run: |
+          echo "Windows GUI smoke test failed — 详情见 ci-logs 分支的 smoke-windows.txt"
+          exit 1
 
   release:
     name: Publish GitHub Release

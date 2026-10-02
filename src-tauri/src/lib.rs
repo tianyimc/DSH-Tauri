@@ -14,9 +14,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use tauri::{
+    image::Image,
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager, Runtime, WebviewUrl, WebviewWindowBuilder, WindowEvent,
+    AppHandle, Manager, Runtime, Theme, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 
 /// 启动选择窗口的 label（在 tauri.conf.json 中预创建）。
@@ -47,6 +48,11 @@ const DEFAULT_REMOTE_URL: &str = "https://dsh.example.com";
 /// 但也**不能**继续「关闭即隐藏」——那会让窗口藏起来却没有任何入口找回来。
 /// 所以这个开关同时决定 `CloseRequested` 的行为：托盘不可用就正常关闭。
 static TRAY_READY: AtomicBool = AtomicBool::new(false);
+
+/// 托盘图标 · 深色任务栏：把原始深色 logo（#020E36）**反转为白色**，透明背景不变。
+const TRAY_ICON_ON_DARK: &[u8] = include_bytes!("../icons/tray-dark.png");
+/// 托盘图标 · 浅色任务栏：原始深色 logo。
+const TRAY_ICON_ON_LIGHT: &[u8] = include_bytes!("../icons/tray-light.png");
 
 /// 持久化在 `<app config dir>/config.json` 的用户配置。
 ///
@@ -186,6 +192,26 @@ fn reveal_window<R: Runtime>(app: &AppHandle<R>) {
 
 /* -------------------------------------------------------------------- tray */
 
+/// 按系统主题挑托盘图标：深色任务栏用反转成白色的 logo，浅色任务栏用原始深色 logo。
+///
+/// 主题探测不到时按**深色**处理——Windows 11 默认就是深色任务栏，
+/// 而深色 logo 落在深色底上会直接看不见，比反过来更糟。
+fn tray_icon(theme: Option<Theme>) -> Option<Image<'static>> {
+    let bytes = match theme {
+        Some(Theme::Light) => TRAY_ICON_ON_LIGHT,
+        _ => TRAY_ICON_ON_DARK,
+    };
+    Image::from_bytes(bytes).ok()
+}
+
+/// 读取当前窗口主题。`setup` 跑之前配置里的选择窗口就已经创建好了，所以这里能拿到。
+fn current_theme<R: Runtime>(app: &AppHandle<R>) -> Option<Theme> {
+    [SELECTOR_LABEL, MAIN_LABEL]
+        .iter()
+        .find_map(|label| app.get_webview_window(label))
+        .and_then(|window| window.theme().ok())
+}
+
 fn setup_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let show_item = MenuItem::with_id(app, MENU_SHOW, "显示主窗口", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, MENU_QUIT, "退出", true, None::<&str>)?;
@@ -214,8 +240,11 @@ fn setup_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
             }
         });
 
-    // 用 tauri.conf.json -> bundle.icon 生成的默认图标，避免再打包一份资源。
-    if let Some(icon) = app.default_window_icon() {
+    // 托盘图标跟随系统主题：深色任务栏用反转成白色的 logo，浅色用原始深色 logo。
+    // 内嵌 PNG 解码失败时退回 bundle.icon 生成的默认图标。
+    if let Some(icon) = tray_icon(current_theme(app)) {
+        builder = builder.icon(icon);
+    } else if let Some(icon) = app.default_window_icon() {
         builder = builder.icon(icon.clone());
     }
 
@@ -324,15 +353,24 @@ pub fn run() {
             }
             Ok(())
         })
-        .on_window_event(|window, event| {
+        .on_window_event(|window, event| match event {
             // 关闭窗口 ≠ 退出程序：隐藏到托盘，由托盘菜单「退出」真正结束。
             // 托盘不可用时不能隐藏，否则用户再也找不回窗口。
-            if let WindowEvent::CloseRequested { api, .. } = event {
+            WindowEvent::CloseRequested { api, .. } => {
                 if TRAY_READY.load(Ordering::Relaxed) {
                     api.prevent_close();
                     let _ = window.hide();
                 }
             }
+            // 系统在浅色 / 深色之间切换时，同步把托盘图标换成对应版本。
+            WindowEvent::ThemeChanged(theme) => {
+                if let Some(tray) = window.app_handle().tray_by_id(TRAY_ID) {
+                    if let Some(icon) = tray_icon(Some(*theme)) {
+                        let _ = tray.set_icon(Some(icon));
+                    }
+                }
+            }
+            _ => {}
         })
         .run(tauri::generate_context!())
         .expect("error while running DSHTauri");

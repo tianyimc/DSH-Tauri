@@ -15,8 +15,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-# tray-icon = Tauri 2 官方托盘 API；不需要额外插件。
-tauri = { version = "2", features = ["tray-icon"] }
+# tray-icon   = Tauri 2 官方托盘 API，不需要额外插件
+# image-png   = 让托盘图标能从内嵌 PNG 字节解码（Image::from_bytes）
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

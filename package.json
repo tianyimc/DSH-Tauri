@@ -13,7 +13,7 @@
     "build": "tauri build",
     "build:nsis": "tauri build --bundles nsis",
     "icon": "tauri icon app-icon.png",
-    "posticon": "node scripts/clean-mobile-icons.mjs"
+    "posticon": "node scripts/post-icon.mjs"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.12.1"

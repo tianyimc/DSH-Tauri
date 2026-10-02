@@ -48,6 +48,7 @@ DSHTauri/
 │   ├── check-env.mjs               # 环境自检：cargo 不在 PATH 等问题直接给修复命令
 │   ├── env.sh                      # `source scripts/env.sh` 接入项目自带 Rust 工具链
 │   ├── make-icon.mjs               # 生成 app-icon.png（纯 Node，无需图形库）
+│   ├── post-icon.mjs               # npm run icon 之后：清理移动端图标 + 固定安装包图标
 │   └── smoke-linux.sh              # Xvfb 下的无头冒烟测试（15 项断言）
 ├── src/                            # 前端（无框架、无构建步骤，直接嵌入二进制）
 │   ├── index.html                  # 选择界面
@@ -65,8 +66,9 @@ DSHTauri/
 │   ├── Cargo.toml                  # 第 5 项
 │   ├── Cargo.lock                  # 提交它，保证 CI 可复现
 │   └── tauri.conf.json             # 第 3 项
-├── app-icon.png                    # 图标源文件（当前为 DeepSeek 鲸鱼 logo，225x225 透明 PNG）
-├── deepseek.ico                    # 用户提供的原始 ico（保留备查，不参与构建）
+├── app-icon.png                    # 图标源文件（从 deepseek_harness.ico 的 256 帧导出）
+├── deepseek_harness.ico            # 官方白底版本（7 档）—— 安装包/exe/应用图标，原样使用
+├── deepseek.ico                    # 早期深色版（单帧 225×225）—— 托盘图标的生成源，保留备查
 ├── package.json                    # 第 2 项
 ├── package-lock.json               # `npm ci` 依赖它
 ├── .gitignore
@@ -182,24 +184,93 @@ DSHTauri/
 
 ### 图标
 
-| 项 | 值 |
-| --- | --- |
-| 源文件 | `app-icon.png` —— DeepSeek 鲸鱼 logo，225×225，透明背景，纯色 `#020E36` |
-| 原始素材 | `deepseek.ico`（用户提供，单帧 225×225 BMP）—— 保留备查，**不参与构建** |
-| 生成命令 | `npm run icon`（= `tauri icon app-icon.png`） |
-| 产物 | `src-tauri/icons/` 全套；其中 `icon.ico` 含 **16/24/32/48/64/256** 六档，全部内嵌 PNG |
-| 用在哪 | NSIS 安装器图标、exe 文件图标、任务栏、系统托盘（`app.default_window_icon()` 复用 `bundle.icon`） |
+本项目有**两套**图标，用途不同，别混：
 
-> ⚠️ **深色任务栏可见性**：该 logo 是不透明的 `#020E36`（极深藏青，亮度约 14/255），
-> 在 Windows 11 默认的深色任务栏/托盘上对比度很低，可能看不清。
-> 如需改善，给 `app-icon.png` 加一层浅色圆角底或白色描边后再跑 `npm run icon` 即可。
-> 也可以单独给托盘用一个浅色图标（`TrayIconBuilder::icon()` 接受任意 `Image`）。
+| 用途 | 文件 | 说明 |
+| --- | --- | --- |
+| **安装包 / exe / 应用图标 / 任务栏** | `deepseek_harness.ico` → `src-tauri/icons/icon.ico` | **官方白底版本**，7 档 16/24/32/48/64/128/256，全部内嵌 PNG。原样复制、不重新生成 |
+| **系统托盘 · 浅色任务栏** | `src-tauri/icons/tray-light.png` | 原始深色鲸鱼 `#020E36`，透明背景，64×64 |
+| **系统托盘 · 深色任务栏** | `src-tauri/icons/tray-dark.png` | 把上面那版**反转为白色**（RGB→白），透明背景不变，64×64 |
 
-**换图标**：把自己的方形 PNG（建议 1024×1024、带透明通道）覆盖到 `app-icon.png`，然后 `npm run icon`。
+`bundle.icon` 里写的是 `icons/icon.ico`，而 `npm run icon` 之后 `posticon` 钩子会用
+`deepseek_harness.ico` **逐字节覆盖** `src-tauri/icons/icon.ico`，所以安装包图标永远是官方白底版本。
+
+**托盘图标随系统主题自动切换**（[src-tauri/src/lib.rs](src-tauri/src/lib.rs)）：
+
+```rust
+const TRAY_ICON_ON_DARK:  &[u8] = include_bytes!("../icons/tray-dark.png");   // 白色版
+const TRAY_ICON_ON_LIGHT: &[u8] = include_bytes!("../icons/tray-light.png");  // 深色原版
+
+fn tray_icon(theme: Option<Theme>) -> Option<Image<'static>> {
+    let bytes = match theme {
+        Some(Theme::Light) => TRAY_ICON_ON_LIGHT,
+        _ => TRAY_ICON_ON_DARK,   // 探测不到也按深色处理：深色底上白 logo 才看得见
+    };
+    Image::from_bytes(bytes).ok()
+}
+```
+
+- 启动时读一次窗口主题（`setup` 之前配置里的选择窗口已创建，所以拿得到）。
+- 用户中途切换浅色/深色时，`WindowEvent::ThemeChanged` 会实时换图标。
+- PNG 解码需要 `tauri` 的 `image-png` feature。实测代价：剥离符号 + LTO 的 release 二进制**增加约 137 KB**（约 1.5%）。介意的话可以改成构建期解码成裸 RGBA + `Image::new_owned()`，省掉这个依赖。
+
+**换图标**：
+
+```bash
+# 换安装包/exe 图标：直接替换根目录的官方 ico，再跑一次 posticon
+cp 你的.ico deepseek_harness.ico && node scripts/post-icon.mjs
+
+# 换托盘图标：替换 app-icon.png 后重新派生（托盘两版由深色原图生成）
+convert 'deepseek.ico[0]' -resize 64x64 src-tauri/icons/tray-light.png
+convert src-tauri/icons/tray-light.png -channel RGB -fill white -colorize 100% src-tauri/icons/tray-dark.png
+```
+
 不要直接把 `.png` 改名成 `.ico` —— 文件头不对，`makensis` 会拒绝（见 [TROUBLESHOOTING §4](docs/TROUBLESHOOTING.md#4-图标格式错误)）。
 
-`npm run icon` 之后会自动跑 `posticon` 钩子（[scripts/clean-mobile-icons.mjs](scripts/clean-mobile-icons.mjs)），
-把 `tauri icon` 顺带生成的 `android/`、`ios/` 两套图标删掉——本项目只做 Windows 桌面端。
+### 安装包行为：这是**安装版**，不是绿色版
+
+产物是 NSIS 安装程序，会写注册表、建快捷方式、带卸载器。**不是**可自由移动的绿色版。
+
+**安装向导页面顺序**（Tauri 2.12.1 官方 NSIS 模板，实测自 CLI 内嵌模板）：
+
+```text
+1. Welcome                      欢迎
+2. License                      （未配置则跳过）
+3. Install mode                 （仅当 installMode = "both"）
+4. 已安装时询问 重装/卸载
+5. Choose install directory     ★ 安装目录选择页 —— 默认就有，用户可以改
+6. Start menu shortcut          开始菜单文件夹
+7. Installing
+8. Finish
+```
+
+**安装目录**：
+
+| 项 | 值 |
+| --- | --- |
+| 默认目录 | `%LOCALAPPDATA%\DSHTauri`（即 `C:\Users\<你>\AppData\Local\DSHTauri`） |
+| 用户能否改 | ✅ 能。第 5 步就是 `!insertmacro MUI_PAGE_DIRECTORY`，**默认插入、无需额外配置** |
+| 什么时候看不到 | 只有静默/被动安装（`/S`）才会跳过该页，这是 NSIS 的正常行为 |
+| 是否需要管理员 | 不需要。`installMode: "currentUser"` 装到用户目录，不弹 UAC |
+
+**会写的注册表**（`currentUser` 下 `SHCTX` = `HKCU`）：
+
+- `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\<DSHTauri>` —— `DisplayName` / `UninstallString` / `HelpLink` / `URLInfoAbout` / `URLUpdateInfo` / `EstimatedSize` / `NoModify` / `NoRepair`
+- `HKCU\Software\<publisher>\<productName>`
+- 开始菜单快捷方式 `%AppData%\Microsoft\Windows\Start Menu\Programs\DSHTauri.lnk`
+- 卸载时会 `DeleteRegKey` 清掉以上项，并 `RmDir /r "$LOCALAPPDATA\<BUNDLEID>"` 清理 WebView2 数据目录
+
+**想改成别的安装模式**（`src-tauri/tauri.conf.json` → `bundle.windows.nsis.installMode`）：
+
+| 取值 | 行为 |
+| --- | --- |
+| `currentUser`（当前） | 装到 `%LOCALAPPDATA%`，无需管理员 |
+| `perMachine` | 装到 `%PROGRAMFILES%`，需要管理员，卸载项写 `HKLM` |
+| `both` | **多一页**让用户选"仅为我安装 / 为所有用户安装"，再选目录 |
+
+> 如果你其实想要**绿色版**：`src-tauri/target/release/DSHTauri.exe` 本身就是单文件可执行程序，
+> 拷到哪都能跑（前提是目标机已装 WebView2，Win11 自带）。代价是没有开始菜单快捷方式、没有卸载项、
+> 也不会自动装 WebView2。需要的话我可以在 CI 里额外产出一个 `dshtauri-portable.zip`。
 
 ---
 

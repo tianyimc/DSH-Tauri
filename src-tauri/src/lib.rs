@@ -47,6 +47,7 @@ const MAIN_MIN_HEIGHT: f64 = 480.0;
 
 const TRAY_ID: &str = "dshtauri-tray";
 const MENU_SHOW: &str = "show";
+const MENU_SELECT: &str = "select";
 const MENU_QUIT: &str = "quit";
 
 /// 本地 / 远程地址的**示例**（只出现在界面的占位符里，不写进默认配置）。
@@ -195,6 +196,23 @@ fn reveal_window<R: Runtime>(app: &AppHandle<R>) {
         .build();
 }
 
+/// 托盘「重新选择连接方式」：把选择窗口叫出来（它只是被隐藏了，没有销毁）。
+fn reveal_selector<R: Runtime>(app: &AppHandle<R>) {
+    if let Some(selector) = app.get_webview_window(SELECTOR_LABEL) {
+        let _ = selector.unminimize();
+        let _ = selector.show();
+        let _ = selector.set_focus();
+        return;
+    }
+    // 理论上不会走到这里（选择窗口不会被销毁），保底重建。
+    let _ = WebviewWindowBuilder::new(app, SELECTOR_LABEL, WebviewUrl::App("index.html".into()))
+        .title(SELECTOR_TITLE)
+        .inner_size(SELECTOR_WIDTH, SELECTOR_HEIGHT)
+        .resizable(true)
+        .center()
+        .build();
+}
+
 /* -------------------------------------------------------------------- tray */
 
 /// 按系统主题挑托盘图标：深色任务栏用反转成白色的 logo，浅色任务栏用原始深色 logo。
@@ -219,9 +237,15 @@ fn current_theme<R: Runtime>(app: &AppHandle<R>) -> Option<Theme> {
 
 fn setup_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let show_item = MenuItem::with_id(app, MENU_SHOW, "显示主窗口", true, None::<&str>)?;
+    let select_item =
+        MenuItem::with_id(app, MENU_SELECT, "重新选择连接方式", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, MENU_QUIT, "退出", true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
-    let menu = Menu::with_items(app, &[&show_item, &separator, &quit_item])?;
+    let separator2 = PredefinedMenuItem::separator(app)?;
+    let menu = Menu::with_items(
+        app,
+        &[&show_item, &select_item, &separator, &separator2, &quit_item],
+    )?;
 
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .tooltip(format!("{MAIN_TITLE} {APP_DISPLAY_VERSION}"))
@@ -230,6 +254,7 @@ fn setup_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
             MENU_SHOW => reveal_window(app),
+            MENU_SELECT => reveal_selector(app),
             // app.exit() 不会触发 WindowEvent::CloseRequested，因此是「真退出」。
             MENU_QUIT => app.exit(0),
             _ => {}
@@ -289,7 +314,7 @@ fn start_local_service(command: String) -> Result<(), String> {
 /// 前端在「自动启动本地服务」后轮询本命令，直到服务就绪或超时，
 /// 这样主窗口不会在服务还没起来时加载出白屏。
 #[tauri::command]
-fn probe_url(url: String) -> Result<bool, String> {
+async fn probe_url(url: String) -> Result<bool, String> {
     let parsed = tauri::Url::parse(url.trim()).map_err(|e| format!("URL 无效：{e}"))?;
     let host = parsed.host_str().ok_or_else(|| "URL 缺少主机名。".to_string())?;
     let port = parsed
@@ -304,9 +329,22 @@ fn app_version() -> String {
     APP_DISPLAY_VERSION.to_string()
 }
 
-/// 打开主窗口并加载 `request.url`，最后关闭选择窗口。
+/// 打开主窗口并加载 `request.url`，然后把选择窗口收起来。
+///
+/// # 为什么必须是 `async`
+///
+/// Tauri 的**同步命令跑在主线程（事件循环）上**。这条命令是选择窗口通过 IPC 调进来的，
+/// 也就是说此刻主线程正处在 **WebView2 的 IPC 回调里**。在这个位置同步创建「窗口 + WebView2」：
+///
+/// * 新 WebView2 的控制器创建是异步的，嵌套在另一个 WebView2 的回调里会**永远初始化不完** ——
+///   窗口出来了，但页面从不导航 ⇒ **白屏**；
+/// * 紧接着销毁「正在执行这条 IPC 的那个 webview」，会让窗口消息处理进入坏状态 ——
+///   后续 `hide()` 被丢弃 ⇒ **点 × 没反应，只能任务管理器强杀**。
+///
+/// 改成 `async fn` 后，命令由 Tauri 丢到异步运行时的**独立线程**上执行：
+/// 创建窗口时会走 `proxy.send_event` 交给主线程处理（主线程此时空闲），不再有嵌套回调问题。
 #[tauri::command]
-fn open_main_window(app: AppHandle, request: OpenRequest) -> Result<(), String> {
+async fn open_main_window(app: AppHandle, request: OpenRequest) -> Result<(), String> {
     let raw = request.url.trim();
     let url = tauri::Url::parse(raw).map_err(|e| format!("URL 无效（{raw}）：{e}"))?;
     match url.scheme() {
@@ -334,9 +372,11 @@ fn open_main_window(app: AppHandle, request: OpenRequest) -> Result<(), String> 
 
     let _ = window.set_focus();
 
-    // 选择窗口使命完成：destroy() 不触发 CloseRequested，不会被「隐藏到托盘」逻辑拦下。
+    // 选择窗口使命完成：**隐藏**而不是销毁。
+    // 销毁会干掉「正在执行这条 IPC 的 webview」，Windows 上会让消息处理进入坏状态。
+    // 隐藏更安全，而且保留下来还能通过托盘「重新选择连接方式」再叫出来。
     if let Some(selector) = app.get_webview_window(SELECTOR_LABEL) {
-        let _ = selector.destroy();
+        let _ = selector.hide();
     }
 
     Ok(())

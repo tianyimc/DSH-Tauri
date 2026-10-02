@@ -143,7 +143,9 @@ if [[ -n "${MAIN:-}" ]]; then
   eval "$(xdotool getwindowgeometry --shell "$MAIN")"
   check "主窗口尺寸 1200x800" "${WIDTH}x${HEIGHT}" "1200x800"
 fi
-check_empty "选择窗口已关闭" "$(selector_id || true)"
+# 选择窗口现在是**隐藏**而不是销毁（销毁正在执行 IPC 的 webview 会出问题），
+# 所以用 --onlyvisible 判断「是否还在显示」。
+check_empty "选择窗口已隐藏（不再显示）" "$(xdotool search --onlyvisible --name "选择 DSH 连接方式" 2>/dev/null | head -1 || true)"
 sleep 1
 check "本地服务收到 WebView 的请求" "$(cat "$OUT/httpd.log" 2>/dev/null)" "GET /"
 

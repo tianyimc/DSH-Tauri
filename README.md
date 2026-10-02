@@ -115,7 +115,7 @@ DSHTauri/
 │   ├── test-rules.mjs              # 配置规则单测（node --test，17 条）
 │   ├── version.mjs                 # 版本号工具（v.A.B.C GenX）
 │   ├── smoke-linux.sh              # Xvfb 下的无头冒烟测试（21 项断言）
-│   └── smoke-windows.ps1           # windows-latest 上的真实 GUI 冒烟测试（14 项断言）
+│   └── smoke-windows.ps1           # windows-latest 上的真实 GUI 冒烟测试（26 项断言）
 ├── src/                            # 前端（无框架、无构建步骤，直接嵌入二进制）
 │   ├── index.html                  # 选择界面
 │   ├── selector.css
@@ -807,6 +807,10 @@ artifact 路径 = `src-tauri/target/release/bundle/nsis/*` ✅；顶层 `permiss
 
 [`scripts/smoke-windows.ps1`](scripts/smoke-windows.ps1) 在 runner 上做的事：
 
+分三段，共 26 条断言：
+
+**A. 首次连接**
+
 | 检查 | 手段 |
 | --- | --- |
 | 应用能启动 | `Start-Process` + 进程存活 |
@@ -815,10 +819,28 @@ artifact 路径 = `src-tauri/target/release/bundle/nsis/*` ✅；顶层 `permiss
 | 主窗口出来了 | 匹配标题 `DSHTauri` 或客户区 ~1200×800（runner 屏幕小，会被钳制到 1028×749，所以用容差） |
 | **界面没卡死** | `IsHungAppWindow` + `SendMessageTimeout(WM_NULL, SMTO_ABORTIFHUNG)` |
 | **页面真的在加载（不是白屏）** | 本地测试服务是否收到来自 WebView2 的 HTTP 请求 |
-| **关闭 = 隐藏到托盘** | `PostMessage(WM_CLOSE)` 后：进程仍存活 且 `IsWindowVisible=false` |
+| 连接后选择窗口隐藏 | `IsWindowVisible=false` |
+| **关闭 = 隐藏到托盘** | `PostMessage(WM_CLOSE)` 后：进程仍存活 且主窗口不可见 |
 
-> 这 3 条「卡死 / 白屏 / × 点不动」的检查就是抓出本项目那个 Windows 专属 bug 的关键：
-> 修复前 `12 通过 / 2 失败`（WebView2 从未发请求、`WM_CLOSE` 后窗口仍可见），修复后 `14 通过 / 0 失败`。
+**B. 切换连接方式**（模拟托盘「重新选择连接方式」）
+
+| 检查 | 手段 |
+| --- | --- |
+| 选择窗口能重新显示 | `ShowWindow` + `IsWindowVisible` |
+| **主窗口被复用而不是销毁重建** | 切换后原 HWND 仍然有效（`IsWindow`） |
+| 切换后主窗口未卡死 / 仍可见 / 仍是活动窗口 | `IsResponsive` / `IsWindowVisible` / `GetForegroundWindow` |
+| **确实切到了新地址** | 第二个测试服务收到来自 WebView2 的请求 |
+
+**C. 进程生命周期**（自动启动的本地服务必须随主程序结束）
+
+| 检查 | 手段 |
+| --- | --- |
+| 服务确实被拉起来了 | 假服务端口进入监听 |
+| **主程序退出后服务也结束** | 强杀主程序 → 端口关闭 |
+
+> A 段那几条「卡死 / 白屏 / × 点不动」的检查抓出了本项目的 Windows 专属 bug：
+> 修复前 `12 通过 / 2 失败`，修复后 `14 通过 / 0 失败`。
+> B、C 两段是 v0.1.2 为「切换连接无反应」「本地服务不随主程序退出」两个问题补的。
 
 **怎么读 CI 的日志？** job 日志和 artifact 都要 token 才能下载。所以这个 job 会把完整输出推到
 **`ci-logs` 分支**的 `smoke-windows.txt`（该分支不触发 workflow），直接用浏览器或 curl 就能看：
@@ -997,8 +1019,10 @@ npm run tauri build -- --bundles nsis --verbose 2>&1 | tail -100   # 完整打�
 | **本地 / 远程允许只配一个** | ✅ 已验证（端到端 + 单测） | 冒烟测试分两轮：只填本地 → 连上，`config.json` 里 `"remoteUrl":""`；清空重来只填远程 → 同样连上，`"localUrl":""`。另有 17 条 JS 单测覆盖校验规则 |
 | 推送到 GitHub 后 Actions 在 `windows-latest` 成功运行 | ✅ 已验证 | [run #36974080393](https://github.com/tianyimc/DSH-Tauri/actions/runs/36974080393) @ `4ac4267`：全部步骤绿（含 `Resolve version` / `Run tests` / `Build NSIS bundle` / `Upload NSIS installer`） |
 | Artifact 中存在 NSIS `.exe` | ✅ 已验证 | Artifact **`DSHTauri-v0.1.1-nsis`**，1.21 MB，未过期。`Upload NSIS installer` 设了 `if-no-files-found: error`，步骤成功即证明 `bundle/nsis/` 非空。（下载 artifact 走 API 需要 token，我没法直接取包内文件） |
-| Windows 11 安装后功能正常 | ✅ 核心链路已在真实 Windows 上验证 | `windows-latest` 上的 GUI 冒烟测试 **14/14 通过**：选择窗口 560x460 → 点击「本地」→ 主窗口出现且不卡死 → WebView2 真的发起了请求（不再白屏）→ `WM_CLOSE` 后进程存活且窗口隐藏（× 可用）。剩余的人工项只有 NSIS 安装向导交互本身 |
+| Windows 11 安装后功能正常 | ✅ 核心链路已在真实 Windows 上验证 | `windows-latest` 上的 GUI 冒烟测试 **26/26 通过**：选择窗口 560x460 → 点击「本地」→ 主窗口出现且不卡死 → WebView2 真的发起了请求（不再白屏）→ `WM_CLOSE` 后进程存活且窗口隐藏（× 可用）。剩余的人工项只有 NSIS 安装向导交互本身 |
 | ~~主窗口白屏 + × 点不动~~ | ✅ 已修复并验证 | 同一套冒烟测试：修复前 `12 通过 / 2 失败`，修复后 `14 通过 / 0 失败`。根因与修复见 [CHANGELOG](CHANGELOG.md#v011) |
+| ~~切换连接方式无反应~~ | ✅ 已修复并验证 | 冒烟测试 B 段：切换后主窗口被复用（HWND 不变）、未卡死、新地址确实收到 WebView2 请求。见 [CHANGELOG](CHANGELOG.md#v012) |
+| ~~本地服务不随主程序退出~~ | ✅ 已修复并验证 | 冒烟测试 C 段：假服务端口在监听 → 强杀主程序 → 端口关闭。见 [CHANGELOG](CHANGELOG.md#v012) |
 
 复现方式：`npm run smoke`（需要 `xvfb xdotool wmctrl openbox dbus-x11`）。当前结果：**21 通过 / 0 失败**。
 
@@ -1039,7 +1063,7 @@ npm run tauri build -- --bundles nsis --verbose 2>&1 | tail -100   # 完整打�
 | 图标 | `npm run icon` → `icons/icon.ico` | ✅ 6 档 16/24/32/48/64/256，内嵌 PNG |
 | 工作流 YAML | `python3 -c "yaml.safe_load(...)"` | ✅ 解析通过，`permissions: contents: write` 就位 |
 | Linux 端到端冒烟 | `npm run smoke` | ✅ 21 通过 / 0 失败 |
-| **Windows 真实 GUI 冒烟** | CI job `smoke-windows`（`scripts/smoke-windows.ps1`） | ✅ **14 通过 / 0 失败** —— 在 `windows-latest` 上真正启动 exe，验证窗口尺寸、界面不卡死（`IsHungAppWindow`）、WebView2 真的发起了 HTTP 请求、`WM_CLOSE` 后隐藏到托盘 |
+| **Windows 真实 GUI 冒烟** | CI job `smoke-windows`（`scripts/smoke-windows.ps1`） | ✅ **26 通过 / 0 失败** —— 在 `windows-latest` 上真正启动 exe：窗口尺寸、界面不卡死（`IsHungAppWindow`）、WebView2 真的发起了 HTTP 请求、`WM_CLOSE` 后隐藏到托盘、切换连接复用主窗口、自动启动的服务随主程序退出 |
 
 > 说明：`cargo check --target x86_64-pc-windows-msvc` 在 Debian 上需要 `llvm`（提供 `llvm-rc`，`tauri-build` 用它嵌入 Windows 资源）。这只影响**在 Linux 上预检 Windows 目标**；GitHub Actions 上用的是真正的 MSVC 工具链，不需要这一步。
 >

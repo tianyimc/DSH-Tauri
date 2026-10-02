@@ -693,6 +693,72 @@ if (lib !== null) {
   );
 }
 
+/* ------------------------------------------------- 8. 侧栏过渡动画（任务 1） */
+
+section("8. 侧栏开/关过渡动画（Windows 11 动画效果适配）");
+
+const ANIM_RS = "src-tauri/src/anim.rs";
+const animRaw = readIfExists(ANIM_RS);
+
+check(`${ANIM_RS} 存在（侧栏过渡动画模块）`, animRaw !== null, `找不到 ${ANIM_RS}`);
+
+if (animRaw !== null) {
+  const animCode = findCodeMatches(animRaw, /./).length > 0 ? animRaw : animRaw;
+
+  // 必须尊重系统的「动画效果」开关：关掉时不能硬放动画。
+  check(
+    "动画模块读取 SPI_GETCLIENTAREAANIMATION（尊重系统「动画效果」开关）",
+    /SPI_GETCLIENTAREAANIMATION/.test(animCode),
+    "没找到 SPI_GETCLIENTAREAANIMATION —— 系统关掉动画时仍会播放过渡，属无障碍缺陷",
+  );
+
+  // 必须有缓动 + 插值的纯函数，才能被单测覆盖。
+  check(
+    "动画有可单测的纯函数（ease_out_cubic / x_at）",
+    /fn\s+ease_out_cubic/.test(animCode) && /fn\s+x_at/.test(animCode),
+    "缺少 ease_out_cubic / x_at —— 观感逻辑无法被单测覆盖",
+  );
+
+  // 防抢占：快速连点时旧动画必须退出。
+  check(
+    "动画有代次（generation）防抢占机制",
+    /ANIM_GENERATION/.test(animCode),
+    "缺少代次机制：用户快速连点会让多个动画线程同时改位置",
+  );
+
+  // 时长要落在「不拖沓」的区间。
+  const ms = animCode.match(/SLIDE_MS\s*:\s*u64\s*=\s*(\d+)/);
+  check(
+    "过渡时长在 100~300ms 之间（对齐 Windows 原生观感）",
+    ms !== null && Number(ms[1]) >= 100 && Number(ms[1]) <= 300,
+    ms ? `实际 SLIDE_MS = ${ms[1]}ms` : "没找到 SLIDE_MS 常量",
+  );
+}
+
+if (lib !== null) {
+  // 模块必须真的被挂上，否则代码在但根本不编译（静默失效）。
+  check(
+    "lib.rs 已 `mod anim;` 挂上动画模块",
+    /^\s*mod\s+anim\s*;/m.test(libRaw),
+    "lib.rs 里没有 `mod anim;` —— anim.rs 不会被编译，动画等于没做",
+  );
+
+  // 收进托盘 / 缩放窗口时必须取消动画，否则侧栏会停在错误位置。
+  const cancels = findMatches(libRaw, /anim::cancel\s*\(\s*\)/);
+  check(
+    "窗口缩放 / 收进托盘时会 anim::cancel()（避免侧栏停在错误位置）",
+    cancels.length >= 2,
+    `只找到 ${cancels.length} 处 anim::cancel()，至少应有 2 处（Resized + hide_main_windows）`,
+  );
+
+  // overlay 模式才做滑动；docked 模式必须避开逐帧重排。
+  check(
+    "toggle_chat_webview 按模式区分：docked 不做逐帧重排",
+    /if\s+chat_docked\s*\(\s*\)/.test(libRaw),
+    "没看到按 chat_docked() 分流的逻辑 —— docked 模式下逐帧改宽度会导致内容页每帧重排",
+  );
+}
+
 /* ------------------------------------------------------------------ 汇总 */
 
 console.log("\n" + "=".repeat(60));

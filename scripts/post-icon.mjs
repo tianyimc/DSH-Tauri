@@ -3,12 +3,17 @@
  *
  * 做两件事：
  *   1. 删除 tauri icon 顺带生成的 android/ 、ios/ —— 本项目只做 Windows 桌面端。
- *   2. 用官方的 deepseek_harness.ico 覆盖 src-tauri/icons/icon.ico —— 安装包/exe/应用图标
- *      必须**始终**是这个官方白底版本（7 档 16/24/32/48/64/128/256），比 tauri icon
- *      自己生成的 6 档更完整，所以不重新生成、直接原样使用。
+ *   2. 把 `icons/icon.ico` 换成**托盘那个 logo**（透明背景的深藏青鲸鱼）。
+ *
+ * 关于第 2 点为什么不再用 `deepseek_harness.ico`：
+ * 那个文件是「鲸鱼画在白色圆角方块上」的应用图标风格，而用户要求安装包图标用
+ * **托盘 logo**（透明背景版）。`icons/tray-light.png` 就是那张图，且与
+ * `deepseek.ico` 的 artwork **逐像素一致**（已用 compare 验证 0 差异）。
+ * 具体生成逻辑见 `scripts/make-ico.mjs`。
  */
-import { copyFileSync, existsSync, rmSync } from "node:fs";
-import { resolve, dirname } from "node:path";
+import { execFileSync } from "node:child_process";
+import { existsSync, rmSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -23,14 +28,11 @@ for (const name of ["android", "ios"]) {
   }
 }
 
-/* 2. 安装包图标固定为官方白底版本 */
-const official = resolve(ROOT, "deepseek_harness.ico");
-const target = resolve(iconsDir, "icon.ico");
-if (existsSync(official)) {
-  copyFileSync(official, target);
-  console.log("[DSHTauri] icon.ico ← deepseek_harness.ico（官方白底版本）");
-} else {
-  console.warn(
-    "[DSHTauri] 警告：找不到 deepseek_harness.ico，icon.ico 保持 tauri icon 生成的结果。",
-  );
+/* 2. 安装包/exe 图标 = 托盘 logo（透明背景鲸鱼），7 档多尺寸 */
+try {
+  execFileSync(process.execPath, [resolve(ROOT, "scripts", "make-ico.mjs")], {
+    stdio: "inherit",
+  });
+} catch (err) {
+  console.warn(`[DSHTauri] 警告：make-ico.mjs 执行失败，icon.ico 保持原样。原因：${err.message}`);
 }

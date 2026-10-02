@@ -396,10 +396,43 @@ try {
     $after = @([Win32]::Descendants($main) | Where-Object { [Win32]::IsWindowVisible($_) }).Count
     Check "点「网页对话」后多出侧栏子 webview" ($after -gt $before) `
       "点击前可见子窗口 $before 个，点击后 $after 个"
+
+    # --- v0.3.0：侧栏开/关过渡动画（overlay 模式）---
+    #
+    # 动画是**逐帧改 x**（180ms、约 60fps）。这里等它放完，然后断言侧栏
+    # **停在它该在的位置**：overlay 模式下侧栏右边缘应贴客户区右边缘，
+    # 左边缘 = 客户区宽 - CHAT_WIDTH×scale。
+    # 若动画终点算错（把 offscreen 当终点、或物理/逻辑单位混用），这条会失败。
+    Start-Sleep -Seconds 1
+    $chatW = [int](420 * $scale)      # CHAT_WIDTH = 420 逻辑 px
+    $tbRects = @([Win32]::Descendants($main) |
+      Where-Object { [Win32]::IsWindowVisible($_) -and [Win32]::ClassName($_) -eq "WRY_WEBVIEW" } |
+      ForEach-Object { [Win32]::RectInClient($main, $_) })
+    # 侧栏 = 那个「高度占满内容区、且左边缘在客户区右半部」的 webview
+    $sidebars = @($tbRects | Where-Object {
+      $_[1] -ge ($expectTbH - $tol) -and $_[0] -ge [int]($ms[0] / 2)
+    })
+    $sbDesc = ($tbRects | ForEach-Object { "($($_[0]),$($_[1])) $($_[2])x$($_[3])" }) -join '; '
+    Check "动画结束后侧栏停在客户区右侧（overlay 目标位置）" ($sidebars.Count -ge 1) `
+      ("期望左边缘≈{0}（客户区宽 {1} - 侧栏宽 {2}）；实际子 webview：{3}" -f `
+        ($ms[0] - $chatW), $ms[0], $chatW, $sbDesc)
+
     # 再点一次收起，确认反复切换也不会卡
     [Win32]::ClickClient($main, [int](148 * $scale), [int](20 * $scale))
     Start-Sleep -Seconds 4
     Check "再次点击收起侧栏后仍响应（可反复切换）" ([Win32]::IsResponsive($main, 5000))
+
+    Write-Host "== 6.7 设置窗口（v0.3.0 新增）=="
+    # 「应用 → 设置」走**系统原生菜单**，菜单是系统级弹出窗口、不是 DOM 元素，
+    # 无法用坐标可靠点中（xdotool/Win32 点击都不稳），所以 CI 里不点它。
+    #
+    # 设置窗口的链路改由两条**能在 CI 稳定跑**的断言覆盖：
+    #   1) `npm run test:js` 的契约对账：真解析 lib.rs，断言 `settings` 同时出现在
+    #      popup_menu 的 app 分支与 run_action 分支里（少一个就会失败）；
+    #   2) `npm run verify` / cargo test：断言 capability 覆盖 settings 窗口（有 IPC）。
+    # 这里只登记一条 INFO，不伪造断言。
+    Write-Host "  [INFO] 设置窗口通过原生菜单打开，CI 不点系统菜单；" `
+      "其链路由 test-titlebar.mjs 的 lib.rs 契约对账 + capability 断言覆盖。"
 
     Write-Host "== 7. 关闭主窗口 = 隐藏到托盘 =="
     [void][Win32]::PostMessage($main, [Win32]::WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero)

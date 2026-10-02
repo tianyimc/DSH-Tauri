@@ -20,6 +20,13 @@ use tauri::{
     AppHandle, Emitter, Manager, Runtime, Theme, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 
+/// 侧栏开 / 关的过渡动画（Windows 11「动画效果」适配）。
+///
+/// 见模块文档与 `docs/ANIMATION-FEASIBILITY.md`：
+/// wry 最终用 `SetWindowPos` 摆放子 webview，**没有**任何框架级动画能力，
+/// 所以这里自己逐帧插值。系统关掉「动画效果」时自动退化为直接切换。
+mod anim;
+
 /// 启动选择窗口的 label（在 `setup()` 里创建）。
 pub const SELECTOR_LABEL: &str = "selector";
 /// 主窗口的 label。
@@ -41,6 +48,8 @@ pub const CONTENT_LABEL: &str = "content";
 pub const CHAT_LABEL: &str = "chat";
 /// 「关于」窗口的 label。
 pub const ABOUT_LABEL: &str = "about";
+/// 「设置」窗口的 label（独立 `WebviewWindow`，加载本地 `settings.html` ⇒ 有 IPC）。
+pub const SETTINGS_LABEL: &str = "settings";
 
 /// 版本号（`v.A.B.C GenX`），由 `build.rs` 从 `Cargo.toml` + `version.json` 生成。
 ///
@@ -78,6 +87,11 @@ const CHAT_WIDTH: f64 = 420.0;
 const ABOUT_TITLE: &str = "关于 DSHTauri";
 const ABOUT_WIDTH: f64 = 520.0;
 const ABOUT_HEIGHT: f64 = 440.0;
+
+/// 「设置」窗口。
+const SETTINGS_TITLE: &str = "DSHTauri 设置";
+const SETTINGS_WIDTH: f64 = 560.0;
+const SETTINGS_HEIGHT: f64 = 520.0;
 
 const TRAY_ID: &str = "dshtauri-tray";
 const MENU_SHOW: &str = "show";
@@ -121,6 +135,12 @@ pub struct AppConfig {
     pub auto_start_local: bool,
     /// 启动本地 DSH 服务的命令（Windows 下通过 PowerShell 后台执行）。
     pub local_start_command: String,
+    /// 「网页对话」侧栏的加载模式：`false` = `overlay`（默认，覆盖在内容页之上，
+    /// 内容页面积不变）；`true` = `docked`（内容页让出右侧 `CHAT_WIDTH`，两者并排）。
+    ///
+    /// **默认 `false`** 保证向后兼容：老配置文件里没有这个字段时，
+    /// `#[serde(default)]` 会取 `bool::default()` = `false` ⇒ 行为与升级前完全一致。
+    pub chat_docked: bool,
 }
 
 /// 前端 `open_main_window({ request })` 的载荷。
@@ -354,6 +374,77 @@ fn child_webview_builder<R: Runtime>(
     }
 }
 
+/* ------------------------------------------------------- chat 布局模式缓存 */
+
+/// 「网页对话」是否处于 `docked`（并排）模式 —— 即 [`AppConfig::chat_docked`] 的内存副本。
+///
+/// # 为什么用 `static AtomicBool` 而不是每次都读配置
+///
+/// [`layout_main_webviews`] 会被 `WindowEvent::Resized` / `ScaleFactorChanged` 调用，
+/// 而窗口缩放期间这两个事件**每帧都会来**（拖动窗口边缘时一秒几十次）。
+/// `read_config()` 是 `fs::read_to_string` + `serde_json::from_str` —— 每次都读盘会让
+/// 主线程在缩放时被文件 IO 拖住（机械盘/杀软实时扫描下尤其明显），
+/// 而且这个值在一次设置保存之间根本不会变。
+///
+/// 所以：**只在两个时刻**更新这个缓存 ——
+///   1. 应用启动时（[`sync_chat_docked_from_disk`]）；
+///   2. 设置窗口保存配置时（[`save_config`] 命令）。
+///
+/// 取舍说明：缓存与磁盘理论上可以不一致（例如用户手动编辑 config.json 后不重启），
+/// 但配置文件的**唯一写入方**就是本进程的 `save_config`，所以这个窗口不存在。
+/// 手动改文件的用户需要重启程序才生效 —— 这是可接受的，也在文档里写明了。
+static CHAT_DOCKED: AtomicBool = AtomicBool::new(false);
+
+/// 把磁盘上的 `chat_docked` 读进 [`CHAT_DOCKED`] 缓存。启动时调用一次。
+fn sync_chat_docked_from_disk<R: Runtime>(app: &AppHandle<R>) {
+    let docked = read_config(app).chat_docked;
+    CHAT_DOCKED.store(docked, Ordering::Relaxed);
+}
+
+/// 当前是否 docked 模式（供设置窗口回显、布局分支判断使用）。
+fn chat_docked() -> bool {
+    CHAT_DOCKED.load(Ordering::Relaxed)
+}
+
+/// 一个子 webview 的几何：`(x, y, 宽, 高)`，全部是**逻辑**单位。
+type Rect = (f64, f64, f64, f64);
+
+/// **对话侧栏的目标几何**（`(x, y, 宽, 高)`，逻辑单位）—— 与对话模式**无关**。
+///
+/// 这是侧栏打开/关闭时**唯一**的位置与尺寸来源：无论 `overlay` 还是 `docked`，
+/// 侧栏都是贴在客户区右侧、顶栏下方的那块 `CHAT_WIDTH × (高-40)`；
+/// 两种模式的差别只在**内容页要不要让出宽度**（见 [`main_webview_rects`]）。
+///
+/// 之所以独立成一个纯函数，是给「侧栏开/关过渡动画」留一个稳定的接入点：
+/// 动画只需把「如何到达这个目标」换成逐帧插值，
+/// **不必碰布局逻辑**（谁占多宽、谁盖在谁上面仍只由 [`main_webview_rects`] 决定）。
+fn chat_target_bounds(width: f64, height: f64) -> Rect {
+    // 窗口比侧栏还窄时把侧栏压到窗口宽度，避免算出负宽度。
+    let chat_width = CHAT_WIDTH.min(width).max(1.0);
+    let content_height = (height - TITLEBAR_HEIGHT).max(1.0);
+    (width - chat_width, TITLEBAR_HEIGHT, chat_width, content_height)
+}
+
+/// 主窗口客户区尺寸 → 三个子 webview 的几何。
+///
+/// **纯函数**（不碰 `AppHandle`、不读盘），所以两种模式的分支可以直接单测 ——
+/// 见 `tests::docked_mode_shrinks_content_and_tiles_with_chat`。
+///
+/// `docked` = 「chat 已创建 **且** 当前可见 **且** 配置为 docked」。
+fn main_webview_rects(width: f64, height: f64, docked: bool) -> (Rect, Rect, Rect) {
+    let content_height = (height - TITLEBAR_HEIGHT).max(1.0);
+    let chat_width = CHAT_WIDTH.min(width).max(1.0);
+    // overlay：内容页占**整宽**，chat 盖在它右侧之上。
+    // docked：内容页让出 chat_width，两者**精确平铺**、不重叠。
+    let content_width = if docked { (width - chat_width).max(1.0) } else { width };
+
+    let titlebar = (0.0, 0.0, width, TITLEBAR_HEIGHT);
+    let content = (0.0, TITLEBAR_HEIGHT, content_width, content_height);
+    // 侧栏几何统一走 chat_target_bounds（动画接入点），这里不重复计算。
+    let chat = chat_target_bounds(width, height);
+    (titlebar, content, chat)
+}
+
 /// 摆放主窗口里的子 webview（顶栏 / 内容 / 对话侧栏）。
 ///
 /// 这里**只做 `set_position` / `set_size`**：它们是非阻塞的消息投递，
@@ -361,6 +452,19 @@ fn child_webview_builder<R: Runtime>(
 /// （`add_child` 会阻塞等主线程 ⇒ 主线程里调用必然死锁）。
 ///
 /// 全部使用**逻辑**单位；Tauri 会自己换算成物理像素。
+///
+/// # 两种对话模式
+///
+/// 判定依据是 [`chat_docked`]（内存缓存，**不读盘** —— 见该 static 的说明）：
+///
+/// | 模式 | content | chat |
+/// | --- | --- | --- |
+/// | `overlay`（`chat_docked == false`，默认） | `(0, 40)` `(宽, 高-40)` 整宽 | `(宽-chatW, 40)` `(chatW, 高-40)`，**盖在**内容页右侧 |
+/// | `docked`（`chat_docked == true`） | `(0, 40)` `(宽-chatW, 高-40)` 让出右侧 | `(宽-chatW, 40)` `(chatW, 高-40)`，与内容页**并排** |
+///
+/// 注意：`docked` 只改变**子 webview 的宽度分配**，**不动主窗口本身的尺寸**
+/// （用户明确要求「不改变程序窗口大小」）。chat 子 webview 尚未创建时
+/// （用户还没点过「网页对话」）两种模式的结果完全一致 —— content 占整宽。
 fn layout_main_webviews<R: Runtime>(app: &AppHandle<R>) {
     let Some(main) = app.get_window(MAIN_LABEL) else {
         return;
@@ -368,23 +472,29 @@ fn layout_main_webviews<R: Runtime>(app: &AppHandle<R>) {
     let Some((width, height)) = main_logical_size(&main) else {
         return;
     };
-    let content_height = (height - TITLEBAR_HEIGHT).max(1.0);
+
+    // 只有「侧栏已创建 且 当前可见 且 docked 模式」才让出宽度，否则维持整宽。
+    // `CHAT_VISIBLE` 是「用户当前有没有把侧栏打开」—— 侧栏被 `hide()` 之后
+    // docked 模式同样不该继续占着内容宽度。
+    let docked = chat_docked()
+        && CHAT_VISIBLE.load(Ordering::Relaxed)
+        && app.get_webview(CHAT_LABEL).is_some();
+
+    let (titlebar_rect, content_rect, chat_rect) = main_webview_rects(width, height, docked);
 
     if let Some(titlebar) = app.get_webview(TITLEBAR_LABEL) {
-        let _ = titlebar.set_position(tauri::LogicalPosition::new(0.0, 0.0));
-        let _ = titlebar.set_size(tauri::LogicalSize::new(width, TITLEBAR_HEIGHT));
+        let _ = titlebar
+            .set_position(tauri::LogicalPosition::new(titlebar_rect.0, titlebar_rect.1));
+        let _ = titlebar.set_size(tauri::LogicalSize::new(titlebar_rect.2, titlebar_rect.3));
     }
     if let Some(content) = app.get_webview(CONTENT_LABEL) {
-        let _ = content.set_position(tauri::LogicalPosition::new(0.0, TITLEBAR_HEIGHT));
-        let _ = content.set_size(tauri::LogicalSize::new(width, content_height));
+        let _ = content
+            .set_position(tauri::LogicalPosition::new(content_rect.0, content_rect.1));
+        let _ = content.set_size(tauri::LogicalSize::new(content_rect.2, content_rect.3));
     }
     if let Some(chat) = app.get_webview(CHAT_LABEL) {
-        let chat_width = CHAT_WIDTH.min(width).max(1.0);
-        let _ = chat.set_position(tauri::LogicalPosition::new(
-            width - chat_width,
-            TITLEBAR_HEIGHT,
-        ));
-        let _ = chat.set_size(tauri::LogicalSize::new(chat_width, content_height));
+        let _ = chat.set_position(tauri::LogicalPosition::new(chat_rect.0, chat_rect.1));
+        let _ = chat.set_size(tauri::LogicalSize::new(chat_rect.2, chat_rect.3));
     }
 }
 
@@ -460,6 +570,9 @@ fn navigate_content<R: Runtime>(app: &AppHandle<R>, url: tauri::Url) -> Result<(
 ///
 /// 子 webview 随父窗口一起隐藏，不需要逐个处理。
 fn hide_main_windows<R: Runtime>(app: &AppHandle<R>) {
+    // 先掐掉可能还在跑的侧栏过渡动画：窗口都要收起来了，
+    // 让一个后台线程继续改 webview 位置既没意义，也可能和「重新显示」打架。
+    anim::cancel();
     if let Some(main) = app.get_window(MAIN_LABEL) {
         let _ = main.hide();
     }
@@ -488,6 +601,12 @@ static CHAT_VISIBLE: AtomicBool = AtomicBool::new(false);
 /// ⚠️ **必须从异步命令调用**：`add_child` 内部是 `run_on_main_thread` + `recv()`，
 /// 在 Windows 上从主线程（同步命令 / 事件处理器）调用会**死锁**。
 /// 这正是用户报告的「点『网页对话』整个程序卡死、只能任务管理器强杀」的根因。
+///
+/// # 目标几何的唯一来源
+///
+/// 侧栏打开时的位置/尺寸**只**取自 [`chat_target_bounds`]（纯函数）；
+/// 内容页要不要让宽度则由 [`layout_main_webviews`] 按当前模式决定。
+/// 两者职责分离，是为了让「开/关过渡动画」只改「如何到达目标」而不动布局逻辑。
 fn toggle_chat_webview<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let Some(main) = app.get_window(MAIN_LABEL) else {
         return Err("还没有主窗口，请先连接".to_string());
@@ -496,35 +615,85 @@ fn toggle_chat_webview<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     // 已创建：切换显示 / 隐藏。
     if let Some(chat) = app.get_webview(CHAT_LABEL) {
         if CHAT_VISIBLE.load(Ordering::Relaxed) {
-            let _ = chat.hide();
+            // ---------------- 关闭 ----------------
             CHAT_VISIBLE.store(false, Ordering::Relaxed);
+            // 先把「内容页要不要让宽」切回去（docked 模式下收回宽度）。
+            layout_main_webviews(app);
+
+            if chat_docked() {
+                // docked 模式：侧栏让出的宽度要还给内容页，这是一次真正的**重排**。
+                // 逐帧缩放两个 webview 会每帧重排内容页（必然掉帧），
+                // 所以这里**不做滑动动画**，直接切到位（与 VS Code 侧边栏的观感一致）。
+                let _ = chat.hide();
+            } else {
+                // overlay 模式：内容页**整宽不变**，只有侧栏在滑动 —— 零重排，动画很顺。
+                // 顺序很重要：`hide()` 是瞬时的，先 hide 就没得看了，
+                // 所以等滑出动画放完再 hide（见 anim::slide_x_with 的 on_done）。
+                let (width, height) =
+                    main_logical_size(&main).ok_or_else(|| "无法读取主窗口尺寸".to_string())?;
+                let (target_x, y, chat_w, chat_h) = chat_target_bounds(width, height);
+                // 从当前位置出发（可能正停在动画中途）。
+                // `Webview::position()` 返回**物理**坐标，要除 scale 换回逻辑单位 ——
+                // 这正是旧实现翻车的地方（物理/逻辑混用），所以这里显式换算并注释。
+                let from_x = chat
+                    .position()
+                    .ok()
+                    .and_then(|p| main.scale_factor().ok().map(|s| p.x as f64 / s))
+                    .unwrap_or(target_x);
+                // 滑到「完全移出客户区右侧」的位置，再隐藏。
+                anim::slide_x_with(app, CHAT_LABEL, from_x, width, y, chat_w, chat_h, |app| {
+                    if let Some(chat) = app.get_webview(CHAT_LABEL) {
+                        let _ = chat.hide();
+                    }
+                });
+            }
             eprintln!("[DSHTauri] 对话侧栏已隐藏");
         } else {
-            layout_main_webviews(app);
+            // ---------------- 打开 ----------------
             chat.show().map_err(|e| e.to_string())?;
             CHAT_VISIBLE.store(true, Ordering::Relaxed);
+            // ⚠️ 顺序很重要：必须**先**把 CHAT_VISIBLE 置 true 再排版，
+            // 否则 `layout_main_webviews` 会认为侧栏不可见，docked 模式下
+            // 内容页仍占整宽、与刚显示出来的侧栏重叠。
+            layout_main_webviews(app);
+
+            if chat_docked() {
+                // docked：内容页已经让出宽度，侧栏直接出现在并排位置（一次重排）。
+                // 理由同上面的关闭分支：不做逐帧重排。
+            } else {
+                // overlay：内容页整宽不动，侧栏从客户区右侧外滑入。
+                // 侧栏**尺寸全程不变**，所以动画期间不需要重排任何页面。
+                let (width, height) =
+                    main_logical_size(&main).ok_or_else(|| "无法读取主窗口尺寸".to_string())?;
+                let (target_x, y, chat_w, chat_h) = chat_target_bounds(width, height);
+                let _ = chat.set_position(tauri::LogicalPosition::new(width, y));
+                let _ = chat.set_size(tauri::LogicalSize::new(chat_w, chat_h));
+                anim::slide_x(app, CHAT_LABEL, width, target_x, y, chat_w, chat_h);
+            }
             eprintln!("[DSHTauri] 对话侧栏已显示");
         }
         return Ok(());
     }
 
-    // 首次打开：创建子 webview。
+    // 首次打开：创建子 webview，初始几何 = chat_target_bounds（唯一的侧栏目标几何）。
     let (width, height) =
         main_logical_size(&main).ok_or_else(|| "无法读取主窗口尺寸".to_string())?;
-    let chat_width = CHAT_WIDTH.min(width).max(1.0);
-    let content_height = (height - TITLEBAR_HEIGHT).max(1.0);
+    let (x, y, chat_width, chat_height) = chat_target_bounds(width, height);
     let url = CHAT_URL
         .parse()
         .map_err(|e| format!("对话页地址无效：{e}"))?;
 
     main.add_child(
         child_webview_builder(app, CHAT_LABEL, WebviewUrl::External(url)),
-        tauri::LogicalPosition::new(width - chat_width, TITLEBAR_HEIGHT),
-        tauri::LogicalSize::new(chat_width, content_height),
+        tauri::LogicalPosition::new(x, y),
+        tauri::LogicalSize::new(chat_width, chat_height),
     )
     .map_err(|e| format!("打开对话侧栏失败：{e}"))?;
 
     CHAT_VISIBLE.store(true, Ordering::Relaxed);
+    // 侧栏刚创建：`docked` 模式下内容页必须**立刻**让出宽度，
+    // 否则会出现「侧栏已经并排显示、内容页却还压在它下面」的一帧错位。
+    layout_main_webviews(app);
     // 这行日志是「缺陷 B 已修复」的运行时证据：能打印出来说明
     // `add_child` 返回了（没有在主线程上死锁），命令链顺利走完。
     eprintln!("[DSHTauri] 对话侧栏 webview 已创建");
@@ -549,6 +718,37 @@ fn show_about_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     with_shared_profile(app, builder)
         .build()
         .map_err(|e| format!("打开关于窗口失败：{e}"))?;
+    Ok(())
+}
+
+/// 「设置」窗口。
+///
+/// 与「关于」完全同构：独立 `WebviewWindow`，加载**本地** `settings.html`，
+/// 因此命中 `capabilities/default.json` 的 `windows` 列表 ⇒ **有 IPC**，
+/// 可以直接 `invoke("load_config" / "save_config" / "chrome_action")`。
+///
+/// 单例：已经存在就 `show()` + `set_focus()`，不重复创建
+/// （重复 `build()` 同 label 窗口在 Windows 上会因旧 WebView2 尚未销毁而失败）。
+fn show_settings_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    if let Some(settings) = app.get_webview_window(SETTINGS_LABEL) {
+        let _ = settings.unminimize();
+        let _ = settings.show();
+        let _ = settings.set_focus();
+        return Ok(());
+    }
+    let builder =
+        WebviewWindowBuilder::new(app, SETTINGS_LABEL, WebviewUrl::App("settings.html".into()))
+            .title(SETTINGS_TITLE)
+            .inner_size(SETTINGS_WIDTH, SETTINGS_HEIGHT)
+            .min_inner_size(480.0, 400.0)
+            .resizable(true)
+            .maximizable(false)
+            .minimizable(true)
+            .center()
+            .visible(true);
+    with_shared_profile(app, builder)
+        .build()
+        .map_err(|e| format!("打开设置窗口失败：{e}"))?;
     Ok(())
 }
 
@@ -760,10 +960,49 @@ fn load_config(app: AppHandle) -> Result<AppConfig, String> {
     Ok(read_config(&app))
 }
 
-/// 写入配置文件。
+/// 写入配置文件，并**立即**把「网页对话」模式应用到主窗口布局。
+///
+/// # 为什么参数是 `serde_json::Value` 而不是 `AppConfig`（**补丁语义**）
+///
+/// 调用方**没提到的字段保持磁盘上的旧值**，而不是被重置成默认值。
+///
+/// 具体要防的这个 bug：选择窗口的 `buildConfig()`（`src/config-rules.js`）
+/// 只产出 5 个地址/启动相关字段，**不包含** `chatDocked`。
+/// 如果这里直接反序列化成 `AppConfig`，缺字段会被 `#[serde(default)]` 补成
+/// `chat_docked = false` —— 于是「设置里选了 docked → 之后又改了一次地址」
+/// 会**静默退回 overlay**。补丁语义从根上消除这类「局部写入顺带清空其它字段」的问题。
+///
+/// 设置窗口改模式时传 `{"chatDocked": true|false}` 即可（也可以整份传，都支持）。
+///
+/// 落盘后同步刷新 [`CHAT_DOCKED`] 缓存并调 [`layout_main_webviews`]，
+/// 让布局**当场**变化（不需要重启，也不用等 `Resized`）。
+/// 这里只做 `set_position` / `set_size`（非阻塞消息投递），同步命令跑在主线程上是安全的；
+/// **不要**在这个命令里创建 webview（那才会死锁，见 `chrome_action` 的注释）。
 #[tauri::command]
-fn save_config(app: AppHandle, config: AppConfig) -> Result<(), String> {
-    write_config(&app, &config)
+fn save_config(app: AppHandle, config: serde_json::Value) -> Result<(), String> {
+    let existing = read_config(&app);
+    let merged = merge_config(&existing, &config)?;
+    write_config(&app, &merged)?;
+    CHAT_DOCKED.store(merged.chat_docked, Ordering::Relaxed);
+    layout_main_webviews(&app);
+    Ok(())
+}
+
+/// 把 `patch` 里**出现过的**字段覆盖到 `existing` 上，返回合并后的配置。
+///
+/// 纯函数，可直接单测（见 `tests::save_config_patch_keeps_untouched_fields`）。
+/// 未知字段会被 `serde` 忽略（`AppConfig` 没开 `deny_unknown_fields`），
+/// 所以前端多传字段不会导致保存失败。
+fn merge_config(existing: &AppConfig, patch: &serde_json::Value) -> Result<AppConfig, String> {
+    let mut base = serde_json::to_value(existing)
+        .map_err(|e| format!("序列化现有配置失败：{e}"))?;
+    let (Some(base_obj), Some(patch_obj)) = (base.as_object_mut(), patch.as_object()) else {
+        return Err("配置必须是一个 JSON 对象。".to_string());
+    };
+    for (key, value) in patch_obj {
+        base_obj.insert(key.clone(), value.clone());
+    }
+    serde_json::from_value(base).map_err(|e| format!("配置字段无效：{e}"))
 }
 
 /// 在后台启动本地 DSH 服务（不等待其就绪）。
@@ -809,6 +1048,15 @@ async fn window_control(app: AppHandle, action: String) -> Result<(), String> {
     if action == "hide-about" {
         if let Some(about) = app.get_webview_window(ABOUT_LABEL) {
             let _ = about.hide();
+        }
+        return Ok(());
+    }
+
+    // 设置窗口同理：它可能是在**没有主窗口**的情况下打开的（比如用户还没连接），
+    // 所以这个分支必须放在取 `main` 之前。
+    if action == "hide-settings" {
+        if let Some(settings) = app.get_webview_window(SETTINGS_LABEL) {
+            let _ = settings.hide();
         }
         return Ok(());
     }
@@ -879,10 +1127,12 @@ async fn popup_menu(app: AppHandle, menu: String, x: f64) -> Result<(), String> 
     let popup = match menu.as_str() {
         "app" => {
             let about = item("about", "关于")?;
+            let settings = item("settings", "设置")?;
             let check = item("check-update", "检查更新")?;
             let reconnect = item("reconnect", "重新连接")?;
             let sep = separator()?;
-            Menu::with_items(&app, &[&about, &check, &sep, &reconnect]).map_err(|e| e.to_string())?
+            Menu::with_items(&app, &[&about, &settings, &check, &sep, &reconnect])
+                .map_err(|e| e.to_string())?
         }
         "actions" => {
             let refresh = item("refresh", "刷新")?;
@@ -904,9 +1154,14 @@ async fn popup_menu(app: AppHandle, menu: String, x: f64) -> Result<(), String> 
 }
 
 /// 菜单项 / 标题栏按钮的统一动作分发。
+///
+/// ⚠️ `popup_menu` 里每个菜单项的 id 都必须在这里有对应分支 —— 否则点了菜单
+/// 只会打印「未知的菜单操作」而毫无反应。`scripts/test-titlebar.mjs` 有一条
+/// 契约对账断言在查这个对应关系（app 分支的 id 列表 ↔ `APP_MENU_ACTIONS`）。
 fn run_action<R: Runtime>(app: &AppHandle<R>, action: &str) -> Result<(), String> {
     match action {
         "about" => show_about_window(app),
+        "settings" => show_settings_window(app),
         "check-update" => {
             show_about_window(app)?;
             // 让「关于」窗口自己去查 GitHub Releases（它是个本地页面，fetch 走 CORS 没问题）
@@ -1142,6 +1397,10 @@ pub fn run() {
             popup_menu
         ])
         .setup(|app| {
+            // 把磁盘上的「网页对话」模式读进内存缓存（`layout_main_webviews` 只用缓存，
+            // 因为它在 Resized 事件里被高频调用，绝不能读盘 —— 见 CHAT_DOCKED 的说明）。
+            sync_chat_docked_from_disk(app.handle());
+
             // 选择窗口不再写在 tauri.conf.json 里：那样没法给它指定共享的 WebView2 数据目录
             // （配置里的 data_directory 是按 label 分目录的，会导致各窗口登录态不共享）。
             if let Err(err) = create_selector_window(app.handle()) {
@@ -1185,6 +1444,9 @@ pub fn run() {
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
                 if window.label() == MAIN_LABEL {
                     let app = window.app_handle();
+                    // 用户正在缩放窗口时，侧栏的过渡动画目标（相对客户区右侧）已经变了，
+                    // 继续跑旧动画会把侧栏停在错误的位置。直接掐掉，让下面的 layout 说了算。
+                    anim::cancel();
                     layout_main_webviews(app);
                     emit_window_state(app, window);
                 }
@@ -1274,6 +1536,8 @@ mod tests {
         assert!(config.remote_url.is_empty());
         assert!(!config.auto_start_local);
         assert!(config.local_start_command.is_empty());
+        // 网页对话默认 overlay（= 不 docked），保持升级前的行为。
+        assert!(!config.chat_docked, "chat_docked 默认必须是 false（overlay）");
         // 示例值只用于界面占位符，不该混进默认配置。
         assert_eq!(EXAMPLE_LOCAL_URL, "http://127.0.0.1:3080");
         assert_eq!(EXAMPLE_REMOTE_URL, "https://dsh.example.com");
@@ -1310,11 +1574,179 @@ mod tests {
             "remoteUrl",
             "autoStartLocal",
             "localStartCommand",
+            "chatDocked",
         ] {
             assert!(json.contains(key), "序列化结果缺少 {key}：{json}");
         }
         let back: AppConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.local_url, AppConfig::default().local_url);
+        assert_eq!(back.chat_docked, AppConfig::default().chat_docked);
+    }
+
+    /// **向后兼容**：老配置文件（v0.2.x）里没有 `chatDocked` 字段，
+    /// 反序列化必须成功并取 `false`（= overlay，行为与升级前完全一致）。
+    #[test]
+    fn old_config_without_chat_docked_defaults_to_overlay() {
+        let legacy = r#"{"configured":true,"localUrl":"http://127.0.0.1:3080",
+                         "remoteUrl":"","autoStartLocal":false,"localStartCommand":"dsh web"}"#;
+        let config: AppConfig = serde_json::from_str(legacy).unwrap();
+        assert!(
+            !config.chat_docked,
+            "缺 chatDocked 的老配置必须按 false（overlay）处理"
+        );
+
+        // 显式写 true 时也必须能读回来。
+        let docked: AppConfig =
+            serde_json::from_str(r#"{"configured":true,"chatDocked":true}"#).unwrap();
+        assert!(docked.chat_docked);
+    }
+
+    /* ------------------------------------------------------ 两种对话模式布局 */
+
+    /// `save_config` 是**补丁语义**：调用方没提到的字段必须保持磁盘上的旧值。
+    ///
+    /// 这条防的是一个真实的静默 bug：选择窗口的 `buildConfig()` 只产出 5 个
+    /// 地址/启动字段（不含 `chatDocked`）。若 `save_config` 直接反序列化成
+    /// `AppConfig`，`#[serde(default)]` 会把 `chatDocked` 补成 `false` ——
+    /// 于是「设置里选了 docked，之后又改了一次地址」会静默退回 overlay。
+    #[test]
+    fn save_config_patch_keeps_untouched_fields() {
+        let existing = AppConfig {
+            configured: true,
+            local_url: "http://127.0.0.1:3080".into(),
+            remote_url: "".into(),
+            auto_start_local: true,
+            local_start_command: "dsh web".into(),
+            chat_docked: true, // 用户已经在设置里选了 docked
+        };
+
+        // 模拟选择窗口保存地址：载荷里**没有** chatDocked。
+        let patch = serde_json::json!({
+            "configured": true,
+            "localUrl": "http://127.0.0.1:9999",
+            "remoteUrl": "",
+            "autoStartLocal": false,
+            "localStartCommand": "",
+        });
+        let merged = merge_config(&existing, &patch).unwrap();
+
+        assert_eq!(merged.local_url, "http://127.0.0.1:9999", "补丁里的字段应生效");
+        assert!(!merged.auto_start_local);
+        assert!(
+            merged.chat_docked,
+            "载荷没提 chatDocked，就**不能**把它重置成 false（否则会静默退回 overlay）"
+        );
+
+        // 只传 chatDocked 的补丁（设置窗口切模式用的最小载荷）。
+        let only_mode =
+            merge_config(&existing, &serde_json::json!({ "chatDocked": false })).unwrap();
+        assert!(!only_mode.chat_docked);
+        assert_eq!(
+            only_mode.local_url, "http://127.0.0.1:3080",
+            "只改模式不该动地址"
+        );
+        assert!(only_mode.auto_start_local);
+    }
+
+    /// 补丁里出现未知字段不应导致保存失败（serde 默认忽略未知字段）。
+    #[test]
+    fn save_config_patch_ignores_unknown_fields() {
+        let existing = AppConfig::default();
+        let patch = serde_json::json!({ "chatDocked": true, "futureField": 42 });
+        let merged = merge_config(&existing, &patch).unwrap();
+        assert!(merged.chat_docked);
+    }
+
+    /// 非对象载荷（前端传错类型）要报错，而不是静默写坏配置。
+    #[test]
+    fn save_config_patch_rejects_non_object() {
+        let existing = AppConfig::default();
+        assert!(merge_config(&existing, &serde_json::json!("nope")).is_err());
+        assert!(merge_config(&existing, &serde_json::json!(null)).is_err());
+    }
+
+    /// `overlay`（默认）：内容页占**整宽**，chat 盖在它右侧之上，两者 x 区间重叠。
+    #[test]
+    fn overlay_mode_keeps_content_full_width() {
+        let (titlebar, content, chat) = main_webview_rects(1200.0, 800.0, false);
+
+        assert_eq!(titlebar, (0.0, 0.0, 1200.0, 40.0));
+        assert_eq!(content, (0.0, 40.0, 1200.0, 760.0));
+        assert_eq!(chat, (1200.0 - 420.0, 40.0, 420.0, 760.0));
+
+        // 覆盖：内容页右边缘（1200）超出 chat 左边缘（780）⇒ 确实压在上面。
+        assert!(
+            content.0 + content.2 > chat.0,
+            "overlay 模式下内容页应当被 chat 覆盖一部分"
+        );
+    }
+
+    /// `docked`：内容页让出右侧 420px，两者**精确平铺、不重叠**，且窗口尺寸不变。
+    #[test]
+    fn docked_mode_shrinks_content_and_tiles_with_chat() {
+        let (titlebar, content, chat) = main_webview_rects(1200.0, 800.0, true);
+
+        // 顶栏仍然占整宽（它不属于内容区）。
+        assert_eq!(titlebar, (0.0, 0.0, 1200.0, 40.0));
+        // 内容页宽度 = 1200 - 420。
+        assert_eq!(content, (0.0, 40.0, 780.0, 760.0));
+        assert_eq!(chat, (780.0, 40.0, 420.0, 760.0));
+
+        // 并排：内容页右边缘正好等于 chat 左边缘（无缝隙、无重叠）。
+        assert_eq!(content.0 + content.2, chat.0, "docked 模式必须精确平铺");
+        // 两者高度一致、都从顶栏下面开始。
+        assert_eq!(content.1, chat.1);
+        assert_eq!(content.3, chat.3);
+        // 宽度守恒：内容 + 侧栏 == 窗口宽 ⇒ **没有改变窗口大小**。
+        assert_eq!(content.2 + chat.2, 1200.0);
+    }
+
+    /// 窗口比侧栏还窄时不能算出负数宽度（docked 下内容宽度至少 1）。
+    #[test]
+    fn docked_mode_clamps_content_width_on_tiny_window() {
+        let (_, content, chat) = main_webview_rects(300.0, 500.0, true);
+        assert!(content.2 >= 1.0, "内容宽度被压成非正数：{}", content.2);
+        assert_eq!(chat.2, 300.0, "窗口比侧栏窄时侧栏应压到窗口宽度");
+        assert_eq!(chat.0, 0.0);
+    }
+
+    /// 两种模式下 chat 的位置/尺寸**相同** —— 差别只在内容页让不让宽度。
+    #[test]
+    fn chat_rect_is_identical_in_both_modes() {
+        let (_, overlay_content, overlay_chat) = main_webview_rects(1000.0, 600.0, false);
+        let (_, docked_content, docked_chat) = main_webview_rects(1000.0, 600.0, true);
+        assert_eq!(overlay_chat, docked_chat);
+        assert_ne!(overlay_content.2, docked_content.2);
+    }
+
+    /// [`chat_target_bounds`] 是侧栏打开/关闭的**唯一**目标几何来源（动画接入点）。
+    ///
+    /// 这条锁死它与 `main_webview_rects` 的一致性：给「侧栏开/关过渡动画」接入时，
+    /// 动画终点必须正好等于这里算出来的值，否则动画结束会出现一帧跳变。
+    #[test]
+    fn chat_target_bounds_matches_layout_in_both_modes() {
+        for docked in [false, true] {
+            let (_, _, chat) = main_webview_rects(1200.0, 800.0, docked);
+            assert_eq!(
+                chat,
+                chat_target_bounds(1200.0, 800.0),
+                "docked={docked} 时 layout 的 chat 几何必须等于 chat_target_bounds"
+            );
+        }
+        // 与模式无关：overlay / docked 下目标几何完全一样。
+        let (x, y, w, h) = chat_target_bounds(1200.0, 800.0);
+        assert_eq!((x, y, w, h), (780.0, 40.0, 420.0, 760.0));
+        // 极端窄窗口同样被夹住（不能出现负宽度）。
+        let (x, _, w, _) = chat_target_bounds(300.0, 500.0);
+        assert_eq!((x, w), (0.0, 300.0));
+    }
+
+    /// 高度不足 40px（极端最小化状态）时不能算出负高度。
+    #[test]
+    fn content_height_never_goes_negative() {
+        let (_, content, chat) = main_webview_rects(800.0, 10.0, false);
+        assert!(content.3 >= 1.0);
+        assert!(chat.3 >= 1.0);
     }
 
     /// `Cargo.toml` 与 `tauri.conf.json` 的版本号必须一致，
@@ -1403,6 +1835,36 @@ mod tests {
         // 顶栏与内容是同一个窗口里的两个不同 webview，label 不能撞。
         assert_ne!(TITLEBAR_LABEL, CONTENT_LABEL);
         assert_ne!(TITLEBAR_LABEL, CHAT_LABEL);
+    }
+
+    /// 「设置」窗口是**本地页面**且要读写配置 ⇒ 必须在 `windows` 里，
+    /// 否则它调 `load_config` / `save_config` 会被 ACL 拒绝，表现为
+    /// 「设置窗口打开了一片空白、点保存毫无反应」。
+    ///
+    /// 和顶栏的区别：顶栏是子 webview（写 `webviews`），设置是独立窗口（写 `windows`）。
+    #[test]
+    fn capability_covers_settings_window() {
+        let cap: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
+        let windows: Vec<&str> = cap["windows"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+
+        assert!(
+            windows.contains(&SETTINGS_LABEL),
+            "capabilities/default.json 的 windows 必须包含 `{SETTINGS_LABEL}`，\
+             否则设置窗口拿不到 IPC、读不到也存不了配置。当前 windows={windows:?}"
+        );
+        // 关于窗口是同样的接线，一起守住。
+        assert!(
+            windows.contains(&ABOUT_LABEL),
+            "windows 必须包含 `{ABOUT_LABEL}`。当前 windows={windows:?}"
+        );
+        // 设置窗口的 label 不能和别的窗口/ webview 撞。
+        for other in [MAIN_LABEL, TITLEBAR_LABEL, CONTENT_LABEL, CHAT_LABEL, SELECTOR_LABEL] {
+            assert_ne!(SETTINGS_LABEL, other);
+        }
     }
 
     /// 顶栏高度是逻辑值，必须原样交给 Tauri（**不许**再乘 scale）。

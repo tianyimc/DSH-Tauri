@@ -1,10 +1,11 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "本地窗口 / 本地 webview 的权限：调用应用自定义命令 + Tauri 核心 API。顶栏用 webviews 匹配（它是主窗口 main 里的子 webview，label = titlebar）；故意不把 main 放进 windows，避免把远程 content 子 webview 一并覆盖。",
+  "description": "本地窗口 / 本地 webview 的权限：调用应用自定义命令 + Tauri 核心 API。顶栏用 webviews 匹配（它是主窗口 main 里的子 webview，label = titlebar）；故意不把 main 放进 windows，避免把远程 content 子 webview 一并覆盖。selector / about / settings 是本地独立窗口（WebviewWindow），写 windows。",
   "windows": [
     "selector",
-    "about"
+    "about",
+    "settings"
   ],
   "webviews": [
     "titlebar"

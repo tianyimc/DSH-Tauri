@@ -15,8 +15,14 @@ export const TITLEBAR_HEIGHT = 40;
 /** 顶栏里出现过的所有 Tauri 命令。命令契约由 Lead 冻结，这里只是白名单。 */
 export const TITLEBAR_COMMANDS = ["chrome_action", "window_control", "start_drag", "popup_menu"];
 
-/** 「应用」原生菜单支持的条目（Rust 侧 `popup_menu` 的 "app" 分支）。 */
-export const APP_MENU_ACTIONS = ["about", "check-update", "reconnect"];
+/**
+ * 「应用」原生菜单支持的条目（Rust 侧 `popup_menu` 的 "app" 分支）。
+ *
+ * ⚠️ 这份列表必须与 `src-tauri/src/lib.rs` 里 `popup_menu` 的 `item("...")` id **完全一致**。
+ * `scripts/test-titlebar.mjs` 会**真的去解析 lib.rs** 做对账（不是硬编码快照）——
+ * 之前这里写死过一个快照，结果菜单加了 `settings` 而测试照旧全绿（假绿），所以改成真解析。
+ */
+export const APP_MENU_ACTIONS = ["about", "settings", "check-update", "reconnect"];
 
 /** 「操作」原生菜单支持的条目（Rust 侧 `popup_menu` 的 "actions" 分支）。 */
 export const ACTIONS_MENU_ACTIONS = ["refresh", "undo", "redo"];

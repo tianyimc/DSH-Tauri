@@ -12,7 +12,32 @@ export const DEFAULT_CONFIG = {
   remoteUrl: "",
   autoStartLocal: false,
   localStartCommand: "",
+  // 网页对话的加载模式：false = overlay（默认，覆盖在内容页之上），true = docked（并排）。
+  // 与 Rust 的 `chat_docked` 对应（serde camelCase）。老配置没有这个字段时按 false 处理。
+  chatDocked: false,
 };
+
+/**
+ * 网页对话的两种加载模式。
+ *
+ * `overlay`：侧栏**覆盖**在内容页右侧之上，内容页面积不变（默认，保持升级前的行为）。
+ * `docked`：内容页让出右侧 `CHAT_WIDTH`（Rust 侧 420 逻辑 px），两者**并排**；
+ *           **不改变程序窗口本身的大小**。
+ */
+export const CHAT_MODES = {
+  overlay: { id: "overlay", docked: false, label: "覆盖（overlay）", hint: "侧栏浮在页面之上，页面宽度不变。" },
+  docked: { id: "docked", docked: true, label: "并排（docked）", hint: "页面让出右侧 420px，与侧栏并排。" },
+};
+
+/** 由 `chatDocked` 布尔值得到模式 id（`"overlay"` | `"docked"`）。 */
+export function chatModeOf(config) {
+  return config && config.chatDocked ? CHAT_MODES.docked.id : CHAT_MODES.overlay.id;
+}
+
+/** 由模式 id 得到要写进配置的 `chatDocked` 值。未知 id 一律按 overlay（false）。 */
+export function chatDockedOf(modeId) {
+  return modeId === CHAT_MODES.docked.id;
+}
 
 /** 界面上的示例值（只用于 placeholder，不会写进默认配置）。 */
 export const EXAMPLES = {
@@ -66,7 +91,14 @@ export function validateConfig(candidate) {
   return null;
 }
 
-/** 把表单读出来的原始值整理成要落盘的配置。 */
+/**
+ * 把表单读出来的原始值整理成要落盘的配置。
+ *
+ * ⚠️ **这里刻意不产出 `chatDocked`** —— 本函数只服务于选择窗口的地址表单。
+ * Rust 侧 `save_config` 是**补丁语义**（没提到的字段保持磁盘旧值），
+ * 所以省略它不会把用户在设置窗口选的模式重置掉。
+ * 若将来这里要带上它，必须先从已加载的配置里透传，而不是写死 false。
+ */
 export function buildConfig(form) {
   return {
     configured: true,

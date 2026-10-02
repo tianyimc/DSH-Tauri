@@ -8,9 +8,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  CHAT_MODES,
   DEFAULT_CONFIG,
   EXAMPLES,
   buildConfig,
+  chatDockedOf,
+  chatModeOf,
   isHttpUrl,
   normalizeUrl,
   urlOf,
@@ -149,4 +152,47 @@ test("示例值与需求一致", () => {
 
 test("默认配置本身校验不通过（强制用户至少填一个）", () => {
   assert.match(validateConfig(DEFAULT_CONFIG), /至少要填一个/);
+});
+
+/* ------------------------------------------------- 网页对话加载模式（task-4） */
+
+test("chatDocked 默认 false = overlay（保持升级前的行为）", () => {
+  assert.equal(DEFAULT_CONFIG.chatDocked, false);
+  assert.equal(chatModeOf(DEFAULT_CONFIG), "overlay");
+  assert.equal(chatModeOf({}), "overlay");
+  assert.equal(chatModeOf({ chatDocked: false }), "overlay");
+});
+
+test("chatDocked 为 true 时是 docked", () => {
+  assert.equal(chatModeOf({ chatDocked: true }), "docked");
+});
+
+test("chatModeOf 对 null/undefined 也安全（按 overlay）", () => {
+  assert.equal(chatModeOf(null), "overlay");
+  assert.equal(chatModeOf(undefined), "overlay");
+});
+
+test("chatDockedOf 把模式 id 映射回布尔值，未知 id 一律 overlay", () => {
+  assert.equal(chatDockedOf("docked"), true);
+  assert.equal(chatDockedOf("overlay"), false);
+  assert.equal(chatDockedOf("bogus"), false);
+  assert.equal(chatDockedOf(undefined), false);
+});
+
+test("CHAT_MODES 的 id 与 docked 布尔值自洽", () => {
+  assert.equal(CHAT_MODES.overlay.docked, false);
+  assert.equal(CHAT_MODES.docked.docked, true);
+  for (const key of ["overlay", "docked"]) {
+    assert.equal(CHAT_MODES[key].id, key);
+    assert.equal(chatDockedOf(CHAT_MODES[key].id), CHAT_MODES[key].docked);
+    assert.equal(chatModeOf({ chatDocked: CHAT_MODES[key].docked }), key);
+  }
+});
+
+test("buildConfig 刻意不产出 chatDocked（靠 Rust save_config 的补丁语义保留）", () => {
+  const built = buildConfig({ localUrl: "http://x:1" });
+  assert.ok(
+    !Object.prototype.hasOwnProperty.call(built, "chatDocked"),
+    "地址表单不该带上 chatDocked —— 若带上，用户在设置里选的模式会被重置",
+  );
 });

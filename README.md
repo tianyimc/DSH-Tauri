@@ -122,6 +122,7 @@ DSHTauri/
 │   ├── titlebar.html               # 主窗口顶部的自定义标题栏（本地页面 = 有 IPC）
 │   ├── titlebar/                   #   顶栏的 CSS / JS / 纯函数规则 + 说明
 │   └── about.html / about.css / about.js         # 「关于 / 检查更新」窗口
+│   └── settings.html / settings.css / settings.js # 「设置」窗口（连接方式 / 网页对话加载模式）
 ├── src-tauri/
 │   ├── capabilities/
 │   │   ├── default.json            # 第 7 项：选择窗口 / 关于窗口 / 顶栏子 webview 的权限
@@ -703,6 +704,48 @@ fn spawn_local_service(command: &str) -> Result<(), String> {
 **右侧对话侧栏**：主窗口内的第三个子 webview（首次点击时创建），贴在右侧、顶部让开顶栏；
 「网页对话」再次点击即隐藏。
 
+### 6.5.1 网页对话的两种加载模式（v0.3.0）
+
+在**设置**里可切换，配置字段 `chatDocked`（默认 `false`）：
+
+| 模式 | 网页（content） | 聊天（chat） | 说明 |
+| --- | --- | --- | --- |
+| `overlay`（默认） | 整宽不变 | 覆盖在网页右侧**之上** | 与旧版行为一致；网页面积不受影响 |
+| `docked` | 让出 `CHAT_WIDTH` | 与网页**并排**、不重叠 | 便于一边看网页一边聊天；网页变窄 |
+
+两种模式都**不改变程序窗口本身的尺寸**（宽度严格守恒：网页宽 + 侧栏宽 = 窗口宽）。
+
+实现要点：几何全部由纯函数 `main_webview_rects(width, height, docked)` 算出，
+`layout_main_webviews` 只负责把结果写进子 webview；`docked` 状态用
+`static CHAT_DOCKED: AtomicBool` 缓存（**`Resized` 里不读盘**，只在启动与保存设置时刷新）。
+
+### 6.5.2 侧栏开/关的过渡动画（v0.3.0）
+
+Windows 11 的「动画效果」适配，实现在 `src-tauri/src/anim.rs`：
+
+- 框架**没有**动画能力 —— wry 最终用 `SetWindowPos` 摆放子 webview，没有动画参数
+  （证据见 [`docs/ANIMATION-FEASIBILITY.md`](docs/ANIMATION-FEASIBILITY.md)），
+  所以是自己**逐帧插值**（180ms、约 60fps、ease-out cubic）。
+- **只对 `overlay` 模式做滑动**：那种模式网页整宽不变，动画期间**尺寸不变、只改 x**，
+  网页不需要重新布局，滑动很顺。
+- **`docked` 模式不做滑动**：它必须改变网页宽度，逐帧改会让网页每帧重排、必然掉帧，
+  所以直接切到位。
+- 跟随系统设置：读 `SPI_GETCLIENTAREAANIMATION`，系统关掉「动画效果」时**直接切换**。
+- 窗口缩放 / 收进托盘时 `anim::cancel()`，避免侧栏停在错误位置。
+
+### 6.5.3 「设置」窗口（v0.3.0）
+
+顶栏「**应用 → 设置**」打开（label `settings`，本地页面 `src/settings.html`，独立窗口）。
+提供：
+
+- **重新选择连接方式** —— 与托盘菜单 / 顶栏「应用 → 重新连接」**同一分支**，行为完全一致。
+- **网页对话的加载方式** —— 上面两种模式二选一，立即生效并落盘。
+
+> **`save_config` 是补丁语义**（只覆盖载荷里出现过的字段）。
+> 这是必要的：选择窗口保存地址时的载荷**不含** `chatDocked`，
+> 若按整对象反序列化，`#[serde(default)]` 会把它补成 `false`，
+> 于是「设置里选了 docked → 之后改一次地址」会**静默退回 overlay**。
+
 > **平台差异**：Linux（WebKitGTK）把子 webview 塞进一个竖向 `GtkBox`，会**忽略**指定的坐标与尺寸，
 > 所以 Linux 下顶栏不会正确贴在顶部 40px。目标平台 Windows 走真正的子 HWND，坐标按传入值生效。
 > Linux 只用于开发机自测。
@@ -720,7 +763,7 @@ fn spawn_local_service(command: &str) -> Result<(), String> {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "本地窗口 / 本地 webview 的权限：调用应用自定义命令 + Tauri 核心 API。",
-  "windows": ["selector", "about"],
+  "windows": ["selector", "about", "settings"],
   "webviews": ["titlebar"],
   "permissions": ["core:default"]
 }

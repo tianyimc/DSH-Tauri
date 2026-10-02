@@ -39,13 +39,24 @@
 
 ### 修复
 
-- **主窗口白屏且点右上角 × 无反应，只能任务管理器强杀**（Windows 上必现）
-  - 原因：`open_main_window` 是**同步命令**，Tauri 的同步命令跑在主线程（事件循环）里，
-    而 `WebviewWindowBuilder::build()` 会向事件循环投递消息后 `rx.recv()` **阻塞等待**它被处理——
-    事件循环正卡在这条命令里，于是永久死锁：窗口画不出来（白屏），也不再响应任何消息（× 点不动）。
-    Tauri 源码里对此有明确注释：*"must be called from a separate thread, otherwise the channel will introduce a deadlock"*。
-  - 修复：把 `open_main_window` 改成 `async fn`，命令改为跑在异步运行时（独立线程），
-    死锁消失；`probe_url` 一并改成 async，避免 DNS 查询卡住界面。
+- **主窗口白屏，且点右上角 × 无反应，只能任务管理器强杀**（Windows 上必现，Linux 正常）
+  - **症状**（由 `windows-latest` 上的 GUI 冒烟测试复现）：
+    WebView2 从未发起任何网络请求（白屏），且收到 `WM_CLOSE` 后窗口仍然 `IsWindowVisible=True`（× 点不动）。
+  - **根因**：`open_main_window` 是**同步命令**，而 Tauri 的同步命令跑在主线程（事件循环）上；
+    这条命令又正是选择窗口通过 IPC 调进来的 —— 主线程此刻处在 **WebView2 的 IPC 回调里**。
+    在这个位置同步创建「窗口 + WebView2」会同时踩两个坑：
+    1. 新 WebView2 控制器的创建是异步的，嵌套在另一个 WebView2 的回调里**永远初始化不完** ——
+       窗口出来了，但页面从不导航 ⇒ **白屏**；
+    2. 紧接着销毁「正在执行这条 IPC 的那个 webview」会让消息处理进入坏状态 ——
+       后续 `hide()` 被丢弃 ⇒ **点 × 没反应**。
+  - **修复**：把 `open_main_window` / `probe_url` 改成 `async fn`。异步命令由 Tauri 丢到
+    异步运行时的**独立线程**执行，创建窗口时走 `proxy.send_event` 交给此时空闲的主线程处理，
+    不再嵌套在 IPC 回调里。选择窗口也从 `destroy()` 改为 `hide()`，避免销毁正在执行 IPC 的 webview。
+  - **验证**：同一套冒烟测试在修复前 `12 通过 / 2 失败`，修复后 **`14 通过 / 0 失败`**。
+
+### 新增（补充）
+
+- 托盘菜单新增「**重新选择连接方式**」：把隐藏的选择窗口重新叫出来（选择窗口不再被销毁）
 
 ### 内部
 

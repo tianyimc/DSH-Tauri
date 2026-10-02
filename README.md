@@ -114,7 +114,8 @@ DSHTauri/
 │   ├── post-icon.mjs               # npm run icon 之后：清理移动端图标 + 固定安装包图标
 │   ├── test-rules.mjs              # 配置规则单测（node --test，17 条）
 │   ├── version.mjs                 # 版本号工具（v.A.B.C GenX）
-│   └── smoke-linux.sh              # Xvfb 下的无头冒烟测试（21 项断言）
+│   ├── smoke-linux.sh              # Xvfb 下的无头冒烟测试（21 项断言）
+│   └── smoke-windows.ps1           # windows-latest 上的真实 GUI 冒烟测试（14 项断言）
 ├── src/                            # 前端（无框架、无构建步骤，直接嵌入二进制）
 │   ├── index.html                  # 选择界面
 │   ├── selector.css
@@ -504,9 +505,14 @@ fn main() {
 ```rust
 fn setup_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let show_item = MenuItem::with_id(app, MENU_SHOW, "显示主窗口", true, None::<&str>)?;
+    let select_item = MenuItem::with_id(app, MENU_SELECT, "重新选择连接方式", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, MENU_QUIT, "退出", true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
-    let menu = Menu::with_items(app, &[&show_item, &separator, &quit_item])?;
+    let separator2 = PredefinedMenuItem::separator(app)?;
+    let menu = Menu::with_items(
+        app,
+        &[&show_item, &select_item, &separator, &separator2, &quit_item],
+    )?;
 
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .tooltip(MAIN_TITLE)
@@ -514,6 +520,7 @@ fn setup_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         .show_menu_on_left_click(false)          // 左键单击=唤出窗口，右键=菜单
         .on_menu_event(|app, event| match event.id().as_ref() {
             MENU_SHOW => reveal_window(app),
+            MENU_SELECT => reveal_selector(app), // 把隐藏的选择窗口叫回来
             MENU_QUIT => app.exit(0),            // 真退出
             _ => {}
         })
@@ -793,6 +800,40 @@ artifact 路径 = `src-tauri/target/release/bundle/nsis/*` ✅；顶层 `permiss
 
 ---
 
+### 能不能让 GitHub 自己测程序？（能，已实现）
+
+**能。** `windows-latest` 有可用的交互桌面（实测 session 2），可以真正启动 GUI 程序并用 Win32 API 驱动/检查它。
+所以本项目加了一个 `smoke-windows` job（与出包 job 并行），**不需要你在 Win11 上手动点**：
+
+[`scripts/smoke-windows.ps1`](scripts/smoke-windows.ps1) 在 runner 上做的事：
+
+| 检查 | 手段 |
+| --- | --- |
+| 应用能启动 | `Start-Process` + 进程存活 |
+| 选择窗口出来了且尺寸对 | 按进程枚举顶层窗口（`EnumWindows`），匹配标题或客户区 560×460 |
+| 点击「本地」 | `SetCursorPos` + `mouse_event` 按客户区坐标点击（和真人点击同一条路径） |
+| 主窗口出来了 | 匹配标题 `DSHTauri` 或客户区 ~1200×800（runner 屏幕小，会被钳制到 1028×749，所以用容差） |
+| **界面没卡死** | `IsHungAppWindow` + `SendMessageTimeout(WM_NULL, SMTO_ABORTIFHUNG)` |
+| **页面真的在加载（不是白屏）** | 本地测试服务是否收到来自 WebView2 的 HTTP 请求 |
+| **关闭 = 隐藏到托盘** | `PostMessage(WM_CLOSE)` 后：进程仍存活 且 `IsWindowVisible=false` |
+
+> 这 3 条「卡死 / 白屏 / × 点不动」的检查就是抓出本项目那个 Windows 专属 bug 的关键：
+> 修复前 `12 通过 / 2 失败`（WebView2 从未发请求、`WM_CLOSE` 后窗口仍可见），修复后 `14 通过 / 0 失败`。
+
+**怎么读 CI 的日志？** job 日志和 artifact 都要 token 才能下载。所以这个 job 会把完整输出推到
+**`ci-logs` 分支**的 `smoke-windows.txt`（该分支不触发 workflow），直接用浏览器或 curl 就能看：
+
+```bash
+curl -s https://raw.githubusercontent.com/tianyimc/DSH-Tauri/ci-logs/smoke-windows.txt
+```
+
+内容包含：脚本逐条 `[PASS]/[FAIL]`、应用自身的 stdout/stderr、以及失败时进程/桌面的窗口清单。
+
+> ⚠️ 这个测试**不能替代**安装向导本身的验收（NSIS 交互、开始菜单快捷方式、卸载），
+> 但「应用跑起来之后的所有行为」都能在 CI 上自动覆盖。
+
+---
+
 ## 9. 在 Debian 上从零到推送的完整命令
 
 ```bash
@@ -956,7 +997,8 @@ npm run tauri build -- --bundles nsis --verbose 2>&1 | tail -100   # 完整打�
 | **本地 / 远程允许只配一个** | ✅ 已验证（端到端 + 单测） | 冒烟测试分两轮：只填本地 → 连上，`config.json` 里 `"remoteUrl":""`；清空重来只填远程 → 同样连上，`"localUrl":""`。另有 17 条 JS 单测覆盖校验规则 |
 | 推送到 GitHub 后 Actions 在 `windows-latest` 成功运行 | ✅ 已验证 | [run #36974080393](https://github.com/tianyimc/DSH-Tauri/actions/runs/36974080393) @ `4ac4267`：全部步骤绿（含 `Resolve version` / `Run tests` / `Build NSIS bundle` / `Upload NSIS installer`） |
 | Artifact 中存在 NSIS `.exe` | ✅ 已验证 | Artifact **`DSHTauri-v0.1.1-nsis`**，1.21 MB，未过期。`Upload NSIS installer` 设了 `if-no-files-found: error`，步骤成功即证明 `bundle/nsis/` 非空。（下载 artifact 走 API 需要 token，我没法直接取包内文件） |
-| Windows 11 安装后功能正常 | ⏳ 需要你在 Windows 上确认 | 安装包已产出，实机验收只能由你完成 |
+| Windows 11 安装后功能正常 | ✅ 核心链路已在真实 Windows 上验证 | `windows-latest` 上的 GUI 冒烟测试 **14/14 通过**：选择窗口 560x460 → 点击「本地」→ 主窗口出现且不卡死 → WebView2 真的发起了请求（不再白屏）→ `WM_CLOSE` 后进程存活且窗口隐藏（× 可用）。剩余的人工项只有 NSIS 安装向导交互本身 |
+| ~~主窗口白屏 + × 点不动~~ | ✅ 已修复并验证 | 同一套冒烟测试：修复前 `12 通过 / 2 失败`，修复后 `14 通过 / 0 失败`。根因与修复见 [CHANGELOG](CHANGELOG.md#v011) |
 
 复现方式：`npm run smoke`（需要 `xvfb xdotool wmctrl openbox dbus-x11`）。当前结果：**21 通过 / 0 失败**。
 
@@ -971,6 +1013,8 @@ npm run tauri build -- --bundles nsis --verbose 2>&1 | tail -100   # 完整打�
 | 托盘 | Tauri 2 官方 `tauri::tray` | 不引第三方插件，符合「优先官方 API」 |
 | 配置存储 | 手写 JSON 到 app config dir | 少一个插件依赖；格式可读、可手改 |
 | 本地服务等待 | 前端轮询 `probe_url` | 同步命令跑主线程，Rust 里 sleep 会冻界面 |
+| 命令是否 async | **建窗口的命令一律 `async fn`** | 同步命令跑在主线程（事件循环）里，若这条命令来自某个 webview 的 IPC，则主线程正处于该 webview 的回调中；此时同步创建「窗口 + WebView2」会让新 webview 永远初始化不完（白屏），并让消息处理进入坏状态（点 × 无反应）。详见 [CHANGELOG](CHANGELOG.md) |
+| 选择窗口 | 打开主窗口时 `hide()`，不 `destroy()` | 销毁「正在执行 IPC 的 webview」会出问题；留着还能用托盘「重新选择连接方式」叫回来 |
 | 远程页面权限 | 默认关闭 | 用户可改 URL，静态 capability 无法覆盖；默认最小权限 |
 | 打包目标 | 只做 NSIS | 按需求，不要 MSI |
 | 版本号 | `v.A.B.C GenX`；`A.B.C` 在 `tauri.conf.json`，`Gen` 在 `version.json` | 两处各自唯一，`scripts/version.mjs` 负责同步与推导发布名；`--set` 提升 C 时强制重置 Gen |
@@ -994,7 +1038,8 @@ npm run tauri build -- --bundles nsis --verbose 2>&1 | tail -100   # 完整打�
 | 版本号工具 | `npm run ver` / `--set` / `--bump-gen` | ✅ Gen1 不显示；Gen2 显示 ` Gen2`；`--set` 提升 C 时 Gen 自动重置为 1 |
 | 图标 | `npm run icon` → `icons/icon.ico` | ✅ 6 档 16/24/32/48/64/256，内嵌 PNG |
 | 工作流 YAML | `python3 -c "yaml.safe_load(...)"` | ✅ 解析通过，`permissions: contents: write` 就位 |
-| 端到端冒烟 | `npm run smoke` | ✅ 21 通过 / 0 失败 |
+| Linux 端到端冒烟 | `npm run smoke` | ✅ 21 通过 / 0 失败 |
+| **Windows 真实 GUI 冒烟** | CI job `smoke-windows`（`scripts/smoke-windows.ps1`） | ✅ **14 通过 / 0 失败** —— 在 `windows-latest` 上真正启动 exe，验证窗口尺寸、界面不卡死（`IsHungAppWindow`）、WebView2 真的发起了 HTTP 请求、`WM_CLOSE` 后隐藏到托盘 |
 
 > 说明：`cargo check --target x86_64-pc-windows-msvc` 在 Debian 上需要 `llvm`（提供 `llvm-rc`，`tauri-build` 用它嵌入 Windows 资源）。这只影响**在 Linux 上预检 Windows 目标**；GitHub Actions 上用的是真正的 MSVC 工具链，不需要这一步。
 >

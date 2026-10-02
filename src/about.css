@@ -1,0 +1,90 @@
+:root {
+  --bg: #ffffff;
+  --fg: #1f2328;
+  --muted: #59636e;
+  --border: #d0d7de;
+  --box: #f6f8fa;
+  --accent: #0969da;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117;
+    --fg: #e6edf3;
+    --muted: #8b949e;
+    --border: #30363d;
+    --box: #161b22;
+    --accent: #2f81f7;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body { height: 100%; margin: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font: 13px/1.6 "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  height: 100%;
+  padding: 20px;
+}
+
+.head { display: flex; align-items: center; gap: 12px; }
+
+.logo { font-size: 34px; line-height: 1; }
+
+h1 { margin: 0; font-size: 19px; }
+h2 { margin: 0 0 6px; font-size: 13px; }
+
+.ver {
+  margin: 2px 0 0;
+  font: 12px ui-monospace, Consolas, monospace;
+  color: var(--muted);
+}
+
+.desc { margin: 0; color: var(--muted); }
+
+.box {
+  padding: 12px 14px;
+  background: var(--box);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.box p { margin: 0; }
+
+.muted { color: var(--muted); font-size: 12px; }
+
+.mono { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+
+.selectable { -webkit-user-select: text; user-select: text; }
+
+#update { white-space: pre-wrap; word-break: break-all; }
+
+.foot {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: auto;
+}
+
+button {
+  padding: 6px 14px;
+  font: inherit;
+  color: var(--fg);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+button:hover { border-color: var(--accent); color: var(--accent); }

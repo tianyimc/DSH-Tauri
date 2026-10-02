@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>关于 DSHTauri</title>
+    <link rel="stylesheet" href="about.css" />
+  </head>
+  <body>
+    <main class="wrap">
+      <header class="head">
+        <span class="logo" aria-hidden="true">🐋</span>
+        <div>
+          <h1>DSHTauri</h1>
+          <p class="ver" id="version">…</p>
+        </div>
+      </header>
+
+      <p class="desc">
+        DSH WebUI 的 Windows 轻量桌面壳：Tauri 2 + 系统原生 WebView2，不捆绑 Chromium。
+      </p>
+
+      <section class="box">
+        <h2>检查更新</h2>
+        <p class="muted" id="update">点「检查更新」开始。</p>
+      </section>
+
+      <section class="box">
+        <h2>项目地址</h2>
+        <p class="mono selectable">https://github.com/tianyimc/DSH-Tauri</p>
+        <p class="muted">版本规则：<span class="mono">v.A.B.C GenX</span>，详见仓库的 CHANGELOG.md。</p>
+      </section>
+
+      <footer class="foot">
+        <button id="btn-check" type="button">检查更新</button>
+        <button id="btn-close" type="button">关闭</button>
+      </footer>
+    </main>
+
+    <script type="module" src="about.js"></script>
+  </body>
+</html>

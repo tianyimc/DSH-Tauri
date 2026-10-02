@@ -16,7 +16,8 @@ param(
   [Parameter(Mandatory = $true)][string]$AppPath,
   [int]$Port = 3080,      # 本地地址对应的测试服务
   [int]$Port2 = 3081,     # 远程地址对应的测试服务
-  [int]$SvcPort = 3099    # C 段：被自动启动的「本地服务」
+  [int]$SvcPort = 3099,   # C 段：被自动启动的「本地服务」
+  [int]$CookiePort = 3090 # D 段：Cookie 持久化测试服务
 )
 
 $ErrorActionPreference = "Stop"
@@ -152,6 +153,28 @@ s.end('<!doctype html><meta charset=utf-8><title>DSH $ListenPort</title><h1>OK $
 "@ | Set-Content -Path $js -Encoding UTF8
   Set-Content -Path $LogFile -Value "" -NoNewline
   return Start-Process node -ArgumentList @($js, $LogFile) -PassThru -WindowStyle Hidden
+}
+
+function Start-CookieServer([int]$ListenPort, [string]$LogFile) {
+  $js = Join-Path $WORK "cookie-$ListenPort.js"
+  @'
+const http = require("http"), fs = require("fs");
+// 页面先把「当前已有的 cookie」上报，再设置两种 cookie，最后再上报一次。
+// 于是第二次启动时的 /before 就能看出哪些 cookie 真的落盘了。
+const page = "<!doctype html><meta charset=utf-8><title>COOKIE</title><script>" +
+  "fetch('/before?c='+encodeURIComponent(document.cookie));" +
+  "document.cookie='persist=1; Max-Age=86400; Path=/';" +
+  "document.cookie='sess=1; Path=/';" +
+  "fetch('/after?c='+encodeURIComponent(document.cookie));" +
+  "<\/script>";
+http.createServer((q, s) => {
+  fs.appendFileSync(process.argv[2], q.url + "\n");
+  s.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+  s.end(page);
+}).listen(process.argv[3], "127.0.0.1");
+'@ | Set-Content -Path $js -Encoding UTF8
+  Set-Content -Path $LogFile -Value "" -NoNewline
+  return Start-Process node -ArgumentList @($js, $LogFile, $ListenPort) -PassThru -WindowStyle Hidden
 }
 
 function Test-Port([int]$P) {
@@ -348,6 +371,53 @@ setInterval(() => {}, 1000);
         "仍在监听 —— 说明子进程没有被作业对象一起回收"
     }
   }
+
+  # ======================================================= D. Cookie 持久化
+  Write-Host "== 10. Cookie / 登录态必须跨重启保留 =="
+  $COOKIE_LOG = Join-Path $WORK "cookie.log"
+  $servers += Start-CookieServer $CookiePort $COOKIE_LOG
+  Start-Sleep -Seconds 2
+  Check "Cookie 测试服务已就绪" (Test-Port $CookiePort)
+
+  $cfg3 = @{ configured = $true;
+             localUrl = "http://127.0.0.1:$CookiePort";
+             remoteUrl = "";
+             autoStartLocal = $false; localStartCommand = "" } | ConvertTo-Json -Compress
+  Set-Content -Path $CONFIG_FILE -Value $cfg3 -Encoding UTF8
+
+  function Open-MainViaLocal([string]$Tag) {
+    $p = Start-Process $AppPath -PassThru -RedirectStandardOutput "$APP_LOG.$Tag" -RedirectStandardError "$APP_LOG.$Tag.err"
+    Start-Sleep -Seconds 8
+    $s = Wait-AppWindow $p.Id $SELECTOR_TITLE 560 460 120
+    if ($s -eq [IntPtr]::Zero) { return $null }
+    $cs = [Win32]::ClientSize($s)
+    [void][Win32]::SetForegroundWindow($s)
+    Start-Sleep -Milliseconds 500
+    [Win32]::ClickClient($s, [int]($cs[0] / 2), $CARD_LOCAL_Y)
+    for ($i = 0; $i -lt 12; $i++) {
+      Start-Sleep -Seconds 2
+      if ((Get-Content $COOKIE_LOG -Raw) -match "/after") { break }
+    }
+    return $p
+  }
+
+  # 第一次运行：页面设置 cookie
+  $run1 = Open-MainViaLocal "cookie1"
+  $log1 = Get-Content $COOKIE_LOG -Raw
+  Check "第一次运行：页面成功写入 cookie" ($log1 -match "persist%3D1") "日志：'$log1'"
+  Stop-App $run1
+  # 上一实例的 WebView2 子进程可能还占着用户数据目录，多等一会儿
+  Start-Sleep -Seconds 6
+
+  # 第二次运行：看第一次设置的 cookie 是否还在
+  Set-Content -Path $COOKIE_LOG -Value "" -NoNewline
+  $run2 = Open-MainViaLocal "cookie2"
+  $log2 = Get-Content $COOKIE_LOG -Raw
+  $before = (($log2 -split "`n") | Where-Object { $_ -like "/before*" } | Select-Object -First 1)
+  $sessSurvived = ($before -match "sess%3D1")
+  Check "持久 cookie 跨重启保留" ($before -match "persist%3D1") "第二次启动的 /before：'$before'"
+  Write-Host ("  会话 cookie 是否保留：{0}" -f $(if ($sessSurvived) { "是" } else { "否（Chromium 默认行为，Cloudflare Access 的 CF_Authorization 就是会话 cookie）" }))
+  Stop-App $run2
 }
 catch {
   Check "脚本异常中止" $false $_.Exception.Message

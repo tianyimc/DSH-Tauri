@@ -8,23 +8,7 @@
   },
   "app": {
     "withGlobalTauri": true,
-    "windows": [
-      {
-        "label": "selector",
-        "title": "选择 DSH 连接方式",
-        "url": "index.html",
-        "width": 560,
-        "height": 460,
-        "minWidth": 460,
-        "minHeight": 380,
-        "resizable": true,
-        "maximizable": false,
-        "center": true,
-        "visible": true,
-        "decorations": true,
-        "focus": true
-      }
-    ],
+    "windows": [],
     "security": {
       "csp": null
     }

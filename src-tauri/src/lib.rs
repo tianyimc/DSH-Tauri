@@ -17,13 +17,19 @@ use tauri::{
     image::Image,
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager, Runtime, Theme, WebviewUrl, WebviewWindowBuilder, WindowEvent,
+    AppHandle, Emitter, Manager, Runtime, Theme, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 
-/// 启动选择窗口的 label（在 tauri.conf.json 中预创建）。
+/// 启动选择窗口的 label（在 `setup()` 里创建）。
 pub const SELECTOR_LABEL: &str = "selector";
 /// 主窗口的 label（选择完成后由 Rust 动态创建）。
 pub const MAIN_LABEL: &str = "main";
+/// 自定义标题栏窗口的 label（覆盖在主窗口顶部，承载「应用 / 操作 / 网页对话」菜单）。
+pub const CHROME_LABEL: &str = "chrome";
+/// 右侧「网页对话」侧栏的 label。
+pub const CHAT_LABEL: &str = "chat";
+/// 「关于」窗口的 label。
+pub const ABOUT_LABEL: &str = "about";
 
 /// 版本号（`v.A.B.C GenX`），由 `build.rs` 从 `Cargo.toml` + `version.json` 生成。
 ///
@@ -44,6 +50,19 @@ const MAIN_WIDTH: f64 = 1200.0;
 const MAIN_HEIGHT: f64 = 800.0;
 const MAIN_MIN_WIDTH: f64 = 640.0;
 const MAIN_MIN_HEIGHT: f64 = 480.0;
+
+/// 自定义标题栏高度（逻辑像素）。主窗口不再用系统标题栏，改为顶部这条自绘菜单栏。
+const CHROME_HEIGHT: f64 = 40.0;
+
+/// 右侧「网页对话」侧栏。
+const CHAT_TITLE: &str = "DSH 对话";
+const CHAT_URL: &str = "https://chat.deepseek.com/";
+const CHAT_WIDTH: f64 = 420.0;
+
+/// 「关于」窗口。
+const ABOUT_TITLE: &str = "关于 DSHTauri";
+const ABOUT_WIDTH: f64 = 520.0;
+const ABOUT_HEIGHT: f64 = 440.0;
 
 const TRAY_ID: &str = "dshtauri-tray";
 const MENU_SHOW: &str = "show";
@@ -253,27 +272,243 @@ fn probe_tcp(host: &str, port: u16) -> bool {
 
 /* ------------------------------------------------------------------ window */
 
-/// 托盘「显示主窗口」/ 左键点击托盘：优先主窗口，其次选择窗口，都没有就重建选择窗口。
-fn reveal_window<R: Runtime>(app: &AppHandle<R>) {
-    for label in [MAIN_LABEL, SELECTOR_LABEL] {
-        if let Some(window) = app.get_webview_window(label) {
-            let _ = window.unminimize();
-            let _ = window.show();
-            let _ = window.set_focus();
-            return;
-        }
-    }
-
-    // 理论上不会走到这里（选择窗口不会被 destroy），保底重建。
-    let _ = WebviewWindowBuilder::new(app, SELECTOR_LABEL, WebviewUrl::App("index.html".into()))
-        .title(SELECTOR_TITLE)
-        .inner_size(SELECTOR_WIDTH, SELECTOR_HEIGHT)
-        .resizable(true)
-        .center()
-        .build();
+/// 所有窗口共用的 WebView2 用户数据目录。
+///
+/// 不显式指定时 `data_directory` 是 `None`，wry 会把**空字符串**传给
+/// `CreateCoreWebView2EnvironmentWithOptions`，用户数据目录就落到 WebView2 的默认位置。
+/// 显式固定到 `%LOCALAPPDATA%\<identifier>\webview2` 有两个好处：
+///   1. Cookie / localStorage / 登录态**确定性地**落盘并跨重启保留；
+///   2. 所有窗口共用同一份 profile —— 选择窗口、主窗口、侧栏、关于窗口共享登录态，
+///      而且只起一个 WebView2 浏览器进程（更省内存）。
+fn webview_data_dir<R: Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
+    app.path()
+        .app_local_data_dir()
+        .ok()
+        .map(|dir| dir.join("webview2"))
 }
 
-/// 托盘「重新选择连接方式」：把选择窗口叫出来（它只是被隐藏了，没有销毁）。
+/// 给窗口构造器套上共享的数据目录。
+fn with_shared_profile<'a, R: Runtime, M: Manager<R>>(
+    app: &AppHandle<R>,
+    mut builder: WebviewWindowBuilder<'a, R, M>,
+) -> WebviewWindowBuilder<'a, R, M> {
+    if let Some(dir) = webview_data_dir(app) {
+        builder = builder.data_directory(dir);
+    }
+    builder
+}
+
+/// 创建启动选择窗口。
+fn create_selector_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
+    let builder = WebviewWindowBuilder::new(app, SELECTOR_LABEL, WebviewUrl::App("index.html".into()))
+        .title(SELECTOR_TITLE)
+        .inner_size(SELECTOR_WIDTH, SELECTOR_HEIGHT)
+        .min_inner_size(460.0, 380.0)
+        .resizable(true)
+        .maximizable(false)
+        .center()
+        .visible(true);
+    with_shared_profile(app, builder).build()?;
+    Ok(())
+}
+
+/// 创建（或复用）主窗口顶部的自定义标题栏窗口。
+///
+/// 用 `parent(&main)` 把它做成主窗口的 **owned window**：
+/// Windows 会保证它永远在主窗口之上（但不会盖到别的应用上）、随主窗口最小化，
+/// 主窗口销毁时一起销毁。位置和宽度需要我们自己跟着主窗口同步。
+fn ensure_chrome_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    if app.get_webview_window(CHROME_LABEL).is_some() {
+        return Ok(());
+    }
+    let main = app
+        .get_webview_window(MAIN_LABEL)
+        .ok_or_else(|| "主窗口尚未创建".to_string())?;
+    let position = main.outer_position().map_err(|e| e.to_string())?;
+    let size = main.outer_size().map_err(|e| e.to_string())?;
+    let scale = main.scale_factor().unwrap_or(1.0);
+    let chrome_height = (CHROME_HEIGHT * scale).round().max(1.0) as u32;
+
+    let builder = WebviewWindowBuilder::new(app, CHROME_LABEL, WebviewUrl::App("chrome.html".into()))
+        .title("")
+        .decorations(false)
+        .resizable(false)
+        .maximizable(false)
+        .minimizable(false)
+        .closable(false)
+        .skip_taskbar(true)
+        .shadow(false)
+        .position(position.x as f64, position.y as f64)
+        .inner_size(size.width as f64, chrome_height as f64)
+        .visible(true)
+        .parent(&main)
+        .map_err(|e| format!("设置标题栏 owner 失败：{e}"))?;
+
+    with_shared_profile(app, builder)
+        .build()
+        .map_err(|e| format!("创建标题栏窗口失败：{e}"))?;
+    Ok(())
+}
+
+/// 让标题栏窗口跟随主窗口的位置与宽度。
+fn sync_chrome_window<R: Runtime>(app: &AppHandle<R>) {
+    let (Some(main), Some(chrome)) = (
+        app.get_webview_window(MAIN_LABEL),
+        app.get_webview_window(CHROME_LABEL),
+    ) else {
+        return;
+    };
+    let (Ok(position), Ok(size)) = (main.outer_position(), main.outer_size()) else {
+        return;
+    };
+    let scale = main.scale_factor().unwrap_or(1.0);
+    let chrome_height = (CHROME_HEIGHT * scale).round().max(1.0) as u32;
+    let _ = chrome.set_position(tauri::PhysicalPosition::new(position.x, position.y));
+    let _ = chrome.set_size(tauri::PhysicalSize::new(size.width, chrome_height));
+}
+
+/// 主窗口（含标题栏、侧栏）整体隐藏 —— 「关闭 = 隐藏到托盘」走这里。
+fn hide_main_windows<R: Runtime>(app: &AppHandle<R>) {
+    for label in [CHROME_LABEL, CHAT_LABEL, MAIN_LABEL] {
+        if let Some(window) = app.get_webview_window(label) {
+            let _ = window.hide();
+        }
+    }
+}
+
+/// 主窗口（含标题栏、侧栏）整体显示 —— 托盘「显示主窗口」走这里。
+fn show_main_windows<R: Runtime>(app: &AppHandle<R>) {
+    if app.get_webview_window(MAIN_LABEL).is_none() {
+        return;
+    }
+    if let Some(main) = app.get_webview_window(MAIN_LABEL) {
+        let _ = main.unminimize();
+        let _ = main.show();
+        let _ = main.set_focus();
+    }
+    if app.get_webview_window(CHROME_LABEL).is_some() {
+        sync_chrome_window(app);
+        if let Some(chrome) = app.get_webview_window(CHROME_LABEL) {
+            let _ = chrome.show();
+        }
+    }
+    if let Some(chat) = app.get_webview_window(CHAT_LABEL) {
+        if chat.is_visible().unwrap_or(false) {
+            position_chat_window(app);
+            let _ = chat.show();
+        }
+    }
+}
+
+/// 把侧栏贴到主窗口右侧（顶部让开标题栏）。
+fn position_chat_window<R: Runtime>(app: &AppHandle<R>) {
+    let (Some(main), Some(chat)) = (
+        app.get_webview_window(MAIN_LABEL),
+        app.get_webview_window(CHAT_LABEL),
+    ) else {
+        return;
+    };
+    let (Ok(position), Ok(size)) = (main.outer_position(), main.outer_size()) else {
+        return;
+    };
+    let scale = main.scale_factor().unwrap_or(1.0);
+    let chrome_height = (CHROME_HEIGHT * scale).round().max(1.0) as i32;
+    let width = (CHAT_WIDTH * scale).round().max(1.0) as u32;
+    let height = size.height.saturating_sub(chrome_height as u32).max(1);
+
+    let _ = chat.set_position(tauri::PhysicalPosition::new(
+        position.x + size.width as i32 - width as i32,
+        position.y + chrome_height,
+    ));
+    let _ = chat.set_size(tauri::PhysicalSize::new(width, height));
+}
+
+/// 「网页对话」：创建 / 显示 / 隐藏右侧侧栏。
+fn toggle_chat_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    let main = app
+        .get_webview_window(MAIN_LABEL)
+        .ok_or_else(|| "还没有主窗口，请先连接".to_string())?;
+
+    if let Some(chat) = app.get_webview_window(CHAT_LABEL) {
+        if chat.is_visible().unwrap_or(false) {
+            let _ = chat.hide();
+            return Ok(());
+        }
+        position_chat_window(app);
+        chat.show().map_err(|e| e.to_string())?;
+        let _ = chat.set_focus();
+        return Ok(());
+    }
+
+    let position = main.outer_position().map_err(|e| e.to_string())?;
+    let size = main.outer_size().map_err(|e| e.to_string())?;
+    let scale = main.scale_factor().unwrap_or(1.0);
+    let chrome_height = (CHROME_HEIGHT * scale).round().max(1.0) as i32;
+    let width = (CHAT_WIDTH * scale).round().max(1.0) as u32;
+    let height = size.height.saturating_sub(chrome_height as u32).max(1);
+
+    let builder = WebviewWindowBuilder::new(
+        app,
+        CHAT_LABEL,
+        WebviewUrl::External(CHAT_URL.parse().map_err(|e| format!("对话页地址无效：{e}"))?),
+    )
+    .title(CHAT_TITLE)
+    .decorations(false)
+    .resizable(false)
+    .maximizable(false)
+    .minimizable(false)
+    .closable(false)
+    .skip_taskbar(true)
+    .shadow(false)
+    .position(
+        (position.x + size.width as i32 - width as i32) as f64,
+        (position.y + chrome_height) as f64,
+    )
+    .inner_size(width as f64, height as f64)
+    .visible(true)
+    .parent(&main)
+    .map_err(|e| format!("设置侧栏 owner 失败：{e}"))?;
+
+    with_shared_profile(app, builder)
+        .build()
+        .map_err(|e| format!("打开对话侧栏失败：{e}"))?;
+    Ok(())
+}
+
+/// 「关于」窗口。
+fn show_about_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    if let Some(about) = app.get_webview_window(ABOUT_LABEL) {
+        let _ = about.show();
+        let _ = about.set_focus();
+        return Ok(());
+    }
+    let builder = WebviewWindowBuilder::new(app, ABOUT_LABEL, WebviewUrl::App("about.html".into()))
+        .title(ABOUT_TITLE)
+        .inner_size(ABOUT_WIDTH, ABOUT_HEIGHT)
+        .resizable(false)
+        .maximizable(false)
+        .minimizable(false)
+        .center()
+        .visible(true);
+    with_shared_profile(app, builder)
+        .build()
+        .map_err(|e| format!("打开关于窗口失败：{e}"))?;
+    Ok(())
+}
+
+
+/// 托盘「显示主窗口」/ 左键点击托盘：优先主窗口（连同标题栏和侧栏），
+/// 其次选择窗口，都没有就重建选择窗口。
+fn reveal_window<R: Runtime>(app: &AppHandle<R>) {
+    if app.get_webview_window(MAIN_LABEL).is_some() {
+        show_main_windows(app);
+        return;
+    }
+    reveal_selector(app);
+}
+
+/// 托盘「重新选择连接方式」/ 自定义标题栏的「重新连接」：
+/// 把选择窗口叫出来（它只是被隐藏了，没有销毁）。
 fn reveal_selector<R: Runtime>(app: &AppHandle<R>) {
     if let Some(selector) = app.get_webview_window(SELECTOR_LABEL) {
         let _ = selector.unminimize();
@@ -282,12 +517,9 @@ fn reveal_selector<R: Runtime>(app: &AppHandle<R>) {
         return;
     }
     // 理论上不会走到这里（选择窗口不会被销毁），保底重建。
-    let _ = WebviewWindowBuilder::new(app, SELECTOR_LABEL, WebviewUrl::App("index.html".into()))
-        .title(SELECTOR_TITLE)
-        .inner_size(SELECTOR_WIDTH, SELECTOR_HEIGHT)
-        .resizable(true)
-        .center()
-        .build();
+    if let Err(err) = create_selector_window(app) {
+        eprintln!("[DSHTauri] 重建选择窗口失败：{err}");
+    }
 }
 
 /* -------------------------------------------------------------------- tray */
@@ -406,7 +638,185 @@ fn app_version() -> String {
     APP_DISPLAY_VERSION.to_string()
 }
 
-/// 打开主窗口并加载 `request.url`，然后把选择窗口收起来。
+/// 自定义标题栏的窗口按钮。
+#[tauri::command]
+fn window_control(app: AppHandle, action: String) -> Result<(), String> {
+    // 关于窗口自己就能关自己，不需要主窗口存在
+    if action == "hide-about" {
+        if let Some(about) = app.get_webview_window(ABOUT_LABEL) {
+            let _ = about.hide();
+        }
+        return Ok(());
+    }
+
+    let main = app
+        .get_webview_window(MAIN_LABEL)
+        .ok_or_else(|| "主窗口不存在".to_string())?;
+    match action.as_str() {
+        "minimize" => main.minimize().map_err(|e| e.to_string()),
+        "toggle-maximize" => {
+            if main.is_maximized().unwrap_or(false) {
+                main.unmaximize().map_err(|e| e.to_string())
+            } else {
+                main.maximize().map_err(|e| e.to_string())
+            }
+        }
+        // 走正常关闭流程 -> CloseRequested -> 隐藏到托盘
+        "close" => main.close().map_err(|e| e.to_string()),
+        other => Err(format!("未知的窗口操作：{other}")),
+    }
+}
+
+/// 拖动窗口：标题栏窗口自己不能拖（那只会移动它自己），
+/// 所以由它发起，真正拖的是主窗口；chrome 会跟着 Moved 事件同步过来。
+#[tauri::command]
+fn start_drag(app: AppHandle) -> Result<(), String> {
+    let main = app
+        .get_webview_window(MAIN_LABEL)
+        .ok_or_else(|| "主窗口不存在".to_string())?;
+    main.start_dragging().map_err(|e| e.to_string())
+}
+
+/// 自定义标题栏的菜单动作（按钮直接触发，例如「网页对话」）。
+#[tauri::command]
+fn chrome_action(app: AppHandle, action: String) -> Result<(), String> {
+    run_action(&app, &action)
+}
+
+/// 弹出原生下拉菜单。
+///
+/// 为什么用原生菜单而不是 HTML 下拉：标题栏窗口只有 40px 高，
+/// HTML 下拉会被窗口边界裁掉；原生菜单可以正常溢出到窗口外，而且外观跟随系统。
+#[tauri::command]
+async fn popup_menu(app: AppHandle, menu: String, x: f64) -> Result<(), String> {
+    use tauri::menu::ContextMenu;
+
+    let main = app
+        .get_webview_window(MAIN_LABEL)
+        .ok_or_else(|| "主窗口不存在".to_string())?;
+    let window = main.as_ref().window();
+
+    let item = |id: &str, label: &str| -> Result<MenuItem<tauri::Wry>, String> {
+        MenuItem::with_id(&app, id, label, true, None::<&str>).map_err(|e| e.to_string())
+    };
+    let separator = || -> Result<PredefinedMenuItem<tauri::Wry>, String> {
+        PredefinedMenuItem::separator(&app).map_err(|e| e.to_string())
+    };
+
+    let popup = match menu.as_str() {
+        "app" => {
+            let about = item("about", "关于")?;
+            let check = item("check-update", "检查更新")?;
+            let reconnect = item("reconnect", "重新连接")?;
+            let sep = separator()?;
+            Menu::with_items(&app, &[&about, &check, &sep, &reconnect]).map_err(|e| e.to_string())?
+        }
+        "actions" => {
+            let refresh = item("refresh", "刷新")?;
+            let undo = item("undo", "撤销")?;
+            let redo = item("redo", "重做")?;
+            let sep1 = separator()?;
+            let sep2 = separator()?;
+            Menu::with_items(&app, &[&refresh, &sep1, &undo, &redo, &sep2])
+                .map_err(|e| e.to_string())?
+        }
+        other => return Err(format!("未知菜单：{other}")),
+    };
+
+    // 位置相对于主窗口左上角：横向对齐按钮，纵向正好在标题栏下面
+    let position = tauri::LogicalPosition::new(x, CHROME_HEIGHT);
+    popup
+        .popup_at(window, position)
+        .map_err(|e| format!("弹出菜单失败：{e}"))
+}
+
+/// 菜单项 / 标题栏按钮的统一动作分发。
+fn run_action<R: Runtime>(app: &AppHandle<R>, action: &str) -> Result<(), String> {
+    match action {
+        "about" => show_about_window(app),
+        "check-update" => {
+            show_about_window(app)?;
+            // 让「关于」窗口自己去查 GitHub Releases（它是个本地页面，fetch 走 CORS 没问题）
+            let _ = app.emit_to(ABOUT_LABEL, "check-update", ());
+            Ok(())
+        }
+        // 与托盘「重新选择连接方式」完全相同
+        "reconnect" => {
+            reveal_selector(app);
+            Ok(())
+        }
+        "refresh" => {
+            let main = app
+                .get_webview_window(MAIN_LABEL)
+                .ok_or_else(|| "主窗口不存在".to_string())?;
+            main.reload().map_err(|e| e.to_string())
+        }
+        "undo" => send_ctrl_key(app, 0x5A), // Ctrl+Z
+        "redo" => send_ctrl_key(app, 0x59), // Ctrl+Y
+        "chat" => toggle_chat_window(app),
+        other => Err(format!("未知的菜单操作：{other}")),
+    }
+}
+
+/// 给主窗口（网页）发一个 Ctrl+<key> 组合键。
+///
+/// 撤销 / 重做没法用 `eval` 可靠地做到 —— 合成的 KeyboardEvent 不受信任，
+/// 浏览器不会拿它去触发 undo/redo。所以用 Win32 `SendInput` 发**真实按键**：
+/// 先把焦点切回主窗口（点完菜单焦点在标题栏窗口上），再发。
+#[cfg(windows)]
+fn send_ctrl_key<R: Runtime>(app: &AppHandle<R>, vk: u16) -> Result<(), String> {
+    use std::time::Duration;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_CONTROL,
+    };
+
+    fn key(vk: u16, flags: u32) -> INPUT {
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: vk,
+                    wScan: 0,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        }
+    }
+
+    let main = app
+        .get_webview_window(MAIN_LABEL)
+        .ok_or_else(|| "主窗口不存在".to_string())?;
+    let _ = main.set_focus();
+    std::thread::sleep(Duration::from_millis(120));
+
+    let inputs = [
+        key(VK_CONTROL, 0),
+        key(vk, 0),
+        key(vk, KEYEVENTF_KEYUP),
+        key(VK_CONTROL, KEYEVENTF_KEYUP),
+    ];
+    let sent = unsafe {
+        SendInput(
+            inputs.len() as u32,
+            inputs.as_ptr(),
+            std::mem::size_of::<INPUT>() as i32,
+        )
+    };
+    if sent != inputs.len() as u32 {
+        return Err("发送按键失败（SendInput 被系统拦截）".to_string());
+    }
+    Ok(())
+}
+
+/// 非 Windows（开发机自测）不发按键。
+#[cfg(not(windows))]
+fn send_ctrl_key<R: Runtime>(_app: &AppHandle<R>, _vk: u16) -> Result<(), String> {
+    Err("撤销 / 重做目前只在 Windows 上实现".to_string())
+}
+
+/// 打开主窗口并加载 `request.url`，最后把选择窗口收起来。
 ///
 /// # 为什么必须是 `async`
 ///
@@ -441,7 +851,10 @@ async fn open_main_window(app: AppHandle, request: OpenRequest) -> Result<(), St
         let _ = existing.show();
         let _ = existing.set_focus();
     } else {
-        let window = WebviewWindowBuilder::new(&app, MAIN_LABEL, WebviewUrl::External(url))
+        // 无边框：系统标题栏被顶部的自绘菜单栏（chrome 窗口）取代。
+        // tao 在 Windows 上关掉 decorations 时只去掉 WS_CAPTION，保留 WS_THICKFRAME，
+        // 所以窗口仍然可以拖边缘缩放，只是没有可见边框。
+        let builder = WebviewWindowBuilder::new(&app, MAIN_LABEL, WebviewUrl::External(url))
             .title(MAIN_TITLE)
             .inner_size(MAIN_WIDTH, MAIN_HEIGHT)
             .min_inner_size(MAIN_MIN_WIDTH, MAIN_MIN_HEIGHT)
@@ -449,12 +862,24 @@ async fn open_main_window(app: AppHandle, request: OpenRequest) -> Result<(), St
             .maximizable(true)
             .minimizable(true)
             .closable(true)
+            .decorations(false)
             .center()
-            .visible(true)
+            .visible(true);
+
+        let window = with_shared_profile(&app, builder)
             .build()
             .map_err(|e| format!("创建主窗口失败：{e}"))?;
 
         let _ = window.set_focus();
+    }
+
+    // 顶部自绘菜单栏。万一建不出来，就退回系统标题栏，别留一个既没标题栏
+    // 又没按钮、只能靠托盘操作的无边框窗口。
+    if let Err(err) = ensure_chrome_window(&app) {
+        eprintln!("[DSHTauri] 自定义标题栏创建失败：{err}；已回退为系统标题栏。");
+        if let Some(main) = app.get_webview_window(MAIN_LABEL) {
+            let _ = main.set_decorations(true);
+        }
     }
 
     // 选择窗口使命完成：**隐藏**而不是销毁。
@@ -478,9 +903,18 @@ pub fn run() {
             start_local_service,
             probe_url,
             open_main_window,
-            app_version
+            app_version,
+            chrome_action,
+            window_control,
+            start_drag,
+            popup_menu
         ])
         .setup(|app| {
+            // 选择窗口不再写在 tauri.conf.json 里：那样没法给它指定共享的 WebView2 数据目录
+            // （配置里的 data_directory 是按 label 分目录的，会导致各窗口登录态不共享）。
+            if let Err(err) = create_selector_window(app.handle()) {
+                eprintln!("[DSHTauri] 创建选择窗口失败：{err}");
+            }
             match setup_tray(app.handle()) {
                 Ok(()) => TRAY_READY.store(true, Ordering::Relaxed),
                 Err(err) => eprintln!(
@@ -490,13 +924,35 @@ pub fn run() {
             }
             Ok(())
         })
+        .on_menu_event(|app, event| {
+            if let Err(err) = run_action(app, event.id().as_ref()) {
+                eprintln!("[DSHTauri] 菜单操作失败：{err}");
+            }
+        })
         .on_window_event(|window, event| match event {
             // 关闭窗口 ≠ 退出程序：隐藏到托盘，由托盘菜单「退出」真正结束。
             // 托盘不可用时不能隐藏，否则用户再也找不回窗口。
             WindowEvent::CloseRequested { api, .. } => {
                 if TRAY_READY.load(Ordering::Relaxed) {
                     api.prevent_close();
-                    let _ = window.hide();
+                    if window.label() == MAIN_LABEL {
+                        // 主窗口关闭 = 整个主界面（含标题栏、侧栏）一起收进托盘
+                        hide_main_windows(window.app_handle());
+                    } else {
+                        let _ = window.hide();
+                    }
+                }
+            }
+            // 主窗口移动 / 缩放时，让标题栏和侧栏跟上
+            WindowEvent::Moved(_) | WindowEvent::Resized(_) => {
+                if window.label() == MAIN_LABEL {
+                    let app = window.app_handle();
+                    sync_chrome_window(app);
+                    if let Some(chat) = app.get_webview_window(CHAT_LABEL) {
+                        if chat.is_visible().unwrap_or(false) {
+                            position_chat_window(app);
+                        }
+                    }
                 }
             }
             // 系统在浅色 / 深色之间切换时，同步把托盘图标换成对应版本。

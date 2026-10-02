@@ -1,7 +1,13 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "选择窗口（本地 index.html）的默认权限：调用应用自定义命令（load_config / save_config / start_local_service / probe_url / open_main_window）+ Tauri 核心 API。",
-  "windows": ["selector"],
-  "permissions": ["core:default"]
+  "description": "本地窗口（选择窗口 / 自定义标题栏 / 关于）的权限：调用应用自定义命令 + Tauri 核心 API。",
+  "windows": [
+    "selector",
+    "chrome",
+    "about"
+  ],
+  "permissions": [
+    "core:default"
+  ]
 }

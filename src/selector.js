@@ -212,6 +212,9 @@ async function connect(mode) {
     }
 
     await invoke("open_main_window", { request: { url } });
+    // 成功也要复位：选择窗口只是被隐藏，用户随时可能从托盘把它叫回来切地址，
+    // 那时按钮必须还能点（否则就是「点了没反应 + 一直转圈」）。
+    setBusy(false);
   } catch (err) {
     setBusy(false);
     setStatus(String(err), "err");
@@ -219,7 +222,10 @@ async function connect(mode) {
 }
 
 async function pick(mode) {
-  if (busy) return;
+  if (busy) {
+    setStatus("正在连接中，请稍候…");
+    return;
+  }
 
   // ① 首次使用：让用户填写 / 确认地址，保存后立即连接。
   if (!config.configured) {
@@ -253,6 +259,11 @@ ui.toggleSettings.addEventListener("click", () => {
 });
 
 ui.cancelSetup.addEventListener("click", closeSetup);
+
+// 兜底：选择窗口被托盘重新叫出来（窗口重新获得焦点）时，确保按钮可点。
+window.addEventListener("focus", () => {
+  if (busy) setBusy(false);
+});
 
 ui.inputAutostart.addEventListener("change", syncCommandVisibility);
 ui.inputLocal.addEventListener("input", syncCommandVisibility);

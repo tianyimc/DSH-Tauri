@@ -1,21 +1,22 @@
 # DSHTauri — Windows 无头冒烟测试（在 GitHub Actions 的 windows-latest 上跑）
 #
-# 目的：不用人工在 Win11 上点，就能验证「选择 → 打开主窗口 → 关闭到托盘」整条链路，
-#       并且能抓出「主窗口白屏 / 界面卡死」这类只在 Windows 上暴露的问题。
+# 目的：不用人工在 Win11 上点，就能验证整条链路，并且能抓出「只在 Windows 上暴露」的问题。
 #
-# 判定手段（全部基于 Win32，不依赖截图 —— WebView2 走 DirectComposition，PrintWindow 常返回空白）：
-#   1) 进程启动后有 560x460 的选择窗口
-#   2) 点击「本地」后出现 ~1200x800 的主窗口
-#   3) 主窗口**没有卡死**：IsHungAppWindow=false 且 SendMessageTimeout(WM_NULL, SMTO_ABORTIFHUNG) 不超时
-#      ← 这条正是「同步命令里创建窗口导致主线程死锁」的检测点
-#   4) 本地测试服务收到来自 WebView2 的 HTTP 请求（证明页面真的在加载，不是白屏空转）
-#   5) 发 WM_CLOSE 后进程仍存活且主窗口不可见（关闭 = 隐藏到托盘）
+# 覆盖：
+#   A. 首次连接：选择窗口 560x460 → 点击「本地」→ 主窗口出现且不卡死
+#                → WebView2 真的发请求（不是白屏）→ WM_CLOSE 隐藏到托盘
+#   B. 切换连接：把选择窗口重新叫出来 → 点击「远程」→ **复用同一个主窗口导航**（不是销毁重建）
+#   C. 进程生命周期：勾了「自动启动本地服务」时，主程序退出后本地服务必须跟着结束
+#
+# 判定手段全部基于 Win32（不依赖截图 —— WebView2 走 DirectComposition，PrintWindow 常返回空白）。
 #
 # 用法：pwsh -File scripts/smoke-windows.ps1 -AppPath <dshtauri.exe>
 
 param(
   [Parameter(Mandatory = $true)][string]$AppPath,
-  [int]$Port = 3080
+  [int]$Port = 3080,      # 本地地址对应的测试服务
+  [int]$Port2 = 3081,     # 远程地址对应的测试服务
+  [int]$SvcPort = 3099    # C 段：被自动启动的「本地服务」
 )
 
 $ErrorActionPreference = "Stop"
@@ -49,14 +50,15 @@ public static class Win32 {
   [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr h, StringBuilder s, int max);
   [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextLengthW(IntPtr h);
 
-  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
   [DllImport("user32.dll")] public static extern bool IsHungAppWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
   [DllImport("user32.dll")] public static extern void mouse_event(uint flags, int dx, int dy, uint data, UIntPtr extra);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
 
   [DllImport("user32.dll", SetLastError = true)]
   public static extern IntPtr SendMessageTimeout(IntPtr h, uint msg, IntPtr w, IntPtr l, uint flags, uint timeout, out IntPtr result);
@@ -69,6 +71,7 @@ public static class Win32 {
   public const uint SMTO_ABORTIFHUNG = 0x0002;
   public const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
   public const uint MOUSEEVENTF_LEFTUP   = 0x0004;
+  public const int  SW_SHOWNORMAL = 1;
 
   public static string Title(IntPtr h) {
     int len = GetWindowTextLengthW(h);
@@ -121,7 +124,6 @@ public static class Win32 {
 
 $WORK = Join-Path $env:RUNNER_TEMP "dshtauri-smoke"
 New-Item -ItemType Directory -Force -Path $WORK | Out-Null
-$HTTP_LOG = Join-Path $WORK "httpd.log"
 
 # 选择 DSH 连接方式 —— 用 Unicode 码点构造，避免脚本文件编码带来的问题
 $SELECTOR_TITLE = -join ([char[]]@(0x9009, 0x62E9, 0x20, 0x44, 0x53, 0x48, 0x20, 0x8FDE, 0x63A5, 0x65B9, 0x5F0F))
@@ -131,9 +133,36 @@ $CONFIG_DIR = Join-Path $env:APPDATA "com.dsh.dshtauri"
 $CONFIG_FILE = Join-Path $CONFIG_DIR "config.json"
 
 $proc = $null
-$httpd = $null
+$proc2 = $null
+$servers = @()
 
-# 把进程的所有顶层窗口打印出来（找不到窗口时用来诊断）
+# 卡片中心（客户区坐标，与 CSS 布局一致）：卡片1「本地」≈103，卡片2「远程」≈185
+$CARD_LOCAL_Y = 103
+$CARD_REMOTE_Y = 185
+
+function Start-TestServer([int]$ListenPort, [string]$LogFile) {
+  $js = Join-Path $WORK "httpd-$ListenPort.js"
+  @"
+const http=require('http'),fs=require('fs');
+http.createServer((q,s)=>{fs.appendFileSync(process.argv[2],q.method+' '+q.url+'\n');
+s.writeHead(200,{'Content-Type':'text/html; charset=utf-8'});
+s.end('<!doctype html><meta charset=utf-8><title>DSH $ListenPort</title><h1>OK $ListenPort</h1>');})
+.listen($ListenPort,'127.0.0.1');
+"@ | Set-Content -Path $js -Encoding UTF8
+  Set-Content -Path $LogFile -Value "" -NoNewline
+  return Start-Process node -ArgumentList @($js, $LogFile) -PassThru -WindowStyle Hidden
+}
+
+function Test-Port([int]$P) {
+  try {
+    $c = New-Object System.Net.Sockets.TcpClient
+    $t = $c.ConnectAsync("127.0.0.1", $P)
+    $ok = $t.Wait(1500) -and $c.Connected
+    $c.Close()
+    return $ok
+  } catch { return $false }
+}
+
 function Format-WindowList([int]$ProcId) {
   $lines = @()
   foreach ($h in [Win32]::TopLevelWindows([uint32]$ProcId)) {
@@ -145,13 +174,10 @@ function Format-WindowList([int]$ProcId) {
   return ($lines -join " | ")
 }
 
-# 按标题找；找不到再按客户区尺寸找（尺寸做 DPI 容差）
 function Find-AppWindow([int]$ProcId, [string]$Title, [int]$W, [int]$H, [int]$Tolerance) {
   $handles = [Win32]::TopLevelWindows([uint32]$ProcId)
   if ($Title) {
-    foreach ($h in $handles) {
-      if ([Win32]::Title($h) -eq $Title) { return $h }
-    }
+    foreach ($h in $handles) { if ([Win32]::Title($h) -eq $Title) { return $h } }
   }
   foreach ($h in $handles) {
     $cs = [Win32]::ClientSize($h)
@@ -160,37 +186,47 @@ function Find-AppWindow([int]$ProcId, [string]$Title, [int]$W, [int]$H, [int]$To
   return [IntPtr]::Zero
 }
 
+function Wait-AppWindow([int]$ProcId, [string]$Title, [int]$W, [int]$H, [int]$Tolerance, [int]$Tries = 15) {
+  for ($i = 0; $i -lt $Tries; $i++) {
+    $h = Find-AppWindow $ProcId $Title $W $H $Tolerance
+    if ($h -ne [IntPtr]::Zero) { return $h }
+    Start-Sleep -Seconds 2
+  }
+  return [IntPtr]::Zero
+}
+
+function Stop-App([System.Diagnostics.Process]$P) {
+  if ($P -and -not $P.HasExited) { Stop-Process -Id $P.Id -Force -ErrorAction SilentlyContinue }
+  Get-Process dshtauri -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+}
+
 try {
   Write-Host "== 0. 前置检查 =="
   Check "应用可执行文件存在" (Test-Path $AppPath) $AppPath
   if (-not (Test-Path $AppPath)) { throw "找不到 $AppPath" }
   Check "Node 可用" ([bool](Get-Command node -ErrorAction SilentlyContinue))
 
-  Write-Host "== 1. 启动本地测试服务 http://127.0.0.1:$Port =="
-  $serverFile = Join-Path $WORK "httpd.js"
-  @"
-const http=require('http'),fs=require('fs');
-http.createServer((q,s)=>{fs.appendFileSync(process.argv[2],q.method+' '+q.url+'\n');
-s.writeHead(200,{'Content-Type':'text/html; charset=utf-8'});
-s.end('<!doctype html><meta charset=utf-8><title>DSH LOCAL</title><h1>DSH LOCAL OK</h1>');})
-.listen($Port,'127.0.0.1');
-"@ | Set-Content -Path $serverFile -Encoding UTF8
-  Set-Content -Path $HTTP_LOG -Value "" -NoNewline
-  $httpd = Start-Process node -ArgumentList @($serverFile, $HTTP_LOG) -PassThru -WindowStyle Hidden
+  Write-Host "== 1. 启动两个测试服务 =="
+  $LOG_A = Join-Path $WORK "httpd-$Port.log"
+  $LOG_B = Join-Path $WORK "httpd-$Port2.log"
+  $servers += Start-TestServer $Port  $LOG_A
+  $servers += Start-TestServer $Port2 $LOG_B
   Start-Sleep -Seconds 2
-  try {
-    $resp = Invoke-WebRequest "http://127.0.0.1:$Port/" -UseBasicParsing -TimeoutSec 5
-    Check "测试服务已就绪" ($resp.StatusCode -eq 200)
-  } catch { Check "测试服务已就绪" $false $_.Exception.Message }
-  Set-Content -Path $HTTP_LOG -Value "" -NoNewline
+  Check "测试服务 $Port 已就绪"  (Test-Port $Port)
+  Check "测试服务 $Port2 已就绪" (Test-Port $Port2)
+  Set-Content -Path $LOG_A -Value "" -NoNewline
+  Set-Content -Path $LOG_B -Value "" -NoNewline
 
-  Write-Host "== 2. 预置配置（只配本地地址）=="
+  Write-Host "== 2. 预置配置（本地 + 远程都配好，便于测试切换）=="
   New-Item -ItemType Directory -Force -Path $CONFIG_DIR | Out-Null
-  $cfg = @{ configured = $true; localUrl = "http://127.0.0.1:$Port"; remoteUrl = "";
+  $cfg = @{ configured = $true;
+            localUrl = "http://127.0.0.1:$Port";
+            remoteUrl = "http://127.0.0.1:$Port2";
             autoStartLocal = $false; localStartCommand = "" } | ConvertTo-Json -Compress
   Set-Content -Path $CONFIG_FILE -Value $cfg -Encoding UTF8
   Check "config.json 已写入" (Test-Path $CONFIG_FILE) $CONFIG_FILE
 
+  # ======================================================= A. 首次连接
   Write-Host "== 3. 启动 DSHTauri =="
   $APP_LOG = Join-Path $WORK "app.log"
   $proc = Start-Process $AppPath -PassThru -RedirectStandardOutput $APP_LOG -RedirectStandardError "$APP_LOG.err"
@@ -199,69 +235,109 @@ s.end('<!doctype html><meta charset=utf-8><title>DSH LOCAL</title><h1>DSH LOCAL 
   if ($proc.HasExited) { throw "应用启动即退出" }
 
   Write-Host "== 4. 选择窗口 =="
-  $sel = [IntPtr]::Zero
-  for ($i = 0; $i -lt 15; $i++) {
-    $sel = Find-AppWindow $proc.Id $SELECTOR_TITLE 560 460 120
-    if ($sel -ne [IntPtr]::Zero) { break }
-    Start-Sleep -Seconds 2
-  }
-  $dump = Format-WindowList $proc.Id
-  # 额外信息：判断 runner 到底有没有可用的交互桌面
-  $sessionId = (Get-Process -Id $PID).SessionId
-  $desktopWindows = [Win32]::AllTopLevelWindows()
-  $desktopDump = ($desktopWindows | Select-Object -First 12 | ForEach-Object {
-      $cs = [Win32]::ClientSize($_)
-      "hwnd=$_ title='$([Win32]::Title($_))' client=$($cs[0])x$($cs[1]) visible=$([Win32]::IsWindowVisible($_))"
-    }) -join " | "
+  $sel = Wait-AppWindow $proc.Id $SELECTOR_TITLE 560 460 120
   Check "选择窗口已出现（标题或 560x460 客户区）" ($sel -ne [IntPtr]::Zero) `
-    "session=$sessionId 进程窗口：$dump 桌面窗口(前12)：$desktopDump"
-  if ($sel -eq [IntPtr]::Zero) {
-    Write-Host "  当前进程的顶层窗口：$dump"
-    throw "选择窗口没出现 —— 进程窗口清单：$dump"
-  }
+    "session=$((Get-Process -Id $PID).SessionId) 进程窗口：$(Format-WindowList $proc.Id)"
+  if ($sel -eq [IntPtr]::Zero) { throw "选择窗口没出现：$(Format-WindowList $proc.Id)" }
   $selCs = [Win32]::ClientSize($sel)
   Write-Host ("  选择窗口：hwnd={0} title='{1}' client={2}x{3}" -f $sel, [Win32]::Title($sel), $selCs[0], $selCs[1])
   Check "选择窗口未卡死" ([Win32]::IsResponsive($sel, 3000))
 
-  Write-Host "== 5. 点击「本地」卡片 =="
+  Write-Host "== 5. 点击「本地」= =="
   [void][Win32]::SetForegroundWindow($sel)
   Start-Sleep -Milliseconds 500
-  $clickY = [int]([Math]::Min(103, ($selCs[1] * 0.25)))
-  [Win32]::ClickClient($sel, [int]($selCs[0] / 2), $clickY)   # 卡片中心（与 CSS 布局一致：纵向约 103px）
+  [Win32]::ClickClient($sel, [int]($selCs[0] / 2), $CARD_LOCAL_Y)
   Start-Sleep -Seconds 8
 
   Write-Host "== 6. 主窗口 =="
-  $main = [IntPtr]::Zero
-  for ($i = 0; $i -lt 15; $i++) {
-    $main = Find-AppWindow $proc.Id $MAIN_TITLE 1200 800 200
-    if ($main -ne [IntPtr]::Zero) { break }
-    Start-Sleep -Seconds 2
-  }
-  Check "主窗口已出现（标题 DSHTauri 或 ~1200x800 客户区）" ($main -ne [IntPtr]::Zero) "进程窗口：$(Format-WindowList $proc.Id)"
+  $main = Wait-AppWindow $proc.Id $MAIN_TITLE 1200 800 200
+  Check "主窗口已出现（标题 DSHTauri 或 ~1200x800 客户区）" ($main -ne [IntPtr]::Zero) `
+    "进程窗口：$(Format-WindowList $proc.Id)"
 
   if ($main -ne [IntPtr]::Zero) {
     $ms = [Win32]::ClientSize($main)
     Write-Host ("  主窗口标题='{0}' 客户区={1}x{2}" -f [Win32]::Title($main), $ms[0], $ms[1])
-
-    # ★ 本次 Win11 白屏 bug 的检测点：
-    #   在同步命令（主线程）里创建窗口会死锁，窗口既不响应消息也画不出内容。
     $hung = [Win32]::IsHungAppWindow($main)
     Check "主窗口没有卡死（IsHungAppWindow=false）" (-not $hung) "IsHungAppWindow=$hung"
     Check "主窗口响应 WM_NULL 不超时" ([Win32]::IsResponsive($main, 5000))
     Check "主窗口可见" ([Win32]::IsWindowVisible($main))
-
     Start-Sleep -Seconds 3
-    $httpText = ""
-    if (Test-Path $HTTP_LOG) { $httpText = (Get-Content $HTTP_LOG -Raw) }
-    if ($null -eq $httpText) { $httpText = "" }
-    Check "本地服务收到 WebView2 的请求（页面真的在加载）" ($httpText -match "GET /") "日志：'$httpText'"
+    Check "本地服务($Port)收到 WebView2 的请求" ((Get-Content $LOG_A -Raw) -match "GET /") "日志：'$(Get-Content $LOG_A -Raw)'"
 
     Write-Host "== 7. 关闭主窗口 = 隐藏到托盘 =="
     [void][Win32]::PostMessage($main, [Win32]::WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero)
     Start-Sleep -Seconds 5
     Check "关闭后进程仍存活" (-not $proc.HasExited)
-    $visible = [Win32]::IsWindowVisible($main)
-    Check "关闭后主窗口不可见（已隐藏到托盘）" (-not $visible) "IsWindowVisible=$visible"
+    Check "关闭后主窗口不可见（已隐藏到托盘）" (-not [Win32]::IsWindowVisible($main)) `
+      "IsWindowVisible=$([Win32]::IsWindowVisible($main))"
+  }
+
+  # ======================================================= B. 切换连接方式
+  Write-Host "== 8. 切换连接方式（模拟托盘「重新选择连接方式」）=="
+  # 主窗口已经在跑；把被隐藏的选择窗口重新显示出来，再点「远程」。
+  # 这一步验证 open_main_window 在「已有主窗口」时的行为：
+  # 必须是**复用同一个窗口导航**，而不是销毁再重建（重建会卡住/点了没反应）。
+  [void][Win32]::ShowWindow($sel, [Win32]::SW_SHOWNORMAL)
+  Start-Sleep -Seconds 2
+  [void][Win32]::SetForegroundWindow($sel)
+  Start-Sleep -Milliseconds 500
+  Check "选择窗口重新显示成功" ([Win32]::IsWindowVisible($sel))
+
+  Set-Content -Path $LOG_B -Value "" -NoNewline
+  [Win32]::ClickClient($sel, [int]($selCs[0] / 2), $CARD_REMOTE_Y)
+  Start-Sleep -Seconds 10
+
+  if ($main -ne [IntPtr]::Zero) {
+    $stillThere = [Win32]::IsWindow($main)
+    Check "切换后主窗口仍然存在（复用而非销毁重建）" $stillThere "IsWindow=$stillThere"
+    Check "切换后主窗口没有卡死" ([Win32]::IsResponsive($main, 5000))
+    Check "切换后主窗口可见" ([Win32]::IsWindowVisible($main))
+    $logB = Get-Content $LOG_B -Raw
+    Check "新地址($Port2)收到 WebView2 的请求（确实切过去了）" ($logB -match "GET /") "日志：'$logB'"
+  }
+  Check "切换后选择窗口重新隐藏" (-not [Win32]::IsWindowVisible($sel))
+
+  Stop-App $proc
+  Start-Sleep -Seconds 3
+
+  # ======================================================= C. 本地服务随主程序退出
+  Write-Host "== 9. 自动启动的本地服务必须随主程序退出而结束 =="
+  $svcJs = Join-Path $WORK "fake-service.js"
+  @"
+const http = require('http');
+http.createServer((q, s) => s.end('service')).listen($SvcPort, '127.0.0.1');
+setInterval(() => {}, 1000);
+"@ | Set-Content -Path $svcJs -Encoding UTF8
+
+  $cfg2 = @{ configured = $true;
+             localUrl = "http://127.0.0.1:$SvcPort";
+             remoteUrl = "";
+             autoStartLocal = $true;
+             localStartCommand = "node `"$svcJs`"" } | ConvertTo-Json -Compress
+  Set-Content -Path $CONFIG_FILE -Value $cfg2 -Encoding UTF8
+  Check "服务端口 $SvcPort 启动前是关闭的" (-not (Test-Port $SvcPort))
+
+  $proc2 = Start-Process $AppPath -PassThru -RedirectStandardOutput "$APP_LOG.2" -RedirectStandardError "$APP_LOG.2.err"
+  Start-Sleep -Seconds 8
+  $sel2 = Wait-AppWindow $proc2.Id $SELECTOR_TITLE 560 460 120
+  Check "选择窗口已出现（第二轮）" ($sel2 -ne [IntPtr]::Zero) "$(Format-WindowList $proc2.Id)"
+  if ($sel2 -ne [IntPtr]::Zero) {
+    $sel2Cs = [Win32]::ClientSize($sel2)
+    [void][Win32]::SetForegroundWindow($sel2)
+    Start-Sleep -Milliseconds 500
+    [Win32]::ClickClient($sel2, [int]($sel2Cs[0] / 2), $CARD_LOCAL_Y)
+
+    $svcUp = $false
+    for ($i = 0; $i -lt 15; $i++) { if (Test-Port $SvcPort) { $svcUp = $true; break }; Start-Sleep -Seconds 2 }
+    Check "自动启动的本地服务确实起来了（端口 $SvcPort 在监听）" $svcUp
+
+    if ($svcUp) {
+      Stop-App $proc2
+      $gone = $false
+      for ($i = 0; $i -lt 10; $i++) { Start-Sleep -Seconds 2; if (-not (Test-Port $SvcPort)) { $gone = $true; break } }
+      Check "主程序退出后本地服务已结束（端口 $SvcPort 关闭）" $gone `
+        "仍在监听 —— 说明子进程没有被作业对象一起回收"
+    }
   }
 }
 catch {
@@ -269,16 +345,20 @@ catch {
 }
 finally {
   Write-Host "== 清理 =="
-  # 把应用自己的输出也带上，便于判断（例如托盘创建失败、WebView2 报错）
-  foreach ($f in @((Join-Path $WORK "app.log"), (Join-Path $WORK "app.log.err"))) {
+  foreach ($f in @((Join-Path $WORK "app.log"), (Join-Path $WORK "app.log.err"),
+                   (Join-Path $WORK "app.log.2"), (Join-Path $WORK "app.log.2.err"))) {
     if (Test-Path $f) {
       $t = (Get-Content $f -Raw)
       if ($t) { Write-Host "--- $([IO.Path]::GetFileName($f)) ---"; Write-Host $t }
     }
   }
-  if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
-  if ($httpd -and -not $httpd.HasExited) { Stop-Process -Id $httpd.Id -Force -ErrorAction SilentlyContinue }
-  Get-Process dshtauri -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+  Stop-App $proc
+  Stop-App $proc2
+  foreach ($s in $servers) { if ($s -and -not $s.HasExited) { Stop-Process -Id $s.Id -Force -ErrorAction SilentlyContinue } }
+  # 兜底：把可能残留的假服务也清掉
+  Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -like "*fake-service.js*" } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 }
 
 Write-Host ""

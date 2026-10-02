@@ -127,13 +127,79 @@ fn write_config<R: Runtime>(app: &AppHandle<R>, config: &AppConfig) -> Result<()
 /* --------------------------------------------------------------- local svc */
 
 /// 在后台启动本地 DSH 服务。Windows 上用 PowerShell 且不弹窗口。
+/// Windows 作业对象：保证「应用启动的本地服务」**随主程序一起结束**。
+///
+/// `Command::spawn()` 出来的是分离进程 —— 主程序退出后它照跑不误，
+/// 用户会在后台白白养着一个 DSH 服务，一直吃内存/CPU。
+///
+/// Windows 的标准做法是把子进程放进一个带 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+/// 的作业对象：作业句柄由本进程持有，进程一退出句柄就被系统关闭，
+/// 作业内所有进程（含子进程自己再拉起的孙进程）会被一起终止。
+///
+/// 句柄故意存进 `static` 且永不关闭，这样它的生命周期 == 进程生命周期；
+/// 无论正常退出、`app.exit()`、还是被任务管理器强杀，都会触发。
+#[cfg(windows)]
+mod service_job {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle;
+    use std::process::Child;
+    use std::sync::OnceLock;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    static JOB: OnceLock<usize> = OnceLock::new();
+
+    fn job() -> Option<HANDLE> {
+        let raw = JOB.get_or_init(|| unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                return 0;
+            }
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let ok = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            if ok == 0 {
+                // 设置失败就放弃，避免留下一个「不会杀子进程」的作业造成误导
+                let _ = CloseHandle(job);
+                return 0;
+            }
+            job as usize
+        });
+        if *raw == 0 {
+            None
+        } else {
+            Some(*raw as HANDLE)
+        }
+    }
+
+    /// 把刚 spawn 的子进程放进作业对象。失败只返回 false，不阻断服务启动。
+    pub fn assign(child: &Child) -> bool {
+        match job() {
+            Some(job) => unsafe {
+                AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE) != 0
+            },
+            None => false,
+        }
+    }
+}
+
 #[cfg(windows)]
 fn spawn_local_service(command: &str) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     /// CREATE_NO_WINDOW
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-    std::process::Command::new("powershell")
+    let child = std::process::Command::new("powershell")
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -146,11 +212,22 @@ fn spawn_local_service(command: &str) -> Result<(), String> {
         ])
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("启动本地服务失败：{e}"))
+        .map_err(|e| format!("启动本地服务失败：{e}"))?;
+
+    // 关键：挂到作业对象上，主程序一退出它就跟着结束。
+    if !service_job::assign(&child) {
+        eprintln!(
+            "[DSHTauri] 警告：未能把本地服务加入作业对象，\n\
+             [DSHTauri] 主程序退出后它可能会继续在后台运行。"
+        );
+    }
+    Ok(())
 }
 
 /// 非 Windows（开发机 Debian 上跑 `tauri dev`）用 sh 执行同样的命令。
+///
+/// 注意：**这里没有**「随主程序退出而结束」的保证 —— 作业对象是 Windows 机制。
+/// 目标平台是 Windows，Linux 这条路径只用于开发机自测。
 #[cfg(not(windows))]
 fn spawn_local_service(command: &str) -> Result<(), String> {
     std::process::Command::new("sh")
@@ -352,25 +429,33 @@ async fn open_main_window(app: AppHandle, request: OpenRequest) -> Result<(), St
         other => return Err(format!("不支持的协议 `{other}`，只允许 http / https。")),
     }
 
-    // 已经存在主窗口（例如用户从托盘重新选择）：先销毁再按新地址重建，保证 URL 生效。
+    // 已经有主窗口（用户从托盘「重新选择连接方式」回来切地址）：
+    // **直接导航过去**，不要 destroy 再重建。
+    // 重建同 label 的窗口要等旧窗口从 Tauri 的注册表里摘掉，而 WebView2 的销毁是异步的，
+    // 很容易出现「新窗口建不出来 / 卡住」，表现为点了没反应。
     if let Some(existing) = app.get_webview_window(MAIN_LABEL) {
-        let _ = existing.destroy();
+        existing
+            .navigate(url)
+            .map_err(|e| format!("切换连接地址失败：{e}"))?;
+        let _ = existing.unminimize();
+        let _ = existing.show();
+        let _ = existing.set_focus();
+    } else {
+        let window = WebviewWindowBuilder::new(&app, MAIN_LABEL, WebviewUrl::External(url))
+            .title(MAIN_TITLE)
+            .inner_size(MAIN_WIDTH, MAIN_HEIGHT)
+            .min_inner_size(MAIN_MIN_WIDTH, MAIN_MIN_HEIGHT)
+            .resizable(true)
+            .maximizable(true)
+            .minimizable(true)
+            .closable(true)
+            .center()
+            .visible(true)
+            .build()
+            .map_err(|e| format!("创建主窗口失败：{e}"))?;
+
+        let _ = window.set_focus();
     }
-
-    let window = WebviewWindowBuilder::new(&app, MAIN_LABEL, WebviewUrl::External(url))
-        .title(MAIN_TITLE)
-        .inner_size(MAIN_WIDTH, MAIN_HEIGHT)
-        .min_inner_size(MAIN_MIN_WIDTH, MAIN_MIN_HEIGHT)
-        .resizable(true)
-        .maximizable(true)
-        .minimizable(true)
-        .closable(true)
-        .center()
-        .visible(true)
-        .build()
-        .map_err(|e| format!("创建主窗口失败：{e}"))?;
-
-    let _ = window.set_focus();
 
     // 选择窗口使命完成：**隐藏**而不是销毁。
     // 销毁会干掉「正在执行这条 IPC 的 webview」，Windows 上会让消息处理进入坏状态。

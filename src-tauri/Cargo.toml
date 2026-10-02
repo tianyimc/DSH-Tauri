@@ -23,6 +23,15 @@ tauri = { version = "2", features = ["tray-icon", "image-png"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# 仅 Windows：用作业对象（Job Object）保证应用启动的本地服务随主程序一起结束
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
 [profile.release]
 # 目标：体积尽量小、内存占用尽量低。
 codegen-units = 1

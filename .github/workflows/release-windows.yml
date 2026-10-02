@@ -85,6 +85,52 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  # 在真实的 windows-latest 上启动应用本体做冒烟测试。
+  # 这一步专门用来抓「只有 Windows 才会暴露」的问题：
+  # 例如「在同步命令（主线程）里创建窗口导致主线程死锁」→ 白屏 + 点 × 无反应。
+  smoke-windows:
+    name: Windows GUI smoke test (real app)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust (stable, x86_64-pc-windows-msvc)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: windows-x86_64-msvc-smoke
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build debug binary
+        run: cargo build --manifest-path src-tauri/Cargo.toml
+
+      - name: Run Windows GUI smoke test
+        shell: pwsh
+        run: ./scripts/smoke-windows.ps1 -AppPath src-tauri/target/debug/dshtauri.exe
+
+      - name: Upload smoke logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-windows-logs
+          path: ${{ runner.temp }}/dshtauri-smoke/
+          if-no-files-found: ignore
+
   release:
     name: Publish GitHub Release
     needs: build-windows

@@ -115,12 +115,12 @@ DSHTauri/
 │   ├── test-rules.mjs              # 配置规则单测（node --test，17 条）
 │   ├── version.mjs                 # 版本号工具（v.A.B.C GenX）
 │   ├── smoke-linux.sh              # Xvfb 下的无头冒烟测试（21 项断言）
-│   └── smoke-windows.ps1           # windows-latest 上的真实 GUI 冒烟测试（26 项断言）
+│   └── smoke-windows.ps1           # windows-latest 上的真实 GUI 冒烟测试（30 项断言）
 ├── src/                            # 前端（无框架、无构建步骤，直接嵌入二进制）
-│   ├── index.html                  # 选择界面
-│   ├── selector.css
+│   ├── index.html / selector.css / selector.js   # 启动选择界面
 │   ├── config-rules.js             # 配置校验纯函数（浏览器与 Node 共用，可单测）
-│   └── selector.js                 # 调用 Rust 命令（ES module）
+│   ├── chrome.html / chrome.css / chrome.js      # 主窗口顶部的自定义标题栏
+│   └── about.html / about.css / about.js         # 「关于 / 检查更新」窗口
 ├── src-tauri/
 │   ├── capabilities/
 │   │   ├── default.json            # 第 7 项：选择窗口权限
@@ -647,6 +647,49 @@ fn spawn_local_service(command: &str) -> Result<(), String> {
 
 ---
 
+## 6.5 自定义标题栏 / 右侧对话侧栏 / 关于窗口
+
+主窗口**没有系统标题栏**（`decorations(false)`），顶部 40px 换成自绘的菜单栏：
+
+```text
+┌──────────────────────────────────────────────────────────────────────┐
+│ 应用 ▾   操作 ▾   网页对话              （拖动区域）      ─   □   ✕   │  ← chrome 窗口（40px）
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│                   主窗口 webview（远程 WebUI）                        │
+│                                                                      │
+│                                          ┌────────────────────────┐  │
+│                                          │  DSH 对话（侧栏）      │  │
+│                                          │  chat.deepseek.com     │  │
+│                                          └────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+| 菜单 | 展开项 | 行为 |
+| --- | --- | --- |
+| **应用** | 关于 / 检查更新 / 重新连接 | 关于 → 打开「关于」窗口；检查更新 → 打开并自动检查；重新连接 → 与托盘「重新选择连接方式」**完全相同** |
+| **操作** | 刷新 / 撤销 / 重做 | 刷新 = `webview.reload()`（等同 F5）；撤销 / 重做 = 发真实的 **Ctrl+Z / Ctrl+Y** |
+| **网页对话** | （无下拉，直接动作） | 切换右侧侧栏，加载 <https://chat.deepseek.com/> |
+
+**实现要点**
+
+- 标题栏是一个**独立的 40px 无边框窗口**（label `chrome`），用 `parent(&main)` 做成主窗口的
+  **owned window**：Windows 保证它永远在主窗口之上（但不会盖到别的应用上）、随主窗口最小化、
+  主窗口销毁时一起销毁。位置/宽度由主窗口的 `Moved` / `Resized` 事件同步。
+- 主窗口虽然无边框，但 tao 只去掉 `WS_CAPTION`、保留 `WS_THICKFRAME`，所以**仍然可以拖边缘缩放**。
+- 下拉菜单用**系统原生菜单**（`Menu::popup_at`），不是 HTML：标题栏只有 40px 高，
+  HTML 下拉会被窗口边界裁掉；原生菜单能正常溢出，外观也跟随系统。
+- 拖动窗口由标题栏发起、拖的却是**主窗口**（`start_drag` 命令）：如果直接拖标题栏窗口，
+  只会把它自己拖走、和主窗口脱节。
+- 撤销/重做**不能**用 `eval` 合成键盘事件 —— 合成事件不受信任，浏览器不会拿它触发 undo/redo。
+  这里用 Win32 `SendInput` 发真实按键（先把焦点切回主窗口）。
+- 标题栏窗口万一创建失败，会自动把主窗口退回系统标题栏，不会留下一个既没标题栏又没按钮的无边框窗口。
+
+**右侧对话侧栏**：同样是主窗口的 owned window，贴在主窗口右侧（顶部让开标题栏），
+随主窗口移动/缩放同步；「网页对话」再次点击即隐藏。
+
+---
+
 ## 7. `src-tauri/capabilities/` 权限配置
 
 **默认假设：远程页面不需要调用本地 Rust 命令 → 默认不开放远程 IPC。**
@@ -1023,6 +1066,8 @@ npm run tauri build -- --bundles nsis --verbose 2>&1 | tail -100   # 完整打�
 | ~~主窗口白屏 + × 点不动~~ | ✅ 已修复并验证 | 同一套冒烟测试：修复前 `12 通过 / 2 失败`，修复后 `14 通过 / 0 失败`。根因与修复见 [CHANGELOG](CHANGELOG.md#v011) |
 | ~~切换连接方式无反应~~ | ✅ 已修复并验证 | 冒烟测试 B 段：切换后主窗口被复用（HWND 不变）、未卡死、新地址确实收到 WebView2 请求。见 [CHANGELOG](CHANGELOG.md#v012) |
 | ~~本地服务不随主程序退出~~ | ✅ 已修复并验证 | 冒烟测试 C 段：假服务端口在监听 → 强杀主程序 → 端口关闭。见 [CHANGELOG](CHANGELOG.md#v012) |
+| ~~每次启动都要重新登录~~ | ✅ 已修复并验证 | 冒烟测试 D 段：重启后**持久 cookie 与会话 cookie 都在**。见 [CHANGELOG](CHANGELOG.md#v020) |
+| 自定义标题栏 / 侧栏 | ✅ 已实现并验证 | 主窗口无系统标题栏、顶部 40px 自绘菜单栏（应用 / 操作 / 网页对话），冒烟测试仍能识别并操作主窗口 |
 
 复现方式：`npm run smoke`（需要 `xvfb xdotool wmctrl openbox dbus-x11`）。当前结果：**21 通过 / 0 失败**。
 
@@ -1063,7 +1108,7 @@ npm run tauri build -- --bundles nsis --verbose 2>&1 | tail -100   # 完整打�
 | 图标 | `npm run icon` → `icons/icon.ico` | ✅ 6 档 16/24/32/48/64/256，内嵌 PNG |
 | 工作流 YAML | `python3 -c "yaml.safe_load(...)"` | ✅ 解析通过，`permissions: contents: write` 就位 |
 | Linux 端到端冒烟 | `npm run smoke` | ✅ 21 通过 / 0 失败 |
-| **Windows 真实 GUI 冒烟** | CI job `smoke-windows`（`scripts/smoke-windows.ps1`） | ✅ **26 通过 / 0 失败** —— 在 `windows-latest` 上真正启动 exe：窗口尺寸、界面不卡死（`IsHungAppWindow`）、WebView2 真的发起了 HTTP 请求、`WM_CLOSE` 后隐藏到托盘、切换连接复用主窗口、自动启动的服务随主程序退出 |
+| **Windows 真实 GUI 冒烟** | CI job `smoke-windows`（`scripts/smoke-windows.ps1`） | ✅ **30 通过 / 0 失败** —— 在 `windows-latest` 上真正启动 exe：窗口尺寸、界面不卡死（`IsHungAppWindow`）、WebView2 真的发起了 HTTP 请求、`WM_CLOSE` 后隐藏到托盘、切换连接复用主窗口、自动启动的服务随主程序退出、**持久 cookie 与会话 cookie 都跨重启保留** |
 
 > 说明：`cargo check --target x86_64-pc-windows-msvc` 在 Debian 上需要 `llvm`（提供 `llvm-rc`，`tauri-build` 用它嵌入 Windows 资源）。这只影响**在 Linux 上预检 Windows 目标**；GitHub Actions 上用的是真正的 MSVC 工具链，不需要这一步。
 >

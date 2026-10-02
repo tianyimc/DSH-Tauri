@@ -265,9 +265,20 @@ try {
   if ($sel -eq [IntPtr]::Zero) { throw "选择窗口没出现：$(Format-WindowList $proc.Id)" }
   $selCs = [Win32]::ClientSize($sel)
   Write-Host ("  选择窗口：hwnd={0} title='{1}' client={2}x{3}" -f $sel, [Win32]::Title($sel), $selCs[0], $selCs[1])
-  Check "选择窗口未卡死" ([Win32]::IsResponsive($sel, 3000))
+  Write-Host ("  启动后窗口清单：{0}" -f (Format-WindowList $proc.Id))
+
+  # 冷启动（首次创建 WebView2 profile）可能比较慢，给足时间再判定卡死
+  $responsive = $false
+  for ($i = 0; $i -lt 15; $i++) {
+    if ([Win32]::IsResponsive($sel, 2000)) { $responsive = $true; break }
+    Start-Sleep -Seconds 2
+  }
+  Check "选择窗口未卡死" $responsive "进程窗口：$(Format-WindowList $proc.Id)"
 
   Write-Host "== 5. 点击「本地」= =="
+  # 窗口响应了不代表页面已经渲染完（CI 上 build job 并行跑，CPU 抢占会让启动明显变慢），
+  # 页面没就绪时点击会落空，所以这里多等一会儿。
+  Start-Sleep -Seconds 3
   [void][Win32]::SetForegroundWindow($sel)
   Start-Sleep -Milliseconds 500
   [Win32]::ClickClient($sel, [int]($selCs[0] / 2), $CARD_LOCAL_Y)
@@ -405,6 +416,9 @@ setInterval(() => {}, 1000);
   $run1 = Open-MainViaLocal "cookie1"
   $log1 = Get-Content $COOKIE_LOG -Raw
   Check "第一次运行：页面成功写入 cookie" ($log1 -match "persist%3D1") "日志：'$log1'"
+  # 应用里的 cookie keeper 是主窗口出现后 5s 才第一次运行，必须等它跑过再杀进程，
+  # 否则测的是「还没来得及转换就被杀了」。
+  Start-Sleep -Seconds 12
   Stop-App $run1
   # 上一实例的 WebView2 子进程可能还占着用户数据目录，多等一会儿
   Start-Sleep -Seconds 6

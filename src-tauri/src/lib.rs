@@ -604,10 +604,12 @@ fn persist_session_cookies<R: Runtime>(_webview: &tauri::Webview<R>, _page_url: 
 /// 跳转/异步请求之后才落下来的。所以起一个轻量线程，启动后很快跑一次，之后每 20 秒一次
 /// （`GetCookies` 很便宜，开销可以忽略）。
 fn spawn_cookie_keeper<R: Runtime>(app: AppHandle<R>) {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
     std::thread::spawn(move || {
         let mut first = true;
         loop {
-            std::thread::sleep(std::time::Duration::from_secs(if first { 3 } else { 20 }));
+            std::thread::sleep(std::time::Duration::from_secs(if first { 5 } else { 20 }));
             first = false;
             for label in [MAIN_LABEL, CHAT_LABEL] {
                 let Some(window) = app.get_webview_window(label) else {
@@ -621,6 +623,7 @@ fn spawn_cookie_keeper<R: Runtime>(app: AppHandle<R>) {
                 persist_session_cookies(window.as_ref(), &url);
             }
         }
+    });
     });
 }
 
@@ -975,6 +978,10 @@ async fn open_main_window(app: AppHandle, request: OpenRequest) -> Result<(), St
         let _ = window.set_focus();
     }
 
+    // 主窗口起来了，再开始定期把会话 cookie 转成持久 cookie。
+    // 放在这里（而不是 setup）是为了避开启动阶段，只在确实有网页在跑时才动手。
+    spawn_cookie_keeper(app.clone());
+
     // 顶部自绘菜单栏。万一建不出来，就退回系统标题栏，别留一个既没标题栏
     // 又没按钮、只能靠托盘操作的无边框窗口。
     if let Err(err) = ensure_chrome_window(&app) {
@@ -1017,7 +1024,6 @@ pub fn run() {
             if let Err(err) = create_selector_window(app.handle()) {
                 eprintln!("[DSHTauri] 创建选择窗口失败：{err}");
             }
-            spawn_cookie_keeper(app.handle().clone());
             match setup_tray(app.handle()) {
                 Ok(()) => TRAY_READY.store(true, Ordering::Relaxed),
                 Err(err) => eprintln!(

@@ -125,11 +125,24 @@ jobs:
         shell: pwsh
         continue-on-error: true
         run: |
+          $ErrorActionPreference = "Continue"
           $log = "$env:RUNNER_TEMP\dshtauri-smoke\smoke-console.txt"
           New-Item -ItemType Directory -Force -Path (Split-Path $log) | Out-Null
-          & ./scripts/smoke-windows.ps1 -AppPath src-tauri/target/debug/dshtauri.exe *>&1 |
-            Tee-Object -FilePath $log
-          exit $LASTEXITCODE
+          # 先把文件建出来：万一脚本**解析失败 / Add-Type 抛异常**（会直接终止、
+          # 一个输出对象都到不了 Tee-Object），日志文件仍然存在，ci-logs 里能看到线索
+          # —— 之前吃过一次亏：脚本早退导致发布的日志只有表头，完全无法定位。
+          Set-Content -Path $log -Value "" -NoNewline
+          $code = 0
+          try {
+            & ./scripts/smoke-windows.ps1 -AppPath src-tauri/target/debug/dshtauri.exe *>&1 |
+              Tee-Object -FilePath $log -Append
+            $code = $LASTEXITCODE
+          } catch {
+            ("===== 冒烟脚本提前失败（异常）=====" + "`n" + ($_ | Out-String)) |
+              Tee-Object -FilePath $log -Append
+            $code = 1
+          }
+          exit $code
 
       - name: Upload smoke logs
         if: always()

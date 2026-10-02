@@ -1,17 +1,16 @@
 /*
  * DSHTauri 顶栏（titlebar）的纯函数规则 —— 无 DOM、无 Tauri、无副作用。
  *
- * 为什么单独一个文件：`src/titlebar/titlebar.js` 是**内联模板**（会被抄进 Rust 的
- * `initialization_script` 字符串里），没法用 `import` 引用外部模块；但它引用的这块
- * 逻辑本身是纯的，放在这里可以被 `scripts/test-titlebar.mjs` 用 node --test 直接测。
- * 两边靠 `scripts/titlebar-build.mjs` 与 `test-titlebar.mjs` 的一致性检查保证不跑偏。
+ * 为什么单独一个文件：`src/titlebar/titlebar.js` 只做 DOM 接线，把它引用的这些
+ * 判定逻辑抽出来，就能用 `scripts/test-titlebar.mjs`（node --test）直接测，
+ * 不需要浏览器环境。`scripts/test-titlebar-wiring.mjs` 另外校验接线本身
+ * （命令白名单、事件名、按钮 id 是否与 HTML 对得上）。
  *
  * 约束：本文件必须保持 **ES module**（浏览器 `import` 与 node `import` 都能用）。
- * 内联模板里对应的是 `createTitlebarRules()` 工厂 + 同名常量，写法不同、语义必须一致。
  */
 
-/** 顶栏高度（逻辑像素）。与 Rust 的 `CHROME_HEIGHT` / `popup_menu` 的 y 偏移一致。 */
-export const CHROME_HEIGHT = 40;
+/** 顶栏高度（逻辑像素）。与 Rust 的 `TITLEBAR_HEIGHT`、`popup_menu` 的 y 偏移一致。 */
+export const TITLEBAR_HEIGHT = 40;
 
 /** 顶栏里出现过的所有 Tauri 命令。命令契约由 Lead 冻结，这里只是白名单。 */
 export const TITLEBAR_COMMANDS = ["chrome_action", "window_control", "start_drag", "popup_menu"];

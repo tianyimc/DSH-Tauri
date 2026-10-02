@@ -10,9 +10,9 @@ import assert from "node:assert/strict";
 import {
   ACTIONS_MENU_ACTIONS,
   APP_MENU_ACTIONS,
-  CHROME_HEIGHT,
   DIRECT_ACTIONS,
   TITLEBAR_COMMANDS,
+  TITLEBAR_HEIGHT,
   canDragWindow,
   canToggleMaximize,
   chromeActionRequest,
@@ -29,8 +29,8 @@ import {
 
 /* --------------------------------------------------- 官方 P3 的关键尺寸 */
 
-test("顶栏高度是 40px（与 Rust CHROME_HEIGHT 一致）", () => {
-  assert.equal(CHROME_HEIGHT, 40);
+test("顶栏高度是 40px（与 Rust TITLEBAR_HEIGHT 一致）", () => {
+  assert.equal(TITLEBAR_HEIGHT, 40);
 });
 
 /* ------------------------------------------------------------ 命中判定 */

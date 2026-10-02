@@ -33,20 +33,31 @@ src/titlebar/rules.js        <- 纯函数（可测，无 DOM / 无 Tauri）
 （`capabilities/remote-main.json.example` 靠 `.example` 后缀默认不生效）。
 
 所以：**顶栏必须是一个本地来源的 webview**，这样它命中 `capabilities/default.json`，
-IPC 正常。改造前它是独立窗口 `chrome`；现在它仍然独立，只是换了个更规范的页面。
+IPC 正常。改造前它是一个独立窗口 `chrome`；现在它是**主窗口内的一个子 webview**
+（label `titlebar`），由 Rust 用 `Window::add_child` 创建。
 
-> ⚠️ **`capabilities/default.json` 的 `windows` 必须包含本页面的 label。**
-> 否则 `invoke` 被拒绝、按钮全部静默失效（`TROUBLESHOOTING §5` 第 5 条）。
-> 建议 label 用 `"titlebar"`。
+> ⚠️ **`capabilities/default.json` 必须用 `webviews: ["titlebar"]` 覆盖本页面。**
+> 注意是 **`webviews`** 而不是 `windows`：顶栏是子 webview，它的 **window label 是 `main`**，
+> 写进 `windows` 是**不匹配**的，`invoke` 会被拒绝、按钮全部静默失效
+> （`TROUBLESHOOTING §5` 第 5 条里的那个坑）。
+> `cargo test` 有一条 `capability_covers_titlebar_webview_but_not_main_window` 盯着这个接线。
 
 ### 尺寸与挂载方式
 
 页面自身铺满 40px 视口 —— CSS 里 `html, body { height: 100% }`，`.bar { height: 40px }`，
 **不用** `position: fixed` 去覆盖页面（它本来就是个独立 webview，没有别的页面可覆盖）。
 
-Rust 侧需要把这条 webview 定位到主窗口顶部、宽 = 主窗口客户区宽、高 = 40 逻辑像素，
-并在主窗口 Moved / Resized / DPI 变化时跟随。这正是改造前 `sync_chrome_window` 干的活，
-但那套几何计算有缺陷（见 `.analysis/DIAGNOSIS.md` 缺陷 A/B）—— 由 `rust-core` 决定新的同步策略。
+Rust 侧把它定位到主窗口客户区顶部：`LogicalPosition(0, 0)` + `LogicalSize(宽, 40)`，
+内容是 `(0, 40)` + `(宽, 高-40)`。窗口 `Resized` / DPI 变化时重排一次。
+
+**关键点（也是旧实现的翻车点）**：
+
+- 子 webview 的坐标是相对父窗口**客户区左上角**的，窗口整体**移动**不改变相对位置，
+  所以**不需要监听 `Moved`**。
+- 尺寸/位置全部用**逻辑**单位（`LogicalSize` / `LogicalPosition`）。
+  **绝不要手算 `× scale_factor`** —— Tauri 内部会自己乘一次，手动再乘会让高度变成 2 倍
+  （实测顶栏 158 device px ≈ 40×2×2，正确值应是 78 ≈ 40×2）。
+  旧的 `sync_chrome_window` 正是栽在这里，它已被删除。
 
 ---
 
@@ -58,7 +69,7 @@ Rust 侧需要把这条 webview 定位到主窗口顶部、宽 = 主窗口客户
 |---|---|---|---|
 | 顶栏背景 | `(27,27,28)` | `#1b1b1c` | ✅ 一致 |
 | 菜单文字 | `(170,173,176)` | `#aaadb0` | ✅ 一致 |
-| 顶栏高度 | y=0..61 ≈ 62 → 约 31~40 | **40px** | ✅ 取 40，与 `CHROME_HEIGHT` 一致 |
+| 顶栏高度 | y=0..61 ≈ 62 → 约 31~40 | **40px** | ✅ 取 40，与 `TITLEBAR_HEIGHT` 一致 |
 | 底部边框线 | **无**（靠底色差区分） | **无** `border` / `box-shadow` | ✅ 已删掉旧的 `(51,51,51)` 线 |
 | 菜单文字 hover | —（官方未测到） | 文字变 `#f0f1f2` + 淡背景 `rgba(255,255,255,.06)` | ⚠️ 合理推断，待真机确认 |
 | 窗口按钮背景 | 透明 | `transparent`、`border: 0` | ✅ 一致 |
@@ -85,7 +96,7 @@ Rust 侧需要把这条 webview 定位到主窗口顶部、宽 = 主窗口客户
 | 最大化 | 双击空白处 | `window_control { action: "toggle-maximize" }` |
 
 **全部保留**，命令契约与改造前逐字一致（`chrome_action` / `window_control` / `start_drag` / `popup_menu`）。
-`popup_menu` 的 `x` 仍是**相对主窗口左上角的逻辑像素**（`CHROME_HEIGHT` = 40 是它的 y 偏移）。
+`popup_menu` 的 `x` 仍是**相对主窗口左上角的逻辑像素**（`TITLEBAR_HEIGHT` = 40 是它的 y 偏移）。
 
 ### 新增的边界处理
 

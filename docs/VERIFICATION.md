@@ -186,3 +186,75 @@ Window "main"（纯 Window，不加载页面，decorations(false)）
 - Linux 下顶栏布局不正确（见 2.4）。Linux 仅用于开发机自测，不影响发布产物。
 - `Webview`（子 webview）没有 `is_visible()`，所以「对话侧栏是否可见」
   由 Rust 侧一个 `AtomicBool` 记录（`CHAT_VISIBLE`）。
+
+---
+
+# v0.3.0 验证记录
+
+CI run [`37047216127`](https://github.com/tianyimc/DSH-Tauri/actions/runs/37047216127)
+在 `windows-latest` 上：**冒烟 38 通过 / 0 失败**，NSIS 构建 + 单测（Rust/JS/静态校验）全绿。
+
+## 1. 侧栏过渡动画（任务 1）
+
+**框架确实没有动画能力**（证据见 [`ANIMATION-FEASIBILITY.md`](ANIMATION-FEASIBILITY.md)）：
+wry 用 `SetWindowPos` 摆放子 webview，无动画参数；`set_position` 也走 `set_bounds`
+（同时设位置和尺寸），没有「只移动」的低开销通道。⇒ 自己逐帧插值（`src-tauri/src/anim.rs`）。
+
+真机断言（CI，overlay 模式）：
+
+```text
+[PASS] 动画结束后侧栏停在客户区右侧（overlay 目标位置）
+       客户区宽 1028、侧栏宽 420 ⇒ 期望左边缘 ≈ 608；实际 (608,40) 420x739 ✅
+[PASS] 点「网页对话」后多出侧栏子 webview
+[PASS] 再次点击收起侧栏后仍响应（可反复切换）
+```
+
+设计取舍：
+- **只对 overlay 模式滑动**（网页整宽不变 ⇒ 动画期间尺寸不变、只改 x ⇒ 网页零重排）。
+- **docked 模式不做滑动**：必须改网页宽度，逐帧改会每帧重排、必然掉帧。
+- 跟随系统 `SPI_GETCLIENTAREAANIMATION`，关掉「动画效果」时直接切换。
+
+## 2. 「设置」窗口（任务 2）
+
+- 命令面**零新增**（复用 `load_config` / `save_config` / `chrome_action` / `window_control` / `popup_menu`）。
+- 配置字段 `chatDocked`（默认 `false`），老配置缺字段天然兼容
+  （`.analysis/settings-check.sh` 用**真的缺字段的老配置**启动验证过）。
+- `save_config` 改**补丁语义**，避免「设置里选了 docked → 改一次地址 → 静默退回 overlay」。
+- 布局几何是纯函数（`main_webview_rects` / `chat_target_bounds`），由 cargo test 直接覆盖；
+  `Resized` 只读 `static CHAT_DOCKED`，不读盘。
+
+## 3. 安装包图标（任务 4）
+
+- 生成脚本 `scripts/make-ico.mjs` 从**托盘 logo**（`icons/tray-light.png`）派生
+  7 档 ICO（256/128/64/48/32/24/16），挂在 `posticon` 钩子上。
+- 素材同源已核验：`deepseek.ico` 与 `tray-light.png` 的 artwork **逐像素一致**
+  （`compare -metric AE` = 0）。
+- 生成结果与托盘 logo 的差异仅来自重采样抗锯齿（`compare` 602/4096 像素，边缘）。
+- CI 无 ImageMagick 时安全跳过（仓库已提交生成结果），不会让打包失败。
+
+## 4. 安装时默认不勾选桌面快捷方式（任务 3）
+
+Tauri 的 NSIS 模板把「创建桌面快捷方式」做成完成页复选框，复用的是 MUI2 的
+`MUI_FINISHPAGE_SHOWREADME`（**默认勾选**）。官方开关是
+`MUI_FINISHPAGE_SHOWREADME_NOTCHECKED`。
+
+**已核验插入顺序成立**（这是关键 —— `!define` 必须在插入完成页之前执行）：
+
+```text
+$ grep -n "installer_hooks\|MUI_PAGE_FINISH" installer.nsi
+36:!include "{{installer_hooks}}"     ← 我们的 nsis-hooks.nsh 在这里被 include
+418:!insertmacro MUI_PAGE_FINISH        ← 完成页在这里才插入
+```
+
+⇒ `!define MUI_FINISHPAGE_SHOWREADME_NOTCHECKED` 在 line 36 生效，line 418 的完成页
+复选框因此**默认不勾选**。CI 的 NSIS 构建成功也证明 `installerHooks` 路径解析正确
+（Tauri 对配置里的相对路径会 `set_current_dir` 到 `src-tauri/`）。
+
+## 5. 仍未验证 / 只能人工确认
+
+- **动画流畅度**（180ms 是否合适、有没有掉帧）：CI 只能断言终点位置正确，
+  看不出流畅度 —— 需要人眼在 Windows 真机上看。
+- **「应用 → 设置」这条原生菜单链路**：菜单是系统级弹出窗口，CI 无法可靠点击；
+  改由「真解析 lib.rs 的契约对账」+「capability 覆盖 settings」两条断言覆盖。
+- **安装器完成页复选框的实际显示状态**：已用「模板插入顺序」在静态层面证明，
+  但没在真机跑一遍安装向导看那一页。

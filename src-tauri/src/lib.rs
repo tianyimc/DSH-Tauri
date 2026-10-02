@@ -113,10 +113,13 @@ pub const EXAMPLE_LOCAL_COMMAND: &str = "dsh web";
 /// 所以这个开关同时决定 `CloseRequested` 的行为：托盘不可用就正常关闭。
 static TRAY_READY: AtomicBool = AtomicBool::new(false);
 
-/// 托盘图标 · 深色任务栏：把原始深色 logo（#020E36）**反转为白色**，透明背景不变。
-const TRAY_ICON_ON_DARK: &[u8] = include_bytes!("../icons/tray-dark.png");
-/// 托盘图标 · 浅色任务栏：原始深色 logo。
-const TRAY_ICON_ON_LIGHT: &[u8] = include_bytes!("../icons/tray-light.png");
+/// 深色任务栏/深色主题用的 logo：**白色**鲸鱼 + 透明底。
+///
+/// 同一张图既用于托盘图标，也用于窗口/任务栏图标（见 [`apply_theme_icons`]）——
+/// 用户要求「统一 logo，深色模式白色小鲸鱼、浅色模式深色小鲸鱼，自动变」。
+const ICON_ON_DARK: &[u8] = include_bytes!("../icons/tray-dark.png");
+/// 浅色任务栏/浅色主题用的 logo：深藏青 `#020E36` 鲸鱼 + 透明底。
+const ICON_ON_LIGHT: &[u8] = include_bytes!("../icons/tray-light.png");
 
 /// 持久化在 `<app config dir>/config.json` 的用户配置。
 ///
@@ -358,16 +361,72 @@ fn main_logical_size<R: Runtime>(window: &tauri::Window<R>) -> Option<(f64, f64)
     Some((size.width, size.height))
 }
 
-/// 给子 webview 构造器套上共享的 WebView2 数据目录。
+/// 子 webview 的**预绘制底色** —— 专治深色模式下的「白色闪烁 / 白色卡顿」。
+///
+/// # 为什么需要它
+///
+/// WebView2 在**页面内容绘制出来之前**会先用自己的默认背景色填满整块区域，
+/// 而那个默认色是**白色**。于是深色模式下：
+///
+/// - 侧栏 `chat` 刚 `show()` / 刚创建、还在加载 `https://chat.deepseek.com/` 时，
+///   会在右侧露出一大块白底；
+/// - 滑入/滑出动画期间，这块白底跟着一起平移 ⇒ 用户看到的就是「白色卡顿」。
+///
+/// 这不是动画的错，是**底色**的错：动画只是把一块本来就白的区域移动了起来。
+///
+/// # 取值依据
+///
+/// 按系统主题取，与 `src/titlebar/titlebar.css` 里 `:root` / `prefers-color-scheme: light`
+/// 的实测值**逐位一致**，保证顶栏与侧栏的预绘制底色不会互相打架：
+///
+/// | 主题 | 取值 | 依据 |
+/// | --- | --- | --- |
+/// | 深色（含探测不到） | `#1b1b1c` = (27,27,28) | 官方 DeepSeek 桌面端实测底色，见 titlebar.css 注释 |
+/// | 浅色 | `#f3f3f3` | titlebar.css 浅色主题的 `--dsht-bg` |
+///
+/// 探测不到主题时按**深色**处理，理由与托盘图标一致：Windows 11 默认深色，
+/// 而白底在深色界面里最刺眼（反过来只是「不够亮」）。
+///
+/// # 为什么不用 `transparent(true)`
+///
+/// `transparent(true)` 在 wry 里等价于把底色设成 `(0,0,0,0)`
+/// （`wry-0.57.0/src/webview2/mod.rs:127`），而且要走 DirectComposition 的
+/// 透明合成路径 —— 对一个**不透明**的远程网页来说没有收益，反而多一层合成开销。
+/// 所以这里用**不透明**的深色底，正是我们想要的「别露白」。
+fn child_background_color(theme: Option<Theme>) -> tauri::webview::Color {
+    match theme {
+        Some(Theme::Light) => tauri::webview::Color(0xf3, 0xf3, 0xf3, 0xff),
+        _ => tauri::webview::Color(0x1b, 0x1b, 0x1c, 0xff),
+    }
+}
+
+/// 把所有**已存在**的子 webview 底色刷成当前主题对应的值。
+///
+/// 系统在浅色 / 深色之间切换时调用：底色是**创建时**烧进 WebView2 控制器的，
+/// 不刷新的话，切到深色后预绘制底色仍是浅色（反之亦然）⇒ 又出现一次闪烁。
+fn refresh_child_background_colors<R: Runtime>(app: &AppHandle<R>, theme: Option<Theme>) {
+    let color = child_background_color(theme);
+    for label in [TITLEBAR_LABEL, CONTENT_LABEL, CHAT_LABEL] {
+        if let Some(webview) = app.get_webview(label) {
+            let _ = webview.set_background_color(Some(color));
+        }
+    }
+}
+
+/// 给子 webview 构造器套上共享的 WebView2 数据目录 + **预绘制底色**。
 ///
 /// 所有 webview 共用同一份 profile ⇒ 登录态共享，且 cookie 仍然落盘
 /// （会话 cookie 转持久 cookie 的 keeper 依赖这一点）。
+///
+/// 底色见 [`child_background_color`]：没有它，深色模式下每个子 webview
+/// 在首次绘制前都会先露一块白底。
 fn child_webview_builder<R: Runtime>(
     app: &AppHandle<R>,
     label: &str,
     url: WebviewUrl,
 ) -> tauri::webview::WebviewBuilder<R> {
-    let builder = tauri::webview::WebviewBuilder::new(label, url);
+    let builder = tauri::webview::WebviewBuilder::new(label, url)
+        .background_color(child_background_color(current_theme(app)));
     match webview_data_dir(app) {
         Some(dir) => builder.data_directory(dir),
         None => builder,
@@ -491,6 +550,13 @@ fn layout_main_webviews<R: Runtime>(app: &AppHandle<R>) {
         let _ = content
             .set_position(tauri::LogicalPosition::new(content_rect.0, content_rect.1));
         let _ = content.set_size(tauri::LogicalSize::new(content_rect.2, content_rect.3));
+    }
+    // ⚠️ 动画正在跑时**绝不碰侧栏**：它的位置由 `anim` 逐帧决定，
+    // 这里再摆一次会互相打架 —— 打开时会把还没滑入的侧栏先摆到终点（闪一下），
+    // 关闭时会把正在滑出的侧栏先拽回终点（弹一下）。两种都像「卡帧」。
+    // 内容页与顶栏不受影响，照常摆放。
+    if anim::is_animating() {
+        return;
     }
     if let Some(chat) = app.get_webview(CHAT_LABEL) {
         let _ = chat.set_position(tauri::LogicalPosition::new(chat_rect.0, chat_rect.1));
@@ -617,13 +683,15 @@ fn toggle_chat_webview<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         if CHAT_VISIBLE.load(Ordering::Relaxed) {
             // ---------------- 关闭 ----------------
             CHAT_VISIBLE.store(false, Ordering::Relaxed);
-            // 先把「内容页要不要让宽」切回去（docked 模式下收回宽度）。
-            layout_main_webviews(app);
+            // 先掐掉可能还在跑的滑入动画：本次「关闭」要接管侧栏的几何。
+            // （`cancel()` 会同时清掉 `is_animating()`，让下面的 layout 能摆放侧栏。）
+            anim::cancel();
 
             if chat_docked() {
                 // docked 模式：侧栏让出的宽度要还给内容页，这是一次真正的**重排**。
                 // 逐帧缩放两个 webview 会每帧重排内容页（必然掉帧），
                 // 所以这里**不做滑动动画**，直接切到位（与 VS Code 侧边栏的观感一致）。
+                layout_main_webviews(app);
                 let _ = chat.hide();
             } else {
                 // overlay 模式：内容页**整宽不变**，只有侧栏在滑动 —— 零重排，动画很顺。
@@ -632,43 +700,108 @@ fn toggle_chat_webview<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
                 let (width, height) =
                     main_logical_size(&main).ok_or_else(|| "无法读取主窗口尺寸".to_string())?;
                 let (target_x, y, chat_w, chat_h) = chat_target_bounds(width, height);
-                // 从当前位置出发（可能正停在动画中途）。
+                // 从**当前真实位置**出发（可能正停在动画中途）。
+                // 必须在 `layout_main_webviews` **之前**读：layout 会把侧栏摆回目标位，
+                // 之后再读就只能读到目标位，滑出会从「完全打开」突然开始（可见跳变）。
+                //
+                // 夹到 `[target_x, width]`：
+                // - 下界：中途位置不该比目标更靠左（否则滑出会先向右倒退一下）；
+                // - 上界：窗口在侧栏可见期间被**改窄**时，旧位置可能已经在 `width` 之外，
+                //   从那里出发会「向左滑入可见区再消失」，看起来是闪一下。
+                //   夹到 `width` 后它就正好是「从屏幕边缘滑出」，观感正确。
+                //
                 // `Webview::position()` 返回**物理**坐标，要除 scale 换回逻辑单位 ——
                 // 这正是旧实现翻车的地方（物理/逻辑混用），所以这里显式换算并注释。
                 let from_x = chat
                     .position()
                     .ok()
                     .and_then(|p| main.scale_factor().ok().map(|s| p.x as f64 / s))
+                    .map(|x| x.clamp(target_x, width))
                     .unwrap_or(target_x);
                 // 滑到「完全移出客户区右侧」的位置，再隐藏。
+                // 先起动画（同步置 `is_animating()`）再 layout ⇒ layout 会跳过侧栏，
+                // 不会把刚开始滑出的侧栏又拽回目标位。
                 anim::slide_x_with(app, CHAT_LABEL, from_x, width, y, chat_w, chat_h, |app| {
                     if let Some(chat) = app.get_webview(CHAT_LABEL) {
                         let _ = chat.hide();
                     }
                 });
+                // 内容页要不要让宽切回去（overlay 下内容页本来就是整宽，这里只是保持幂等）。
+                layout_main_webviews(app);
             }
             eprintln!("[DSHTauri] 对话侧栏已隐藏");
         } else {
             // ---------------- 打开 ----------------
-            chat.show().map_err(|e| e.to_string())?;
-            CHAT_VISIBLE.store(true, Ordering::Relaxed);
-            // ⚠️ 顺序很重要：必须**先**把 CHAT_VISIBLE 置 true 再排版，
-            // 否则 `layout_main_webviews` 会认为侧栏不可见，docked 模式下
-            // 内容页仍占整宽、与刚显示出来的侧栏重叠。
-            layout_main_webviews(app);
+            // 先读当前位置（可能正停在**滑出**动画中途），**再**掐掉旧动画。
+            // 顺序不能反：要的是「接管之前」的真实位置，用来决定滑入起点。
+            // `Webview::position()` 返回**物理**坐标，要除 scale 换回逻辑单位 ——
+            // 这正是旧实现翻车的地方（物理/逻辑混用），所以这里显式换算并注释。
+            //
+            // `was_animating` 也必须在 `cancel()` **之前**读：它区分「接管一个半途的
+            // 滑出动画」（从当前位置反向滑回）与「侧栏本来就藏着」（从屏幕外完整滑入）。
+            let was_animating = anim::is_animating();
+            let resume_x = chat
+                .position()
+                .ok()
+                .and_then(|p| main.scale_factor().ok().map(|s| p.x as f64 / s));
+
+            // 「打开」= 接管侧栏几何。必须掐掉可能在飞的**滑出**动画：
+            // 它的收尾回调是 `hide()`，若不取消，它会在我们 `show()` **之后**
+            // 把侧栏又藏起来，留下「CHAT_VISIBLE=true 但侧栏不可见」的坏状态。
+            // （用户快速「关→开」、或在设置里切换 overlay/docked 时都会撞上。）
+            anim::cancel();
 
             if chat_docked() {
-                // docked：内容页已经让出宽度，侧栏直接出现在并排位置（一次重排）。
-                // 理由同上面的关闭分支：不做逐帧重排。
+                chat.show().map_err(|e| e.to_string())?;
+                CHAT_VISIBLE.store(true, Ordering::Relaxed);
+                // ⚠️ 顺序很重要：必须**先**把 CHAT_VISIBLE 置 true 再排版，
+                // 否则 `layout_main_webviews` 会认为侧栏不可见，docked 模式下
+                // 内容页仍占整宽、与刚显示出来的侧栏重叠。
+                //
+                // docked：内容页让出宽度，侧栏直接出现在并排位置（一次重排）。
+                // 不做逐帧滑动 —— 理由同上面的关闭分支：逐帧缩放会让内容页每帧重排。
+                layout_main_webviews(app);
             } else {
                 // overlay：内容页整宽不动，侧栏从客户区右侧外滑入。
                 // 侧栏**尺寸全程不变**，所以动画期间不需要重排任何页面。
                 let (width, height) =
                     main_logical_size(&main).ok_or_else(|| "无法读取主窗口尺寸".to_string())?;
                 let (target_x, y, chat_w, chat_h) = chat_target_bounds(width, height);
-                let _ = chat.set_position(tauri::LogicalPosition::new(width, y));
+
+                // 起点怎么定，分两种情况：
+                //
+                // 1. **刚接管一个半途的滑出动画**：从当前位置接着滑回来，
+                //    观感是平滑反向，不会「跳」回屏幕外重来一次。
+                // 2. **侧栏本来就藏着**（含 docked 隐藏后切到 overlay）：
+                //    必须从「完全移出客户区右侧」的 `width` 出发。
+                //    ⚠️ 不能直接沿用「上次停留的 x」—— docked 隐藏时它停在 `target_x`，
+                //    而窗口在隐藏期间被改过宽度时它又可能落在可视区内；
+                //    两种情况都会让侧栏先「闪现」在某个位置再滑，看起来是闪一下。
+                //
+                // 两种都夹到 `[target_x, width]`：中途位置不该比目标更靠左（那会先倒退），
+                // 也不该超出屏幕外（那会多滑一段空白）。
+                let from_x = if was_animating {
+                    resume_x
+                        .map(|x| x.clamp(target_x, width))
+                        .unwrap_or(width)
+                } else {
+                    width
+                };
+
+                // ⚠️ **先摆位、再 `show()`**：`show()` 是瞬时的，
+                // 如果它先执行，侧栏会在「上一次隐藏时停留的位置」上露一帧
+                // （docked 隐藏后就停在目标位 ⇒ 用户看到侧栏先闪现在目标位再跳去屏幕外）。
+                // 摆位必须在隐藏状态下完成，用户看不到这一步。
+                let _ = chat.set_position(tauri::LogicalPosition::new(from_x, y));
                 let _ = chat.set_size(tauri::LogicalSize::new(chat_w, chat_h));
-                anim::slide_x(app, CHAT_LABEL, width, target_x, y, chat_w, chat_h);
+                chat.show().map_err(|e| e.to_string())?;
+                CHAT_VISIBLE.store(true, Ordering::Relaxed);
+
+                // ⚠️ **先起动画、再排版**：`slide_x` 会在返回前**同步**取得几何独占权，
+                // 于是下面的 `layout_main_webviews` 会跳过侧栏
+                // （否则它会把刚摆到屏幕外的侧栏又拽回目标位 ⇒ 闪一下）。
+                anim::slide_x(app, CHAT_LABEL, from_x, target_x, y, chat_w, chat_h);
+                layout_main_webviews(app);
             }
             eprintln!("[DSHTauri] 对话侧栏已显示");
         }
@@ -683,14 +816,30 @@ fn toggle_chat_webview<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         .parse()
         .map_err(|e| format!("对话页地址无效：{e}"))?;
 
+    // overlay 模式下**从客户区右侧外创建**，再滑入到目标位。
+    //
+    // v0.3.0 这里是「直接创建在目标位」—— 也就是**第一次**点「网页对话」根本没有动画
+    // （只有第二次及以后才有）。用户第一次点看到的是「啪」地出现，观感与后续不一致。
+    // 现在统一：先建在屏幕外（此刻用户看不到，且页面正好利用这段时间开始加载），
+    // 再走和后续打开完全一样的滑入路径。
+    //
+    // docked 模式仍然直接建在目标位：那种模式刻意不做滑动（逐帧缩放会让内容页重排）。
+    let slide_in = !chat_docked();
+    let create_x = if slide_in { width } else { x };
+
     main.add_child(
         child_webview_builder(app, CHAT_LABEL, WebviewUrl::External(url)),
-        tauri::LogicalPosition::new(x, y),
+        tauri::LogicalPosition::new(create_x, y),
         tauri::LogicalSize::new(chat_width, chat_height),
     )
     .map_err(|e| format!("打开对话侧栏失败：{e}"))?;
 
     CHAT_VISIBLE.store(true, Ordering::Relaxed);
+    // ⚠️ 先起动画再排版：`slide_x` 返回时 `anim::is_animating()` 已同步置 true，
+    // 于是下面的 `layout_main_webviews` 会跳过侧栏，不会把它从屏幕外拽回目标位。
+    if slide_in {
+        anim::slide_x(app, CHAT_LABEL, create_x, x, y, chat_width, chat_height);
+    }
     // 侧栏刚创建：`docked` 模式下内容页必须**立刻**让出宽度，
     // 否则会出现「侧栏已经并排显示、内容页却还压在它下面」的一帧错位。
     layout_main_webviews(app);
@@ -885,16 +1034,46 @@ fn spawn_cookie_keeper<R: Runtime>(app: AppHandle<R>) {
 
 /* -------------------------------------------------------------------- tray */
 
-/// 按系统主题挑托盘图标：深色任务栏用反转成白色的 logo，浅色任务栏用原始深色 logo。
+/// 按系统主题挑 logo 图标：深色主题用**白色**鲸鱼，浅色主题用**深藏青**鲸鱼。
 ///
 /// 主题探测不到时按**深色**处理——Windows 11 默认就是深色任务栏，
 /// 而深色 logo 落在深色底上会直接看不见，比反过来更糟。
-fn tray_icon(theme: Option<Theme>) -> Option<Image<'static>> {
+///
+/// 同一个函数同时服务**托盘图标**与**窗口/任务栏图标**（见 [`apply_theme_icons`]），
+/// 保证两处配色始终一致。
+fn themed_icon(theme: Option<Theme>) -> Option<Image<'static>> {
     let bytes = match theme {
-        Some(Theme::Light) => TRAY_ICON_ON_LIGHT,
-        _ => TRAY_ICON_ON_DARK,
+        Some(Theme::Light) => ICON_ON_LIGHT,
+        _ => ICON_ON_DARK,
     };
     Image::from_bytes(bytes).ok()
+}
+
+/// 把当前主题对应的 logo 同时应用到**托盘**与**主窗口（任务栏/标题栏）**。
+///
+/// 为什么窗口图标也要跟着换：Windows 的深色任务栏上，深藏青鲸鱼几乎看不见；
+/// 而浅色任务栏上白色鲸鱼同样看不见。托盘图标早就有这个适配，窗口图标却没有 ——
+/// 用户要求「统一 logo、自动变」，所以这里一起切。
+///
+/// 失败只忽略（拿不到图标或窗口时不影响主流程）。
+fn apply_theme_icons<R: Runtime>(app: &AppHandle<R>, theme: Option<Theme>) {
+    let Some(icon) = themed_icon(theme) else {
+        return;
+    };
+    // 托盘
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        let _ = tray.set_icon(Some(icon.clone()));
+    }
+    // 主窗口（含任务栏按钮与无边框窗口的图标）
+    if let Some(main) = app.get_window(MAIN_LABEL) {
+        let _ = main.set_icon(icon.clone());
+    }
+    // 选择窗口 / 关于 / 设置这些独立窗口也一并统一，避免同一程序出现两种图标。
+    for label in [SELECTOR_LABEL, ABOUT_LABEL, SETTINGS_LABEL] {
+        if let Some(window) = app.get_webview_window(label) {
+            let _ = window.set_icon(icon.clone());
+        }
+    }
 }
 
 /// 读取当前窗口主题。`setup` 跑之前配置里的选择窗口就已经创建好了，所以这里能拿到。
@@ -940,9 +1119,9 @@ fn setup_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
             }
         });
 
-    // 托盘图标跟随系统主题：深色任务栏用反转成白色的 logo，浅色用原始深色 logo。
+    // 托盘图标跟随系统主题：深色任务栏用白色 logo，浅色用深藏青 logo。
     // 内嵌 PNG 解码失败时退回 bundle.icon 生成的默认图标。
-    if let Some(icon) = tray_icon(current_theme(app)) {
+    if let Some(icon) = themed_icon(current_theme(app)) {
         builder = builder.icon(icon);
     } else if let Some(icon) = app.default_window_icon() {
         builder = builder.icon(icon.clone());
@@ -1357,6 +1536,9 @@ async fn open_main_window_inner(app: &AppHandle, request: OpenRequest) -> Result
 
         layout_main_webviews(app);
         let _ = window.set_focus();
+        // 主窗口是**连接之后**才创建的（比 setup 晚），所以这里再统一一次 logo，
+        // 保证它的任务栏/标题栏图标也是主题对应的那只鲸鱼。
+        apply_theme_icons(app, current_theme(app));
         eprintln!(
             "[DSHTauri] 主窗口已创建：pos={:?} size={:?} visible={:?}",
             window.outer_position(),
@@ -1413,6 +1595,12 @@ pub fn run() {
                      [DSHTauri] 已降级运行：关闭窗口将直接退出程序（不会隐藏到托盘）。"
                 ),
             }
+
+            // 统一 logo：按当前系统主题把托盘 + 各窗口的图标设成
+            // 「深色→白色鲸鱼 / 浅色→深藏青鲸鱼」。之后系统主题变化时
+            // `WindowEvent::ThemeChanged` 会再调一次。
+            apply_theme_icons(app.handle(), current_theme(app.handle()));
+
             Ok(())
         })
         .on_menu_event(|app, event| {
@@ -1451,13 +1639,14 @@ pub fn run() {
                     emit_window_state(app, window);
                 }
             }
-            // 系统在浅色 / 深色之间切换时，同步把托盘图标换成对应版本。
+            // 系统在浅色 / 深色之间切换时：
+            //   1. 把**托盘 + 所有窗口**的图标换成对应版本（深色 → 白色鲸鱼，浅色 → 深藏青鲸鱼）；
+            //   2. 把子 webview 的**预绘制底色**也换成对应版本 —— 否则切主题后
+            //      下次打开侧栏又会露一次「旧主题的底色」，白闪重新出现。
             WindowEvent::ThemeChanged(theme) => {
-                if let Some(tray) = window.app_handle().tray_by_id(TRAY_ID) {
-                    if let Some(icon) = tray_icon(Some(*theme)) {
-                        let _ = tray.set_icon(Some(icon));
-                    }
-                }
+                let app = window.app_handle();
+                apply_theme_icons(app, Some(*theme));
+                refresh_child_background_colors(app, Some(*theme));
             }
             _ => {}
         })
@@ -1474,9 +1663,9 @@ mod tests {
     /// 两个内嵌的托盘 PNG 必须能解码。
     /// 解不出来不会报错，只会静默退回 bundle 默认图标——所以必须测。
     #[test]
-    fn embedded_tray_icons_decode() {
+    fn embedded_theme_icons_decode() {
         for theme in [Theme::Dark, Theme::Light] {
-            let icon = tray_icon(Some(theme))
+            let icon = themed_icon(Some(theme))
                 .unwrap_or_else(|| panic!("托盘图标解码失败：{theme:?}"));
             assert_eq!(icon.width(), 64, "托盘图标宽度应为 64");
             assert_eq!(icon.height(), 64, "托盘图标高度应为 64");
@@ -1485,15 +1674,15 @@ mod tests {
 
     /// 主题探测不到时按深色处理（Windows 11 默认深色任务栏）。
     #[test]
-    fn tray_icon_falls_back_to_white_version() {
-        assert!(tray_icon(None).is_some());
+    fn themed_icon_falls_back_to_white_version() {
+        assert!(themed_icon(None).is_some());
     }
 
     /// 深色版应该是白鲸鱼，浅色版应该是深色鲸鱼——反色确实生效了。
     #[test]
-    fn tray_icons_are_inverted_versions_of_each_other() {
-        let dark = tray_icon(Some(Theme::Dark)).unwrap();
-        let light = tray_icon(Some(Theme::Light)).unwrap();
+    fn theme_icons_are_opposite_colors() {
+        let dark = themed_icon(Some(Theme::Dark)).unwrap();
+        let light = themed_icon(Some(Theme::Light)).unwrap();
         let dark_rgba = dark.rgba();
         let light_rgba = light.rgba();
 
@@ -1747,6 +1936,27 @@ mod tests {
         let (_, content, chat) = main_webview_rects(800.0, 10.0, false);
         assert!(content.3 >= 1.0);
         assert!(chat.3 >= 1.0);
+    }
+
+    /// `target_x <= width` 恒成立 —— 侧栏动画里的 `x.clamp(target_x, width)` 依赖它。
+    ///
+    /// `f64::clamp` 在 `min > max` 时会 **panic**。滑入/滑出都用
+    /// `clamp(target_x, width)` 把中途位置夹进合法区间，所以这条必须成立。
+    #[test]
+    fn chat_target_x_never_exceeds_window_width() {
+        // 含极窄窗口（侧栏被压到窗口宽度 ⇒ target_x == 0）与正常窗口。
+        for width in [1.0, 100.0, 419.0, 420.0, 421.0, 1200.0, 3840.0] {
+            for height in [1.0, 40.0, 41.0, 800.0, 2160.0] {
+                let (x, _, w, _) = chat_target_bounds(width, height);
+                assert!(
+                    x <= width,
+                    "clamp 的下界不能大于上界：width={width} height={height} x={x}"
+                );
+                assert!(w >= 1.0, "宽度必须为正：width={width} w={w}");
+                // 实际执行一次 clamp，确保不 panic。
+                let _ = 500.0_f64.clamp(x, width);
+            }
+        }
     }
 
     /// `Cargo.toml` 与 `tauri.conf.json` 的版本号必须一致，

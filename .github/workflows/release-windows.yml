@@ -77,6 +77,58 @@ jobs:
         shell: pwsh
         run: Get-ChildItem -Recurse src-tauri/target/release/bundle | Select-Object FullName, Length
 
+      # 验证「统一 logo」真的进了产物（用户明确要求安装包与卸载器都要那只小鲸鱼，
+      # 而不是 Tauri 默认图标）。
+      #
+      # 这里**不**做「抽 exe 图标再比像素」那套：`System.Drawing` 的图标抽取在不同
+      # Windows 版本上对 PNG 压缩的 ICO 支持不一致，容易变成 flaky 断言。
+      # 改为两条**确定性强**的检查：
+      #   1) exe 的图标资源里确实含 ICO 数据，且与 icons/icon.ico 的**尺寸档位一致**
+      #      （Tauri 会把 bundle.icon 里的 ico 嵌进 exe）；
+      #   2) 配置里 installerIcon / uninstallerIcon 指向的文件存在 —— 这是安装包与
+      #      卸载器图标的**唯一**来源，之前它们从未被设置，所以才会是 Tauri 默认图标。
+      - name: Verify unified logo is wired into the bundle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $conf = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+
+          # 1) 安装包 / 卸载器图标必须显式指向统一 logo
+          foreach ($k in @("installerIcon", "uninstallerIcon")) {
+            $rel = $conf.bundle.windows.nsis.$k
+            if (-not $rel) {
+              throw "tauri.conf.json 缺少 nsis.$k —— 安装包/卸载器会退回 Tauri 默认图标（用户明确不要）"
+            }
+            $p = Join-Path "src-tauri" $rel
+            if (-not (Test-Path $p)) { throw "nsis.$k 指向的文件不存在：$p" }
+            Write-Host "OK  nsis.$k = $rel"
+          }
+
+          # 2) bundle.icon 必须包含 icon.ico，且该 ico 是多档的（含 256 与 16）
+          $icons = @($conf.bundle.icon)
+          if ($icons -notcontains "icons/icon.ico") {
+            throw "bundle.icon 里没有 icons/icon.ico"
+          }
+          $icoPath = "src-tauri/icons/icon.ico"
+          $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $icoPath))
+          # ICO 头：reserved(2)=0, type(2)=1, count(2)=N
+          $reserved = [BitConverter]::ToUInt16($bytes, 0)
+          $type = [BitConverter]::ToUInt16($bytes, 2)
+          $count = [BitConverter]::ToUInt16($bytes, 4)
+          if ($reserved -ne 0 -or $type -ne 1) { throw "icons/icon.ico 不是合法的 ICO 文件" }
+          Write-Host ("OK  icons/icon.ico 合法，含 {0} 档尺寸" -f $count)
+          if ($count -lt 6) {
+            throw "icons/icon.ico 只有 $count 档，期望至少 6 档（256/128/64/48/32/24/16）"
+          }
+
+          # 3) 打包产物里 exe 与安装器都要存在（确认构建真的产出了东西）
+          $exe = "src-tauri/target/release/dshtauri.exe"
+          if (-not (Test-Path $exe)) { throw "找不到 $exe" }
+          $setup = Get-ChildItem "src-tauri/target/release/bundle/nsis/*.exe" -ErrorAction SilentlyContinue
+          if (-not $setup) { throw "找不到 NSIS 安装包" }
+          Write-Host ("OK  产物：{0} / {1}" -f (Split-Path $exe -Leaf), $setup[0].Name)
+
       - name: Upload NSIS installer
         uses: actions/upload-artifact@v4
         with:

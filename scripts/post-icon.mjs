@@ -3,13 +3,14 @@
  *
  * 做两件事：
  *   1. 删除 tauri icon 顺带生成的 android/ 、ios/ —— 本项目只做 Windows 桌面端。
- *   2. 把 `icons/icon.ico` 换成**托盘那个 logo**（透明背景的深藏青鲸鱼）。
+ *   2. 用**统一 logo** 覆盖 `tauri icon` 生成的图标。
  *
- * 关于第 2 点为什么不再用 `deepseek_harness.ico`：
- * 那个文件是「鲸鱼画在白色圆角方块上」的应用图标风格，而用户要求安装包图标用
- * **托盘 logo**（透明背景版）。`icons/tray-light.png` 就是那张图，且与
- * `deepseek.ico` 的 artwork **逐像素一致**（已用 compare 验证 0 差异）。
- * 具体生成逻辑见 `scripts/make-ico.mjs`。
+ * 为什么第 2 步必要：`tauri icon app-icon.png` 会从 `app-icon.png`
+ * （那只「鲸鱼画在白色圆角方块上」的旧图）重新生成全部图标，
+ * 把我们的统一鲸鱼覆盖掉。用户明确要求统一成**托盘那只小鲸鱼**，
+ * 所以每次生成后都要用 `scripts/make-logo.mjs` 修正回来。
+ *
+ * 统一 logo 的定义、配色与产出见 `scripts/make-logo.mjs` 的头部注释。
  */
 import { execFileSync } from "node:child_process";
 import { existsSync, rmSync } from "node:fs";
@@ -28,11 +29,13 @@ for (const name of ["android", "ios"]) {
   }
 }
 
-/* 2. 安装包/exe 图标 = 托盘 logo（透明背景鲸鱼），7 档多尺寸 */
+/* 2. 覆盖成统一 logo（icon.ico + 运行时主题图标 + 各尺寸 PNG） */
 try {
-  execFileSync(process.execPath, [resolve(ROOT, "scripts", "make-ico.mjs")], {
+  execFileSync(process.execPath, [resolve(ROOT, "scripts", "make-logo.mjs")], {
     stdio: "inherit",
   });
 } catch (err) {
-  console.warn(`[DSHTauri] 警告：make-ico.mjs 执行失败，icon.ico 保持原样。原因：${err.message}`);
+  console.warn(
+    `[DSHTauri] 警告：make-logo.mjs 执行失败，图标保持 tauri icon 生成的结果。原因：${err.message}`,
+  );
 }

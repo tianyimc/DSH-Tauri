@@ -1,6 +1,6 @@
 [package]
 name = "dshtauri"
-version = "0.3.0"
+version = "0.3.1"
 description = "DSHTauri - lightweight Tauri 2 desktop shell for the DSH WebUI"
 authors = ["DSHTauri"]
 edition = "2021"
@@ -40,6 +40,9 @@ windows-sys = { version = "0.61", features = [
     # 读取 Windows 11「设置 → 辅助功能 → 视觉效果 → 动画效果」开关，
     # 关掉时我们不做过渡动画（见 src/anim.rs）。
     "Win32_UI_WindowsAndMessaging",
+    # timeBeginPeriod / timeEndPeriod（winmm）：把系统定时器粒度压到 1ms，
+    # 否则 `sleep(15ms)` 实际会睡 15~31ms，帧间隔抖动 = 看起来「一顿一顿」（见 src/anim.rs）。
+    "Win32_Media",
 ] }
 # 用来把「会话 cookie」改成「持久 cookie」，否则每次启动都要重新登录
 # （Cloudflare Access 的 CF_Authorization 就是会话 cookie）

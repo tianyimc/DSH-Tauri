@@ -117,17 +117,39 @@ $WORK = Join-Path $env:RUNNER_TEMP "dshtauri-smoke"
 New-Item -ItemType Directory -Force -Path $WORK | Out-Null
 $HTTP_LOG = Join-Path $WORK "httpd.log"
 
+# 选择 DSH 连接方式 —— 用 Unicode 码点构造，避免脚本文件编码带来的问题
+$SELECTOR_TITLE = -join ([char[]]@(0x9009, 0x62E9, 0x20, 0x44, 0x53, 0x48, 0x20, 0x8FDE, 0x63A5, 0x65B9, 0x5F0F))
+$MAIN_TITLE = "DSHTauri"
+
 $CONFIG_DIR = Join-Path $env:APPDATA "com.dsh.dshtauri"
 $CONFIG_FILE = Join-Path $CONFIG_DIR "config.json"
 
 $proc = $null
 $httpd = $null
 
-# 按客户区尺寸找窗口：选择窗口 560x460，主窗口 ~1200x800
-function Find-WindowByClientSize([IntPtr[]]$Handles, [int]$W, [int]$H, [int]$Tolerance) {
-  foreach ($h in $Handles) {
-    $s = [Win32]::ClientSize($h)
-    if ([Math]::Abs($s[0] - $W) -le $Tolerance -and [Math]::Abs($s[1] - $H) -le $Tolerance) { return $h }
+# 把进程的所有顶层窗口打印出来（找不到窗口时用来诊断）
+function Format-WindowList([int]$ProcId) {
+  $lines = @()
+  foreach ($h in [Win32]::TopLevelWindows([uint32]$ProcId)) {
+    $cs = [Win32]::ClientSize($h)
+    $lines += ("hwnd={0} title='{1}' client={2}x{3} visible={4} hung={5}" -f `
+      $h, [Win32]::Title($h), $cs[0], $cs[1], [Win32]::IsWindowVisible($h), [Win32]::IsHungAppWindow($h))
+  }
+  if ($lines.Count -eq 0) { $lines += "(该进程没有任何顶层窗口)" }
+  return ($lines -join " | ")
+}
+
+# 按标题找；找不到再按客户区尺寸找（尺寸做 DPI 容差）
+function Find-AppWindow([int]$ProcId, [string]$Title, [int]$W, [int]$H, [int]$Tolerance) {
+  $handles = [Win32]::TopLevelWindows([uint32]$ProcId)
+  if ($Title) {
+    foreach ($h in $handles) {
+      if ([Win32]::Title($h) -eq $Title) { return $h }
+    }
+  }
+  foreach ($h in $handles) {
+    $cs = [Win32]::ClientSize($h)
+    if ([Math]::Abs($cs[0] - $W) -le $Tolerance -and [Math]::Abs($cs[1] - $H) -le $Tolerance) { return $h }
   }
   return [IntPtr]::Zero
 }
@@ -173,35 +195,35 @@ s.end('<!doctype html><meta charset=utf-8><title>DSH LOCAL</title><h1>DSH LOCAL 
   Write-Host "== 4. 选择窗口 =="
   $sel = [IntPtr]::Zero
   for ($i = 0; $i -lt 15; $i++) {
-    $sel = Find-WindowByClientSize ([Win32]::TopLevelWindows([uint32]$proc.Id)) 560 460 4
+    $sel = Find-AppWindow $proc.Id $SELECTOR_TITLE 560 460 120
     if ($sel -ne [IntPtr]::Zero) { break }
     Start-Sleep -Seconds 2
   }
-  Check "选择窗口已出现（客户区 560x460）" ($sel -ne [IntPtr]::Zero)
+  $dump = Format-WindowList $proc.Id
+  Check "选择窗口已出现（标题或 560x460 客户区）" ($sel -ne [IntPtr]::Zero) "进程窗口：$dump"
   if ($sel -eq [IntPtr]::Zero) {
-    Write-Host "  当前进程的顶层窗口："
-    foreach ($h in [Win32]::TopLevelWindows([uint32]$proc.Id)) {
-      $s = [Win32]::ClientSize($h)
-      Write-Host ("    hwnd={0} title='{1}' client={2}x{3} visible={4}" -f $h, [Win32]::Title($h), $s[0], $s[1], [Win32]::IsWindowVisible($h))
-    }
-    throw "选择窗口没出现 —— 可能 runner 上没有可用的交互桌面"
+    Write-Host "  当前进程的顶层窗口：$dump"
+    throw "选择窗口没出现 —— 进程窗口清单：$dump"
   }
+  $selCs = [Win32]::ClientSize($sel)
+  Write-Host ("  选择窗口：hwnd={0} title='{1}' client={2}x{3}" -f $sel, [Win32]::Title($sel), $selCs[0], $selCs[1])
   Check "选择窗口未卡死" ([Win32]::IsResponsive($sel, 3000))
 
   Write-Host "== 5. 点击「本地」卡片 =="
   [void][Win32]::SetForegroundWindow($sel)
   Start-Sleep -Milliseconds 500
-  [Win32]::ClickClient($sel, 280, 103)   # 卡片中心：横向居中，纵向约 103px（与 CSS 布局一致）
+  $clickY = [int]([Math]::Min(103, ($selCs[1] * 0.25)))
+  [Win32]::ClickClient($sel, [int]($selCs[0] / 2), $clickY)   # 卡片中心（与 CSS 布局一致：纵向约 103px）
   Start-Sleep -Seconds 8
 
   Write-Host "== 6. 主窗口 =="
   $main = [IntPtr]::Zero
   for ($i = 0; $i -lt 15; $i++) {
-    $main = Find-WindowByClientSize ([Win32]::TopLevelWindows([uint32]$proc.Id)) 1200 800 40
+    $main = Find-AppWindow $proc.Id $MAIN_TITLE 1200 800 200
     if ($main -ne [IntPtr]::Zero) { break }
     Start-Sleep -Seconds 2
   }
-  Check "主窗口已出现（客户区 ~1200x800）" ($main -ne [IntPtr]::Zero)
+  Check "主窗口已出现（标题 DSHTauri 或 ~1200x800 客户区）" ($main -ne [IntPtr]::Zero) "进程窗口：$(Format-WindowList $proc.Id)"
 
   if ($main -ne [IntPtr]::Zero) {
     $ms = [Win32]::ClientSize($main)

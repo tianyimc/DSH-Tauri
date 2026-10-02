@@ -146,23 +146,38 @@ jobs:
         shell: pwsh
         continue-on-error: true
         run: |
-          $dir = "$env:RUNNER_TEMP\dshtauri-smoke"
-          $out = Join-Path $env:RUNNER_TEMP "smoke-windows.txt"
-          "run_id: ${{ github.run_id }}"   | Out-File -FilePath $out -Encoding utf8
-          "sha:    ${{ github.sha }}"      | Out-File -FilePath $out -Append -Encoding utf8
-          "result: ${{ steps.smoke.outcome }}" | Out-File -FilePath $out -Append -Encoding utf8
+          $ErrorActionPreference = "Continue"
+          function Invoke-Git([string[]]$GitArgs) {
+            & git @GitArgs
+            if ($LASTEXITCODE -ne 0) { throw "git $($GitArgs -join ' ') 失败（exit $LASTEXITCODE）" }
+          }
+
+          $dir = Join-Path $env:RUNNER_TEMP "dshtauri-smoke"
+          # 必须写在仓库工作区内，否则 git add 会报 "is outside repository"
+          $out = Join-Path $env:GITHUB_WORKSPACE "smoke-windows.txt"
+
+          $lines = @(
+            "run_id: ${{ github.run_id }}",
+            "sha:    ${{ github.sha }}",
+            "result: ${{ steps.smoke.outcome }}",
+            "session: $((Get-Process -Id $PID).SessionId)"
+          )
           if (Test-Path $dir) {
-            Get-ChildItem $dir -File | ForEach-Object {
-              "`n===== $($_.Name) =====" | Out-File -FilePath $out -Append -Encoding utf8
-              (Get-Content $_.FullName -Raw) | Out-File -FilePath $out -Append -Encoding utf8
+            Get-ChildItem $dir -File | Sort-Object Name | ForEach-Object {
+              $lines += ""
+              $lines += "===== $($_.Name) ====="
+              $lines += (Get-Content $_.FullName -Raw)
             }
           }
-          git config user.email "ci@dshtauri.local"
-          git config user.name "DSHTauri CI"
-          git checkout -q -b ci-logs
-          git add -f $out
-          git commit -q -m "ci: smoke output for run ${{ github.run_id }}"
-          git push -q -f origin ci-logs
+          Set-Content -Path $out -Value ($lines -join "`n") -Encoding utf8
+
+          Invoke-Git @("config", "user.email", "ci@dshtauri.local")
+          Invoke-Git @("config", "user.name", "DSHTauri CI")
+          Invoke-Git @("checkout", "-q", "-B", "ci-logs")
+          Invoke-Git @("add", "-f", "smoke-windows.txt")
+          Invoke-Git @("commit", "-q", "-m", "ci: smoke output for run ${{ github.run_id }}")
+          Invoke-Git @("push", "-q", "-f", "origin", "ci-logs")
+          Write-Host "smoke output published to ci-logs/smoke-windows.txt"
 
       - name: Fail job if smoke test failed
         if: steps.smoke.outcome == 'failure'

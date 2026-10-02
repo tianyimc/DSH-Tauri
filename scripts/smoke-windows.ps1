@@ -77,6 +77,12 @@ public static class Win32 {
     return sb.ToString();
   }
 
+  public static IntPtr[] AllTopLevelWindows() {
+    var list = new List<IntPtr>();
+    EnumWindows(delegate(IntPtr h, IntPtr l) { list.Add(h); return true; }, IntPtr.Zero);
+    return list.ToArray();
+  }
+
   public static IntPtr[] TopLevelWindows(uint targetPid) {
     var list = new List<IntPtr>();
     EnumWindows(delegate(IntPtr h, IntPtr l) {
@@ -200,7 +206,15 @@ s.end('<!doctype html><meta charset=utf-8><title>DSH LOCAL</title><h1>DSH LOCAL 
     Start-Sleep -Seconds 2
   }
   $dump = Format-WindowList $proc.Id
-  Check "选择窗口已出现（标题或 560x460 客户区）" ($sel -ne [IntPtr]::Zero) "进程窗口：$dump"
+  # 额外信息：判断 runner 到底有没有可用的交互桌面
+  $sessionId = (Get-Process -Id $PID).SessionId
+  $desktopWindows = [Win32]::AllTopLevelWindows()
+  $desktopDump = ($desktopWindows | Select-Object -First 12 | ForEach-Object {
+      $cs = [Win32]::ClientSize($_)
+      "hwnd=$_ title='$([Win32]::Title($_))' client=$($cs[0])x$($cs[1]) visible=$([Win32]::IsWindowVisible($_))"
+    }) -join " | "
+  Check "选择窗口已出现（标题或 560x460 客户区）" ($sel -ne [IntPtr]::Zero) `
+    "session=$sessionId 进程窗口：$dump 桌面窗口(前12)：$desktopDump"
   if ($sel -eq [IntPtr]::Zero) {
     Write-Host "  当前进程的顶层窗口：$dump"
     throw "选择窗口没出现 —— 进程窗口清单：$dump"

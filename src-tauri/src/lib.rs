@@ -1822,16 +1822,24 @@ mod tests {
     /// **任务栏**图标的配色依据是外壳主题（`SystemUsesLightTheme`），
     /// 与**应用**主题（tao 的 `Theme`）是两个独立开关。
     ///
-    /// 这条测试锁住「两者被分开处理」这个结构：`apply_theme_icons` 必须同时
-    /// 依据 `theme`（应用）与 `win_icon::taskbar_prefers_light`（外壳）来选图标。
-    /// 在非 Windows 上 `taskbar_prefers_light` 直接透传，所以断言是平台无关的。
+    /// 这条测试锁住「注册表值 → 深浅色」的**翻译规则**。
     #[test]
     fn taskbar_theme_falls_back_to_apps_theme() {
-        // 非 Windows 上恒为透传；Windows 上仅在读不到注册表值时才透传。
-        // 两种情况下「透传」都是允许的默认行为，这里只断言不会 panic、
-        // 且返回的是布尔语义（浅色 / 深色）。
-        assert!(win_icon::taskbar_prefers_light(true));
-        assert!(!win_icon::taskbar_prefers_light(false));
+        // ⚠️ 这里**只**断言纯翻译函数，**不**断言 `taskbar_prefers_light()` 的返回值。
+        //
+        // 原因：在 CI 的 `windows-latest` 上 `SystemUsesLightTheme` **确实存在**
+        // （值可能是 0 = 深色外壳），于是 `taskbar_prefers_light(true)` 会返回
+        // `false` —— 直接断言「透传」会**在 Windows 上失败**。
+        // v0.3.2 第一次推送时 CI 就是这样红的，所以改成测纯函数。
+        use crate::win_icon::taskbar_light_from_registry_value as tr;
+
+        // 读到 1 ⇒ 浅色任务栏。
+        assert!(tr(Some(1), false), "读到 1 应判定为浅色（不受 fallback 影响）");
+        // 读到 0 ⇒ 深色任务栏。
+        assert!(!tr(Some(0), true), "读到 0 应判定为深色（不受 fallback 影响）");
+        // 读不到 ⇒ 退回调用方给的 fallback（tao 的应用主题）。
+        assert!(tr(None, true), "读不到时应退回 fallback=true");
+        assert!(!tr(None, false), "读不到时应退回 fallback=false");
     }
 
     /// v0.3.2 起 **docked 与 overlay 共用同一条滑出动画**：

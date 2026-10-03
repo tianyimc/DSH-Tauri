@@ -441,94 +441,6 @@ try {
     Start-Sleep -Seconds 4
     Check "再次点击收起侧栏后仍响应（可反复切换）" ([Win32]::IsResponsive($main, 5000))
 
-    # --- v0.3.2：docked（并排）模式的过渡动画 ---
-    #
-    # v0.3.1 的 docked 模式**不做滑动**（直接切到位），用户实测「还是卡/闪」。
-    # v0.3.2 起 docked 与 overlay 共用同一条滑动路径：滑动期间内容页**不收窄**，
-    # 等侧栏滑到位（`slide_x_with` 的 on_done）才让出宽度。
-    #
-    # 做法：把 `chatDocked` 写进配置、重启应用，**走与 A 段完全相同的流程**
-    # 把主窗口叫出来（启动时只有选择窗口！），再点「网页对话」，
-    # 然后断言**内容页与侧栏精确平铺**（内容页让出 420 逻辑 px）。
-    #
-    # ⚠️ 三个坑（独立验证发现，都会让 CI 变红）：
-    #   1. **启动后第一个可见顶层窗口是「选择 DSH 连接方式」，不是主窗口** ——
-    #      `.setup()` 无条件创建选择窗口（不判断 `config.configured`），
-    #      主窗口要等用户点「本地」卡片才建。所以必须像 A 段那样
-    #      `Wait-AppWindow $SELECTOR_TITLE` → 点「本地」→ `Wait-AppWindow $MAIN_TITLE`，
-    #      **不能**用 `TopLevelWindows | Select-Object -First 1`。
-    #   2. **「网页对话」按钮的 x 是 148，不是 68**。顶栏按钮顺序是
-    #      应用(中心≈27) → 操作(≈81) → 网页对话(≈148)；按 CSS 推算
-    #      （`.menu` padding 0 14px、字体 13px）网页对话左边缘 108、中心 148。
-    #      点 68 会点到「操作」弹出原生菜单，侧栏根本不会开。
-    #      这里统一用 `$CHAT_BTN_X`，与上面的 overlay 分支**同一个常量**，避免再次分叉。
-    #   3. 先收起侧栏再重启，避免上一段留下的状态干扰。
-    [Win32]::ClickClient($main, [int]($CHAT_BTN_X * $scale), [int](20 * $scale))
-    Start-Sleep -Seconds 2
-    if (-not $proc.HasExited) { $proc.Kill(); $proc.WaitForExit(5000) }
-
-    $cfgDock = @{ configured = $true;
-                  localUrl = "http://127.0.0.1:$Port";
-                  remoteUrl = "http://127.0.0.1:$Port2";
-                  autoStartLocal = $false; localStartCommand = "";
-                  chatDocked = $true } | ConvertTo-Json -Compress
-    Set-Content -Path $CONFIG_FILE -Value $cfgDock -Encoding UTF8
-
-    $dockLog = Join-Path $WORK "app.docked.log"
-    $procDock = Start-Process $AppPath -PassThru -RedirectStandardOutput $dockLog -RedirectStandardError "$dockLog.err"
-
-    # 与 A 段同构：选择窗口 → 点「本地」→ 主窗口。
-    $selD = Wait-AppWindow $procDock.Id $SELECTOR_TITLE 560 460 120
-    $mainDock = $null
-    if ($selD) {
-      $selDCs = [Win32]::ClientSize($selD)
-      [Win32]::ClickClient($selD, [int]($selDCs[0] / 2), $CARD_LOCAL_Y)
-      $mainDock = Wait-AppWindow $procDock.Id $MAIN_TITLE 1200 800 200
-    }
-    if ($mainDock) {
-      $msD = [Win32]::ClientSize($mainDock)
-      $scaleD = [Win32]::GetDpiForWindow($mainDock) / 96.0
-      $tbHD = [int](40 * $scaleD)
-      # 点「网页对话」——与 overlay 分支共用同一个 x 常量。
-      [Win32]::ClickClient($mainDock, [int]($CHAT_BTN_X * $scaleD), [int](20 * $scaleD))
-      Start-Sleep -Seconds 4   # 等动画（180ms）放完 + 页面开始加载
-
-      $chatWD = [int](420 * $scaleD)
-      $rectsD = @(
-        [Win32]::Descendants($mainDock) |
-          Where-Object { [Win32]::IsWindowVisible($_) -and [Win32]::ClassName($_) -eq "WRY_WEBVIEW" } |
-          ForEach-Object { ,@([Win32]::RectInClient($mainDock, $_)) }
-      )
-      $descD = ($rectsD | ForEach-Object { "($($_[0]),$($_[1])) $($_[2])x$($_[3])" }) -join '; '
-
-      # 内容页 = 从 y≈40 开始、左边缘为 0、宽度≈客户区宽-chatW 的那个。
-      $expectContentW = $msD[0] - $chatWD
-      $contentOk = $false
-      foreach ($r in $rectsD) {
-        if ($r[1] -ge ($tbHD - 6) -and $r[0] -le 2 -and [math]::Abs($r[2] - $expectContentW) -le 8) {
-          $contentOk = $true
-        }
-      }
-      Check "docked：内容页让出侧栏宽度（与侧栏并排、不重叠）" $contentOk `
-        ("期望内容页宽≈{0}（客户区宽 {1} - 侧栏宽 {2}）；实际子 webview：{3}" -f `
-          $expectContentW, $msD[0], $chatWD, $descD)
-
-      # 侧栏左边缘应正好贴在内容页右边缘（精确平铺）。
-      $expectChatXD = $expectContentW
-      $chatOkD = $false
-      foreach ($r in $rectsD) {
-        if ($r[1] -ge ($tbHD - 6) -and [math]::Abs($r[0] - $expectChatXD) -le 8) { $chatOkD = $true }
-      }
-      Check "docked：侧栏左边缘与内容页右边缘对齐（精确平铺）" $chatOkD `
-        ("期望侧栏左边缘≈{0}；实际：{1}" -f $expectChatXD, $descD)
-
-      Check "docked：打开侧栏后进程仍存活（未死锁）" (-not $procDock.HasExited)
-    } else {
-      Check "docked：能启动并找到主窗口" $false `
-        "没走到主窗口（选择窗口=$(if ($selD) {'有'} else {'无'})）"
-    }
-    if (-not $procDock.HasExited) { $procDock.Kill(); $procDock.WaitForExit(5000) }
-
     Write-Host "== 6.7 设置窗口（v0.3.0 新增）=="
     # 「应用 → 设置」走**系统原生菜单**，菜单是系统级弹出窗口、不是 DOM 元素，
     # 无法用坐标可靠点中（xdotool/Win32 点击都不稳），所以 CI 里不点它。
@@ -673,7 +585,103 @@ setInterval(() => {}, 1000);
   # 应用里有个 cookie keeper 会把它转成持久 cookie，所以这里必须是「保留」。
   Check "会话 cookie 也被转成持久 cookie（跨重启保留）" ($before -match "sess%3D1") "第二次启动的 /before：'$before'"
   Stop-App $run2
+
+  # ======================================================= E. docked（并排）模式动画
+  #
+  # ⚠️ 这一节**必须独立于 A~D 段**：它要改配置并重启应用，会 kill 掉前面的
+  # `$proc`。第一版把它塞在「6. 主窗口」里面，结果后面第 7/8 节的
+  # 「关闭窗口 = 隐藏到托盘」「切换连接方式」全部失败（进程已经没了）
+  # —— 这是 v0.3.2 第一次推送时 CI 冒烟红掉的原因之一。
+  # 现在它有自己的进程（`$procDock`），且放在所有依赖 `$proc` 的断言之后。
+    # --- v0.3.2：docked（并排）模式的过渡动画 ---
+    #
+    # v0.3.1 的 docked 模式**不做滑动**（直接切到位），用户实测「还是卡/闪」。
+    # v0.3.2 起 docked 与 overlay 共用同一条滑动路径：滑动期间内容页**不收窄**，
+    # 等侧栏滑到位（`slide_x_with` 的 on_done）才让出宽度。
+    #
+    # 做法：把 `chatDocked` 写进配置、重启应用，**走与 A 段完全相同的流程**
+    # 把主窗口叫出来（启动时只有选择窗口！），再点「网页对话」，
+    # 然后断言**内容页与侧栏精确平铺**（内容页让出 420 逻辑 px）。
+    #
+    # ⚠️ 三个坑（独立验证发现，都会让 CI 变红）：
+    #   1. **启动后第一个可见顶层窗口是「选择 DSH 连接方式」，不是主窗口** ——
+    #      `.setup()` 无条件创建选择窗口（不判断 `config.configured`），
+    #      主窗口要等用户点「本地」卡片才建。所以必须像 A 段那样
+    #      `Wait-AppWindow $SELECTOR_TITLE` → 点「本地」→ `Wait-AppWindow $MAIN_TITLE`，
+    #      **不能**用 `TopLevelWindows | Select-Object -First 1`。
+    #   2. **「网页对话」按钮的 x 是 148，不是 68**。顶栏按钮顺序是
+    #      应用(中心≈27) → 操作(≈81) → 网页对话(≈148)；按 CSS 推算
+    #      （`.menu` padding 0 14px、字体 13px）网页对话左边缘 108、中心 148。
+    #      点 68 会点到「操作」弹出原生菜单，侧栏根本不会开。
+    #      这里统一用 `$CHAT_BTN_X`，与上面的 overlay 分支**同一个常量**，避免再次分叉。
+    #   3. 本段**完全自包含**：自己写配置、自己启进程（`$procDock`）。
+    #      第一版把它塞在「6. 主窗口」里面，并 kill 掉了 A 段的 `$proc`，
+    #      导致后面的第 7/8 节全部失败（进程已经没了）——
+    #      这是 v0.3.2 第一次推送时 CI 冒烟红掉的原因之一。
+    #      所以这里**不碰** `$proc` / `$main`，只用自己的变量。
+    $cfgDock = @{ configured = $true;
+                  localUrl = "http://127.0.0.1:$Port";
+                  remoteUrl = "http://127.0.0.1:$Port2";
+                  autoStartLocal = $false; localStartCommand = "";
+                  chatDocked = $true } | ConvertTo-Json -Compress
+    Set-Content -Path $CONFIG_FILE -Value $cfgDock -Encoding UTF8
+
+    $dockLog = Join-Path $WORK "app.docked.log"
+    $procDock = Start-Process $AppPath -PassThru -RedirectStandardOutput $dockLog -RedirectStandardError "$dockLog.err"
+
+    # 与 A 段同构：选择窗口 → 点「本地」→ 主窗口。
+    $selD = Wait-AppWindow $procDock.Id $SELECTOR_TITLE 560 460 120
+    $mainDock = $null
+    if ($selD) {
+      $selDCs = [Win32]::ClientSize($selD)
+      [Win32]::ClickClient($selD, [int]($selDCs[0] / 2), $CARD_LOCAL_Y)
+      $mainDock = Wait-AppWindow $procDock.Id $MAIN_TITLE 1200 800 200
+    }
+    if ($mainDock) {
+      $msD = [Win32]::ClientSize($mainDock)
+      $scaleD = [Win32]::GetDpiForWindow($mainDock) / 96.0
+      $tbHD = [int](40 * $scaleD)
+      # 点「网页对话」——与 overlay 分支共用同一个 x 常量。
+      [Win32]::ClickClient($mainDock, [int]($CHAT_BTN_X * $scaleD), [int](20 * $scaleD))
+      Start-Sleep -Seconds 4   # 等动画（180ms）放完 + 页面开始加载
+
+      $chatWD = [int](420 * $scaleD)
+      $rectsD = @(
+        [Win32]::Descendants($mainDock) |
+          Where-Object { [Win32]::IsWindowVisible($_) -and [Win32]::ClassName($_) -eq "WRY_WEBVIEW" } |
+          ForEach-Object { ,@([Win32]::RectInClient($mainDock, $_)) }
+      )
+      $descD = ($rectsD | ForEach-Object { "($($_[0]),$($_[1])) $($_[2])x$($_[3])" }) -join '; '
+
+      # 内容页 = 从 y≈40 开始、左边缘为 0、宽度≈客户区宽-chatW 的那个。
+      $expectContentW = $msD[0] - $chatWD
+      $contentOk = $false
+      foreach ($r in $rectsD) {
+        if ($r[1] -ge ($tbHD - 6) -and $r[0] -le 2 -and [math]::Abs($r[2] - $expectContentW) -le 8) {
+          $contentOk = $true
+        }
+      }
+      Check "docked：内容页让出侧栏宽度（与侧栏并排、不重叠）" $contentOk `
+        ("期望内容页宽≈{0}（客户区宽 {1} - 侧栏宽 {2}）；实际子 webview：{3}" -f `
+          $expectContentW, $msD[0], $chatWD, $descD)
+
+      # 侧栏左边缘应正好贴在内容页右边缘（精确平铺）。
+      $expectChatXD = $expectContentW
+      $chatOkD = $false
+      foreach ($r in $rectsD) {
+        if ($r[1] -ge ($tbHD - 6) -and [math]::Abs($r[0] - $expectChatXD) -le 8) { $chatOkD = $true }
+      }
+      Check "docked：侧栏左边缘与内容页右边缘对齐（精确平铺）" $chatOkD `
+        ("期望侧栏左边缘≈{0}；实际：{1}" -f $expectChatXD, $descD)
+
+      Check "docked：打开侧栏后进程仍存活（未死锁）" (-not $procDock.HasExited)
+    } else {
+      Check "docked：能启动并找到主窗口" $false `
+        "没走到主窗口（选择窗口=$(if ($selD) {'有'} else {'无'})）"
+    }
+    if (-not $procDock.HasExited) { $procDock.Kill(); $procDock.WaitForExit(5000) }
 }
+
 catch {
   Check "脚本异常中止" $false $_.Exception.Message
 }
@@ -688,6 +696,8 @@ finally {
   }
   Stop-App $proc
   Stop-App $proc2
+  # E 段的 docked 实例（自包含，独立于 $proc）。
+  if ($procDock) { Stop-App $procDock }
   foreach ($s in $servers) { if ($s -and -not $s.HasExited) { Stop-Process -Id $s.Id -Force -ErrorAction SilentlyContinue } }
   # 兜底：把可能残留的假服务也清掉
   Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |

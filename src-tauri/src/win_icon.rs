@@ -68,6 +68,27 @@
 //! 并自己持有旧句柄。现在不做，是因为那会让状态管理复杂化，
 //! 而当前收益为零。
 
+/// 把「注册表里读到的值」翻译成「任务栏是否浅色」。
+///
+/// **纯函数**，与注册表读取分开 —— 这样「翻译规则」可以被单测覆盖，
+/// 而不用去断言依赖运行环境的注册表读取结果。
+///
+/// 为什么要分开：CI（`windows-latest`）上 `SystemUsesLightTheme` **确实存在**，
+/// 值可能是 0（深色外壳）。如果测试直接断言 `taskbar_prefers_light(true) == true`，
+/// 就会在 CI 上失败 —— 因为 Windows 上它真的会去读注册表。
+/// （这正是 v0.3.2 第一次推送时 CI 红掉的原因。）
+///
+/// `raw`：
+/// - `Some(v)` ⇒ 读到值，`v != 0` 表示浅色；
+/// - `None` ⇒ 没读到（键不存在 / 权限问题 / 非 Windows），退回 `fallback`。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn taskbar_light_from_registry_value(raw: Option<u32>, fallback: bool) -> bool {
+    match raw {
+        Some(v) => v != 0,
+        None => fallback,
+    }
+}
+
 /// 读取**任务栏实际使用的**深浅色（`true` = 浅色任务栏）。
 ///
 /// # 为什么不能直接用 Tauri/tao 的 `Window::theme()`
@@ -135,12 +156,9 @@ pub fn taskbar_prefers_light(fallback: bool) -> bool {
             &mut size,
         )
     };
-    if status == 0 {
-        // `SystemUsesLightTheme` 是「是否浅色」，1 = 浅色。
-        data != 0
-    } else {
-        fallback
-    }
+    // 读到 ⇒ 交给纯函数翻译（可单测）；读不到 ⇒ `None` ⇒ 退回 fallback。
+    let raw = if status == 0 { Some(data) } else { None };
+    taskbar_light_from_registry_value(raw, fallback)
 }
 
 /// 非 Windows：没有任务栏概念，直接沿用调用方给的主题。

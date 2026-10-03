@@ -9,7 +9,8 @@
  *   save_config({ config })           -> null   // Rust 侧是**补丁语义**
  *   chrome_action({ action })         -> null   // action: "reconnect"
  *   window_control({ action })        -> null   // action: "hide-settings"
- *   app_version()                     -> "v0.3.0 Gen3"
+ *   app_version()                     -> "v.0.3.2"（RC 版是 "v.0.3.2 RC"）
+ *   app_channel()                     -> "release" | "rc"
  *
  * ⚠️ `save_config` 的补丁语义很关键：这里切模式时**只发 `{ chatDocked }`**，
  * 其余字段（地址、启动命令）由 Rust 保留磁盘上的旧值。

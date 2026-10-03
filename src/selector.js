@@ -302,7 +302,7 @@ ui.saveSetup.addEventListener("click", async () => {
     setStatus(`读取配置失败，使用默认值：${err}`, "err");
   }
 
-  // 版本号（v.A.B.C GenX）由 Rust 侧编译进去，这里只负责显示。
+  // 版本号（v.A.B.C，RC 版附 ` RC` 后缀）由 Rust 侧编译进去，这里只负责显示。
   try {
     ui.footVersion.textContent = await invoke("app_version");
   } catch {

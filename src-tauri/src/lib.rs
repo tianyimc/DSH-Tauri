@@ -27,6 +27,12 @@ use tauri::{
 /// 所以这里自己逐帧插值。系统关掉「动画效果」时自动退化为直接切换。
 mod anim;
 
+/// Windows 任务栏图标的主题适配。
+///
+/// Tauri 的 `Window::set_icon()` **只设置 `ICON_SMALL`**，而任务栏按钮用的是
+/// `ICON_BIG` —— 所以 v0.3.1 的任务栏图标根本没跟着主题变。见模块文档。
+mod win_icon;
+
 /// 启动选择窗口的 label（在 `setup()` 里创建）。
 pub const SELECTOR_LABEL: &str = "selector";
 /// 主窗口的 label。
@@ -51,15 +57,16 @@ pub const ABOUT_LABEL: &str = "about";
 /// 「设置」窗口的 label（独立 `WebviewWindow`，加载本地 `settings.html` ⇒ 有 IPC）。
 pub const SETTINGS_LABEL: &str = "settings";
 
-/// 版本号（`v.A.B.C GenX`），由 `build.rs` 从 `Cargo.toml` + `version.json` 生成。
+/// 版本号（`v.A.B.C`，可选 ` RC` 后缀），由 `build.rs` 从 `Cargo.toml` + `version.json` 生成。
 ///
-/// - `APP_VERSION`：`1.1.1`
-/// - `APP_GENERATION`：`GenX` 里的 X，Gen1 时不在界面上显示
-/// - `APP_DISPLAY_VERSION`：`v1.1.1` 或 `v1.1.1 Gen2`
+/// - `APP_VERSION`：`0.3.2`（纯数字三段，不带前缀）
+/// - `APP_CHANNEL`：`"release"` 或 `"rc"` —— **RC 与 Release 是两条发布通道**，
+///   Release 版不带后缀，RC 版显示为 ` RC`。
+/// - `APP_DISPLAY_VERSION`：`v.0.3.2`（Release）或 `v.0.3.2 RC`（RC）
 mod version_info {
     include!(concat!(env!("OUT_DIR"), "/version_info.rs"));
 }
-pub use version_info::{APP_DISPLAY_VERSION, APP_GENERATION, APP_VERSION};
+pub use version_info::{APP_CHANNEL, APP_DISPLAY_VERSION, APP_VERSION};
 
 const SELECTOR_TITLE: &str = "选择 DSH 连接方式";
 const SELECTOR_WIDTH: f64 = 560.0;
@@ -687,48 +694,55 @@ fn toggle_chat_webview<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
             // （`cancel()` 会同时清掉 `is_animating()`，让下面的 layout 能摆放侧栏。）
             anim::cancel();
 
-            if chat_docked() {
-                // docked 模式：侧栏让出的宽度要还给内容页，这是一次真正的**重排**。
-                // 逐帧缩放两个 webview 会每帧重排内容页（必然掉帧），
-                // 所以这里**不做滑动动画**，直接切到位（与 VS Code 侧边栏的观感一致）。
-                layout_main_webviews(app);
-                let _ = chat.hide();
-            } else {
-                // overlay 模式：内容页**整宽不变**，只有侧栏在滑动 —— 零重排，动画很顺。
-                // 顺序很重要：`hide()` 是瞬时的，先 hide 就没得看了，
-                // 所以等滑出动画放完再 hide（见 anim::slide_x_with 的 on_done）。
-                let (width, height) =
-                    main_logical_size(&main).ok_or_else(|| "无法读取主窗口尺寸".to_string())?;
-                let (target_x, y, chat_w, chat_h) = chat_target_bounds(width, height);
-                // 从**当前真实位置**出发（可能正停在动画中途）。
-                // 必须在 `layout_main_webviews` **之前**读：layout 会把侧栏摆回目标位，
-                // 之后再读就只能读到目标位，滑出会从「完全打开」突然开始（可见跳变）。
-                //
-                // 夹到 `[target_x, width]`：
-                // - 下界：中途位置不该比目标更靠左（否则滑出会先向右倒退一下）；
-                // - 上界：窗口在侧栏可见期间被**改窄**时，旧位置可能已经在 `width` 之外，
-                //   从那里出发会「向左滑入可见区再消失」，看起来是闪一下。
-                //   夹到 `width` 后它就正好是「从屏幕边缘滑出」，观感正确。
-                //
-                // `Webview::position()` 返回**物理**坐标，要除 scale 换回逻辑单位 ——
-                // 这正是旧实现翻车的地方（物理/逻辑混用），所以这里显式换算并注释。
-                let from_x = chat
-                    .position()
-                    .ok()
-                    .and_then(|p| main.scale_factor().ok().map(|s| p.x as f64 / s))
-                    .map(|x| x.clamp(target_x, width))
-                    .unwrap_or(target_x);
-                // 滑到「完全移出客户区右侧」的位置，再隐藏。
-                // 先起动画（同步置 `is_animating()`）再 layout ⇒ layout 会跳过侧栏，
-                // 不会把刚开始滑出的侧栏又拽回目标位。
-                anim::slide_x_with(app, CHAT_LABEL, from_x, width, y, chat_w, chat_h, |app| {
-                    if let Some(chat) = app.get_webview(CHAT_LABEL) {
-                        let _ = chat.hide();
-                    }
-                });
-                // 内容页要不要让宽切回去（overlay 下内容页本来就是整宽，这里只是保持幂等）。
-                layout_main_webviews(app);
-            }
+            // ⚠️ **两种模式共用同一条滑出动画**（v0.3.2 起）。
+            //
+            // v0.3.1 里 docked 是「直接切到位、不滑动」，理由是「逐帧缩放会让内容页
+            // 每帧重排」。但那条理由**只对「逐帧改内容页宽度」成立**，而下面的做法
+            // 把内容页的宽度变化**只做一次**、且**在侧栏滑走的同时**完成 ——
+            // 于是既没有逐帧重排，也没有 v0.3.1 那种「啪一下跳过去」的生硬感。
+            let (width, height) =
+                main_logical_size(&main).ok_or_else(|| "无法读取主窗口尺寸".to_string())?;
+            let (target_x, y, chat_w, chat_h) = chat_target_bounds(width, height);
+
+            // 从**当前真实位置**出发（可能正停在动画中途）。
+            // 必须在 `layout_main_webviews` **之前**读：layout 会把侧栏摆回目标位，
+            // 之后再读就只能读到目标位，滑出会从「完全打开」突然开始（可见跳变）。
+            //
+            // 夹到 `[target_x, width]`：
+            // - 下界：中途位置不该比目标更靠左（否则滑出会先向右倒退一下）；
+            // - 上界：窗口在侧栏可见期间被**改窄**时，旧位置可能已经在 `width` 之外，
+            //   从那里出发会「向左滑入可见区再消失」，看起来是闪一下。
+            //   夹到 `width` 后它就正好是「从屏幕边缘滑出」，观感正确。
+            //
+            // `Webview::position()` 返回**物理**坐标，要除 scale 换回逻辑单位 ——
+            // 这正是旧实现翻车的地方（物理/逻辑混用），所以这里显式换算并注释。
+            let from_x = chat
+                .position()
+                .ok()
+                .and_then(|p| main.scale_factor().ok().map(|s| p.x as f64 / s))
+                .map(|x| x.clamp(target_x, width))
+                .unwrap_or(target_x);
+
+            // ⚠️ **顺序：先起动画、再 layout**（与 v0.3.1 的 overlay 分支一致）。
+            //
+            // `slide_x_with` 会在返回前**同步**取得侧栏几何独占权，于是紧随其后的
+            // `layout_main_webviews` 只摆顶栏和内容页、**不碰侧栏**
+            // （否则它会把刚要从 `from_x` 出发的侧栏一把拽到 `target_x` ⇒ 闪一下）。
+            //
+            // 这一步同时把**内容页的宽度还回去**，这就是「白闪」的根治点：
+            // `CHAT_VISIBLE` 在上面已置 false，layout 据此算出 `docked = false`，
+            // 于是 docked 模式下内容页从「让出 chatW」恢复成整宽。
+            //
+            // 为什么这一次重排不会闪：内容页变宽与侧栏滑出**在同一时刻**开始，
+            // 变宽发生在侧栏**底下**；等侧栏滑走时，那一块已经有内容页画好了。
+            // v0.3.1 的 docked 分支是「先 layout 让宽、再 hide」——两者之间没有任何
+            // 过渡，`[target_x, width]` 那块会先空一帧再被内容页填上，看着就是白闪。
+            anim::slide_x_with(app, CHAT_LABEL, from_x, width, y, chat_w, chat_h, |app| {
+                if let Some(chat) = app.get_webview(CHAT_LABEL) {
+                    let _ = chat.hide();
+                }
+            });
+            layout_main_webviews(app);
             eprintln!("[DSHTauri] 对话侧栏已隐藏");
         } else {
             // ---------------- 打开 ----------------
@@ -751,55 +765,65 @@ fn toggle_chat_webview<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
             // （用户快速「关→开」、或在设置里切换 overlay/docked 时都会撞上。）
             anim::cancel();
 
-            if chat_docked() {
-                chat.show().map_err(|e| e.to_string())?;
-                CHAT_VISIBLE.store(true, Ordering::Relaxed);
-                // ⚠️ 顺序很重要：必须**先**把 CHAT_VISIBLE 置 true 再排版，
-                // 否则 `layout_main_webviews` 会认为侧栏不可见，docked 模式下
-                // 内容页仍占整宽、与刚显示出来的侧栏重叠。
-                //
-                // docked：内容页让出宽度，侧栏直接出现在并排位置（一次重排）。
-                // 不做逐帧滑动 —— 理由同上面的关闭分支：逐帧缩放会让内容页每帧重排。
-                layout_main_webviews(app);
+            // overlay：内容页整宽不动，侧栏从客户区右侧外滑入。
+            // 侧栏**尺寸全程不变**，所以动画期间不需要重排任何页面。
+            let (width, height) =
+                main_logical_size(&main).ok_or_else(|| "无法读取主窗口尺寸".to_string())?;
+            let (target_x, y, chat_w, chat_h) = chat_target_bounds(width, height);
+
+            // 起点怎么定，分两种情况：
+            //
+            // 1. **刚接管一个半途的滑出动画**：从当前位置接着滑回来，
+            //    观感是平滑反向，不会「跳」回屏幕外重来一次。
+            // 2. **侧栏本来就藏着**（含 docked 隐藏后切到 overlay）：
+            //    必须从「完全移出客户区右侧」的 `width` 出发。
+            //    ⚠️ 不能直接沿用「上次停留的 x」—— docked 隐藏时它停在 `target_x`，
+            //    而窗口在隐藏期间被改过宽度时它又可能落在可视区内；
+            //    两种情况都会让侧栏先「闪现」在某个位置再滑，看起来是闪一下。
+            //
+            // 两种都夹到 `[target_x, width]`：中途位置不该比目标更靠左（那会先倒退），
+            // 也不该超出屏幕外（那会多滑一段空白）。
+            let from_x = if was_animating {
+                resume_x
+                    .map(|x| x.clamp(target_x, width))
+                    .unwrap_or(width)
             } else {
-                // overlay：内容页整宽不动，侧栏从客户区右侧外滑入。
-                // 侧栏**尺寸全程不变**，所以动画期间不需要重排任何页面。
-                let (width, height) =
-                    main_logical_size(&main).ok_or_else(|| "无法读取主窗口尺寸".to_string())?;
-                let (target_x, y, chat_w, chat_h) = chat_target_bounds(width, height);
+                width
+            };
 
-                // 起点怎么定，分两种情况：
-                //
-                // 1. **刚接管一个半途的滑出动画**：从当前位置接着滑回来，
-                //    观感是平滑反向，不会「跳」回屏幕外重来一次。
-                // 2. **侧栏本来就藏着**（含 docked 隐藏后切到 overlay）：
-                //    必须从「完全移出客户区右侧」的 `width` 出发。
-                //    ⚠️ 不能直接沿用「上次停留的 x」—— docked 隐藏时它停在 `target_x`，
-                //    而窗口在隐藏期间被改过宽度时它又可能落在可视区内；
-                //    两种情况都会让侧栏先「闪现」在某个位置再滑，看起来是闪一下。
-                //
-                // 两种都夹到 `[target_x, width]`：中途位置不该比目标更靠左（那会先倒退），
-                // 也不该超出屏幕外（那会多滑一段空白）。
-                let from_x = if was_animating {
-                    resume_x
-                        .map(|x| x.clamp(target_x, width))
-                        .unwrap_or(width)
-                } else {
-                    width
-                };
+            // ⚠️ **先摆位、再 `show()`**：`show()` 是瞬时的，
+            // 如果它先执行，侧栏会在「上一次隐藏时停留的位置」上露一帧
+            // （docked 隐藏后就停在目标位 ⇒ 用户看到侧栏先闪现在目标位再跳去屏幕外）。
+            // 摆位必须在隐藏状态下完成，用户看不到这一步。
+            let _ = chat.set_position(tauri::LogicalPosition::new(from_x, y));
+            let _ = chat.set_size(tauri::LogicalSize::new(chat_w, chat_h));
+            chat.show().map_err(|e| e.to_string())?;
+            CHAT_VISIBLE.store(true, Ordering::Relaxed);
 
-                // ⚠️ **先摆位、再 `show()`**：`show()` 是瞬时的，
-                // 如果它先执行，侧栏会在「上一次隐藏时停留的位置」上露一帧
-                // （docked 隐藏后就停在目标位 ⇒ 用户看到侧栏先闪现在目标位再跳去屏幕外）。
-                // 摆位必须在隐藏状态下完成，用户看不到这一步。
-                let _ = chat.set_position(tauri::LogicalPosition::new(from_x, y));
-                let _ = chat.set_size(tauri::LogicalSize::new(chat_w, chat_h));
-                chat.show().map_err(|e| e.to_string())?;
-                CHAT_VISIBLE.store(true, Ordering::Relaxed);
-
-                // ⚠️ **先起动画、再排版**：`slide_x` 会在返回前**同步**取得几何独占权，
-                // 于是下面的 `layout_main_webviews` 会跳过侧栏
-                // （否则它会把刚摆到屏幕外的侧栏又拽回目标位 ⇒ 闪一下）。
+            // ⚠️ **先起动画、再排版**：`slide_x` 会在返回前**同步**取得几何独占权，
+            // 于是 `layout_main_webviews` 不会把刚摆到屏幕外的侧栏又拽回目标位。
+            //
+            // docked 与 overlay 在这里**唯一**的差别是「内容页什么时候收窄」：
+            //
+            // · overlay：内容页本来就整宽，layout 只是幂等地重摆一次 —— 随时调都行。
+            // · docked：内容页必须从整宽缩到「宽 - chatW」。**不能在动画开始时就缩**，
+            //   因为那一刻侧栏还在窗口外，`[target_x, width]` 那块会先变成没有页面
+            //   覆盖的空带（深色主题下就是用户看到的「白闪」），侧栏随后才滑进来盖住它。
+            //   所以改成**等侧栏滑到位（`on_done`）再缩**：收窄发生在侧栏**已经盖住**
+            //   右侧之后，那条空带从未露出来。
+            //
+            // 诚实说明：docked 下**必然有一次**内容页重排（并排模式本来就要变窄）。
+            // 本版把这次重排从「滑动过程中」挪到了「滑动结束、被侧栏遮住时」，
+            // 于是**滑动过程本身是零重排**的 —— 这正是 overlay 之所以顺的原因。
+            //
+            // `on_done` 在动画线程上执行；`layout_main_webviews` 只投递
+            // `set_position` / `set_size`（非阻塞消息），是线程安全的，
+            // 与关闭分支在 `on_done` 里调 `hide()` 同理。
+            if chat_docked() {
+                anim::slide_x_with(app, CHAT_LABEL, from_x, target_x, y, chat_w, chat_h, |app| {
+                    layout_main_webviews(app);
+                });
+            } else {
                 anim::slide_x(app, CHAT_LABEL, from_x, target_x, y, chat_w, chat_h);
                 layout_main_webviews(app);
             }
@@ -816,16 +840,16 @@ fn toggle_chat_webview<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         .parse()
         .map_err(|e| format!("对话页地址无效：{e}"))?;
 
-    // overlay 模式下**从客户区右侧外创建**，再滑入到目标位。
+    // **两种模式都从客户区右侧外创建**，再滑入到目标位 —— 与「已创建后打开」
+    // 走完全相同的路径，所以第一次点「网页对话」也有动画。
     //
-    // v0.3.0 这里是「直接创建在目标位」—— 也就是**第一次**点「网页对话」根本没有动画
-    // （只有第二次及以后才有）。用户第一次点看到的是「啪」地出现，观感与后续不一致。
-    // 现在统一：先建在屏幕外（此刻用户看不到，且页面正好利用这段时间开始加载），
-    // 再走和后续打开完全一样的滑入路径。
+    // v0.3.0 这里是「直接创建在目标位」—— 第一次点根本没有动画，观感与后续不一致。
+    // v0.3.1 只给 overlay 补了滑入，docked 仍然直接建在目标位（理由同样是
+    // 「逐帧缩放会让内容页重排」）。v0.3.2 起 docked 也滑入：
+    // 滑动期间内容页**不收窄**（见下面的 `on_done`），所以滑动过程零重排。
     //
-    // docked 模式仍然直接建在目标位：那种模式刻意不做滑动（逐帧缩放会让内容页重排）。
-    let slide_in = !chat_docked();
-    let create_x = if slide_in { width } else { x };
+    // 先建在屏幕外还有个额外好处：侧栏页面正好利用这段时间开始加载。
+    let create_x = width;
 
     main.add_child(
         child_webview_builder(app, CHAT_LABEL, WebviewUrl::External(url)),
@@ -835,14 +859,19 @@ fn toggle_chat_webview<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     .map_err(|e| format!("打开对话侧栏失败：{e}"))?;
 
     CHAT_VISIBLE.store(true, Ordering::Relaxed);
-    // ⚠️ 先起动画再排版：`slide_x` 返回时 `anim::is_animating()` 已同步置 true，
-    // 于是下面的 `layout_main_webviews` 会跳过侧栏，不会把它从屏幕外拽回目标位。
-    if slide_in {
+    // ⚠️ 先起动画再排版：`slide_x` / `slide_x_with` 返回时 `anim::is_animating()`
+    // 已同步置 true，于是 `layout_main_webviews` 不会把侧栏从屏幕外拽回目标位。
+    //
+    // docked：内容页在 `on_done`（侧栏滑到位、已经盖住右侧）之后才收窄，
+    // 避免「侧栏还在窗口外、右侧先空出一条带子」的那一帧（用户看到的就是白闪）。
+    if chat_docked() {
+        anim::slide_x_with(app, CHAT_LABEL, create_x, x, y, chat_width, chat_height, |app| {
+            layout_main_webviews(app);
+        });
+    } else {
         anim::slide_x(app, CHAT_LABEL, create_x, x, y, chat_width, chat_height);
+        layout_main_webviews(app);
     }
-    // 侧栏刚创建：`docked` 模式下内容页必须**立刻**让出宽度，
-    // 否则会出现「侧栏已经并排显示、内容页却还压在它下面」的一帧错位。
-    layout_main_webviews(app);
     // 这行日志是「缺陷 B 已修复」的运行时证据：能打印出来说明
     // `add_child` 返回了（没有在主线程上死锁），命令链顺利走完。
     eprintln!("[DSHTauri] 对话侧栏 webview 已创建");
@@ -1057,16 +1086,47 @@ fn themed_icon(theme: Option<Theme>) -> Option<Image<'static>> {
 ///
 /// 失败只忽略（拿不到图标或窗口时不影响主流程）。
 fn apply_theme_icons<R: Runtime>(app: &AppHandle<R>, theme: Option<Theme>) {
-    let Some(icon) = themed_icon(theme) else {
-        return;
-    };
-    // 托盘
-    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+    // ⚠️ 这里要区分**两套主题**，它们由 Windows 的两个独立开关控制：
+    //
+    //   · `AppsUseLightTheme`  → 应用窗口（tao 的 `Theme` 读的就是它）；
+    //   · `SystemUsesLightTheme` → **任务栏 / 托盘所在的外壳**。
+    //
+    // 用户在「个性化 → 颜色」选「自定义」时两者可以不一致。托盘和任务栏按钮都长在
+    // **任务栏**上，所以它们必须按**外壳**主题选色；窗口图标按**应用**主题选色。
+    //
+    // 这正是 v0.3.1「深色任务栏上鲸鱼看不见」的另一半原因（另一半是 Tauri 的
+    // `set_icon()` 只设 `ICON_SMALL`，见 `win_icon` 模块文档）。
+    let apps_light = matches!(theme, Some(Theme::Light));
+    let taskbar_light = win_icon::taskbar_prefers_light(apps_light);
+
+    let apps_icon = themed_icon(if apps_light { Some(Theme::Light) } else { Some(Theme::Dark) });
+    let taskbar_icon = themed_icon(if taskbar_light {
+        Some(Theme::Light)
+    } else {
+        Some(Theme::Dark)
+    });
+
+    // 托盘：长在任务栏上 ⇒ 按外壳主题选色。
+    if let (Some(tray), Some(icon)) = (app.tray_by_id(TRAY_ID), taskbar_icon.as_ref()) {
         let _ = tray.set_icon(Some(icon.clone()));
     }
+
+    let Some(icon) = apps_icon else {
+        return;
+    };
+
     // 主窗口（含任务栏按钮与无边框窗口的图标）
     if let Some(main) = app.get_window(MAIN_LABEL) {
+        // 小图标槽（标题栏 / Alt+Tab 小图）：按**应用**主题。
         let _ = main.set_icon(icon.clone());
+        // ⚠️ **大图标槽（任务栏按钮）必须单独设**：`set_icon()` 走 Tauri → tao 的
+        // `set_window_icon()`，它**只设 `ICON_SMALL`**；任务栏按钮渲染的是
+        // `ICON_BIG`。不补这一下，任务栏会一直用 exe 里那个静态的深藏青图标
+        // —— 正是 v0.3.1 用户看到的「深色任务栏上几乎看不见」。
+        // 而且它要按**外壳**主题选色（托盘同理）。详见 `win_icon` 模块文档。
+        if let Some(taskbar) = taskbar_icon.as_ref() {
+            win_icon::set_taskbar_icon(&main, taskbar);
+        }
     }
     // 选择窗口 / 关于 / 设置这些独立窗口也一并统一，避免同一程序出现两种图标。
     for label in [SELECTOR_LABEL, ABOUT_LABEL, SETTINGS_LABEL] {
@@ -1211,10 +1271,89 @@ async fn probe_url(url: String) -> Result<bool, String> {
     Ok(probe_tcp(host, port))
 }
 
-/// 返回显示用版本号：`v1.1.1` 或 `v1.1.1 Gen2`。
+/// 返回显示用版本号：`v.0.3.2`（Release）或 `v.0.3.2 RC`（RC）。
 #[tauri::command]
 fn app_version() -> String {
     APP_DISPLAY_VERSION.to_string()
+}
+
+/// 返回当前**发布通道**：`"release"` 或 `"rc"`。
+///
+/// 「关于」窗口的「检查更新」要用它判断用户当前跑的是哪条通道，
+/// 从而在**跨通道下载**（Release 用户去下 RC 版，或反过来）时先弹确认。
+#[tauri::command]
+fn app_channel() -> String {
+    APP_CHANNEL.to_string()
+}
+
+/// 在**系统默认浏览器**里打开一个下载链接（「关于」窗口的检查更新用）。
+///
+/// # 为什么需要这个命令
+///
+/// 前端直接 `window.location.href = url` 会让**「关于」窗口自己导航走**
+/// —— 用户点一次「下载」，关于窗口就变成浏览器的下载页，界面回不来了。
+/// 本项目**没有**启用 `tauri-plugin-opener` / `shell` 插件（依赖越少越好），
+/// 所以在这里用系统 API 打开。
+///
+/// # 为什么要在 Rust 侧校验协议
+///
+/// 只接受 `http` / `https`，拒绝 `file:`、`javascript:` 等 —— 否则前端一旦被
+/// 注入一个危险 scheme，就等于把它交给系统外壳执行。
+///
+/// `async`：与其他会触发窗口/系统动作的命令保持一致，避免占住主线程。
+#[tauri::command]
+async fn open_external(url: String) -> Result<(), String> {
+    let parsed = tauri::Url::parse(url.trim()).map_err(|e| format!("链接无效：{e}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => return Err(format!("拒绝打开不支持的协议 `{other}`（只允许 http / https）")),
+    }
+    open_url_in_system(&parsed.to_string())
+}
+
+/// 用系统默认程序打开 URL。
+///
+/// Windows 走 `ShellExecuteW`（不经过 cmd，避免命令注入与引号转义问题）；
+/// 其它平台走 `xdg-open`（本项目的验收平台只有 Windows，这里只为让 Linux 上的
+/// `cargo test` / `cargo check` 能编过，不做行为保证）。
+#[cfg(windows)]
+fn open_url_in_system(url: &str) -> Result<(), String> {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    // 转成 NUL 结尾的 UTF-16。
+    let to_wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+    let op = to_wide("open");
+    let file = to_wide(url);
+
+    // SAFETY: 两个字符串都是本函数内构造、以 NUL 结尾且在调用期间存活；
+    // hwnd 传 null（不需要父窗口），参数与返回值按 Win32 文档约定使用。
+    let ret = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            op.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // `ShellExecuteW` 返回值 > 32 表示成功（Win32 的历史约定，32 及以下是错误码）。
+    if ret as isize > 32 {
+        Ok(())
+    } else {
+        Err("系统无法打开链接（ShellExecuteW 返回错误码）".to_string())
+    }
+}
+
+/// 非 Windows：用 `xdg-open`。仅用于让其它平台的编译通过。
+#[cfg(not(windows))]
+fn open_url_in_system(url: &str) -> Result<(), String> {
+    std::process::Command::new("xdg-open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("无法调用 xdg-open：{e}"))
 }
 
 /// 自定义标题栏的窗口按钮。
@@ -1573,6 +1712,8 @@ pub fn run() {
             probe_url,
             open_main_window,
             app_version,
+            app_channel,
+            open_external,
             chrome_action,
             window_control,
             start_drag,
@@ -1676,6 +1817,46 @@ mod tests {
     #[test]
     fn themed_icon_falls_back_to_white_version() {
         assert!(themed_icon(None).is_some());
+    }
+
+    /// **任务栏**图标的配色依据是外壳主题（`SystemUsesLightTheme`），
+    /// 与**应用**主题（tao 的 `Theme`）是两个独立开关。
+    ///
+    /// 这条测试锁住「两者被分开处理」这个结构：`apply_theme_icons` 必须同时
+    /// 依据 `theme`（应用）与 `win_icon::taskbar_prefers_light`（外壳）来选图标。
+    /// 在非 Windows 上 `taskbar_prefers_light` 直接透传，所以断言是平台无关的。
+    #[test]
+    fn taskbar_theme_falls_back_to_apps_theme() {
+        // 非 Windows 上恒为透传；Windows 上仅在读不到注册表值时才透传。
+        // 两种情况下「透传」都是允许的默认行为，这里只断言不会 panic、
+        // 且返回的是布尔语义（浅色 / 深色）。
+        assert!(win_icon::taskbar_prefers_light(true));
+        assert!(!win_icon::taskbar_prefers_light(false));
+    }
+
+    /// v0.3.2 起 **docked 与 overlay 共用同一条滑出动画**：
+    /// 两种模式下侧栏的目标几何完全相同，差别只在内容页什么时候收窄。
+    ///
+    /// 这条测试是「docked 不再走无动画直切」的守卫 —— 若有人把 docked 改回
+    /// 「直接 hide」，它仍然通过（几何本来就一样），所以真正的行为守卫在
+    /// `verify-titlebar.mjs` 的静态检查里；这里锁住的是**几何前提**：
+    /// 动画的起点与终点在两种模式下是同一对值，因此动画实现无需分模式。
+    #[test]
+    fn slide_endpoints_are_mode_independent() {
+        let (width, height) = (1200.0, 800.0);
+        let (target_x, y, chat_w, chat_h) = chat_target_bounds(width, height);
+        // 滑出动画的终点是 `width`（完全移出客户区右侧），起点是目标位。
+        assert_eq!(target_x + chat_w, width, "侧栏目标位右边缘应等于窗口宽度");
+        assert_eq!(y, TITLEBAR_HEIGHT);
+        assert_eq!(chat_h, height - TITLEBAR_HEIGHT);
+
+        // 两种模式的 chat 目标几何必须一致（否则动画终点要分模式算）。
+        let (_, overlay_content, overlay_chat) = main_webview_rects(width, height, false);
+        let (_, docked_content, docked_chat) = main_webview_rects(width, height, true);
+        assert_eq!(overlay_chat, docked_chat, "两种模式的侧栏几何必须相同");
+        // 内容页是唯一分模式的量：docked 让出 chatW，overlay 占整宽。
+        assert_eq!(overlay_content.2, width);
+        assert_eq!(docked_content.2, width - chat_w);
     }
 
     /// 深色版应该是白鲸鱼，浅色版应该是深色鲸鱼——反色确实生效了。
@@ -1892,8 +2073,7 @@ mod tests {
 
     /// 窗口比侧栏还窄时不能算出负数宽度（docked 下内容宽度至少 1）。
     #[test]
-    fn docked_mode_clamps_content_width_on_tiny_window() {
-        let (_, content, chat) = main_webview_rects(300.0, 500.0, true);
+    fn docked_mode_clamps_content_width_on_tiny_window() {        let (_, content, chat) = main_webview_rects(300.0, 500.0, true);
         assert!(content.2 >= 1.0, "内容宽度被压成非正数：{}", content.2);
         assert_eq!(chat.2, 300.0, "窗口比侧栏窄时侧栏应压到窗口宽度");
         assert_eq!(chat.0, 0.0);
@@ -1971,22 +2151,28 @@ mod tests {
             "版本号不一致，用 `node scripts/version.mjs --set X.Y.Z` 同步"
         );
         // 绑到变量，避免 clippy 把常量断言判成无意义断言。
-        let generation: u32 = APP_GENERATION;
-        assert!(generation >= 1, "GenX 最小为 1");
+        let channel: &str = APP_CHANNEL;
+        assert!(
+            channel == "release" || channel == "rc",
+            "发布通道只能是 release 或 rc，实际是 {channel:?}"
+        );
     }
 
-    /// 版本显示规则：Gen1 不显示；从 Gen2 起显示 ` GenX`。
+    /// 版本显示规则：Release 不带后缀；RC 版显示 ` RC`。
+    ///
+    /// 这条测试是「GenX 已取消」的守卫：显示串里**不允许**再出现 `Gen`。
     #[test]
-    fn display_version_hides_gen1() {
-        let expected = if APP_GENERATION >= 2 {
-            format!("v{APP_VERSION} Gen{APP_GENERATION}")
+    fn display_version_marks_rc_only() {
+        let expected = if APP_CHANNEL == "rc" {
+            format!("v.{APP_VERSION} RC")
         } else {
-            format!("v{APP_VERSION}")
+            format!("v.{APP_VERSION}")
         };
         assert_eq!(APP_DISPLAY_VERSION, expected);
-        if APP_GENERATION == 1 {
-            assert!(!APP_DISPLAY_VERSION.contains("Gen"), "Gen1 不该显示 Gen");
-        }
+        assert!(
+            !APP_DISPLAY_VERSION.contains("Gen"),
+            "GenX 规则已取消，显示串里不该再有 Gen：{APP_DISPLAY_VERSION}"
+        );
     }
 
     /// 配置文件缺字段 / 是坏 JSON 时，必须退回默认值而不是崩掉。

@@ -121,6 +121,24 @@ fn release(generation: u32) {
     let _ = ANIM_OWNER.compare_exchange(generation, 0, Ordering::SeqCst, Ordering::SeqCst);
 }
 
+/// 收尾回调（`on_done`）现在还能不能执行 —— 即「我是否仍是最新的那次动画」。
+///
+/// # 为什么收尾也要查代次（v0.3.2 修复）
+///
+/// 代次检查只在**每帧开头**做（见 [`slide_x_with`] 的循环），而「这是末帧」是在
+/// 那之后算出来的。从「判定末帧」到「调用 `on_done`」之间存在窗口：用户此刻点了开关
+/// ⇒ [`cancel()`] 或新动画把代次 +1，本次动画**已经不是最新动作**了。
+///
+/// 此时 [`release`] 的 CAS 会正确拒绝清除独占权，但 `on_done` 若不复检就会照常执行。
+/// 后果很具体：关闭分支的收尾是 `chat.hide()`，于是**用户刚打开的侧栏被这个迟到的
+/// 回调立刻藏起来**（状态还是 `CHAT_VISIBLE=true` ⇒ 「点了没反应」）。
+///
+/// 所以「释放独占权」与「执行收尾」是**两件独立的事**，必须各自判断：
+/// 前者用 CAS（判断独占者是不是我），后者用代次比较（判断我是不是最新动画）。
+pub fn should_run_on_done(generation: u32) -> bool {
+    ANIM_GENERATION.load(Ordering::SeqCst) == generation
+}
+
 /// 系统是否允许播放动画（Windows 11 的「动画效果」开关）。
 ///
 /// 非 Windows 返回 true（开发机没有这个开关，动画照跑）。
@@ -368,6 +386,29 @@ where
                 // 用 CAS：只有「独占者仍然是我」才清得掉，
                 // 不会把这两步之间刚起跑的新动画的独占权误清（见 ANIM_OWNER）。
                 release(my_generation);
+
+                // ⚠️ **收尾前必须再查一次代次**（v0.3.2 修复的竞态）。
+                //
+                // 代次检查只在**每帧开头**（本循环顶部）做过一次，而 `last` 是在
+                // 那之后算出来的。从「判定末帧」到「调用 `on_done`」之间存在窗口：
+                // 用户此时点了开关 ⇒ `cancel()` 或新动画把代次 +1，
+                // 于是本次动画**已经不是最新动作**了。
+                //
+                // 此时 `release()` 的 CAS 会正确地**拒绝**清除（独占权已属于新动画），
+                // 但 `on_done` **没有任何保护** —— 旧动作的收尾照样会执行。
+                // 后果是真实且可见的：
+                //   · 关闭分支的 `on_done` 是 `chat.hide()` ⇒ 用户刚打开的侧栏
+                //     被这个迟到的回调立刻藏起来，表现为「点了没反应」
+                //     （状态还留在 `CHAT_VISIBLE=true`，即侧栏「开着但看不见」）；
+                //   · docked 打开分支的 `on_done` 是 `layout_main_webviews` ⇒
+                //     会在错误的时机收窄内容页。
+                //
+                // 这与本循环顶部注释里写明的意图（「被抢占时不调用 `on_done`」）
+                // 保持一致 —— 之前是实现漏了这一步。
+                if !should_run_on_done(my_generation) {
+                    return;
+                }
+
                 on_done(&app);
                 return;
             }
@@ -837,6 +878,62 @@ mod tests {
         ANIM_OWNER.store(gen, Ordering::SeqCst);
         release(gen);
         assert!(!is_animating(), "独占者释放后必须变为「无动画」");
+    }
+
+    /// **末帧的 `on_done` 也必须受代次保护**（v0.3.2 修掉的竞态）。
+    ///
+    /// # 这个竞态为什么真实
+    ///
+    /// 代次检查只在**每帧开头**做一次，而 `last` 是在那之后算出来的。
+    /// 于是「判定末帧 → 调用 `on_done`」之间有一个窗口：用户此时点了开关，
+    /// `cancel()` 会把代次 +1。`release()` 的 CAS 会**正确拒绝**清除独占权，
+    /// 但如果 `on_done` 没有复检代次，**旧动作的收尾照样会执行** ——
+    /// 关闭分支的收尾是 `chat.hide()`，于是用户刚打开的侧栏被立刻藏起来
+    /// （`CHAT_VISIBLE=true` 但不可见 = 「点了没反应」）。
+    ///
+    /// 这里把那段判定逻辑抽出来直接单测：`should_run_on_done(my_gen)` 在
+    /// 「代次已被 cancel() 推进」之后必须返回 `false`。
+    #[test]
+    fn stale_animation_must_not_run_on_done() {
+        let _guard = lock_globals();
+        cancel();
+        // 模拟：本次动画取得代次 N。
+        let my_generation = ANIM_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        ANIM_OWNER.store(my_generation, Ordering::SeqCst);
+
+        // 正常情况：没人抢占 ⇒ 收尾应当执行。
+        assert!(
+            should_run_on_done(my_generation),
+            "没有被抢占时，on_done 必须执行（否则侧栏永远收不了尾）"
+        );
+
+        // 模拟用户在「判定末帧」与「执行收尾」之间点了开关。
+        cancel();
+        assert!(
+            !should_run_on_done(my_generation),
+            "被 cancel() 抢占后，旧动画的 on_done 绝不能执行 —— \
+             否则旧的 hide() 会把用户刚打开的侧栏藏掉"
+        );
+    }
+
+    /// 模拟「新动画接管」的场景：旧代次的收尾同样必须被拒绝。
+    #[test]
+    fn newer_animation_blocks_older_on_done() {
+        let _guard = lock_globals();
+        cancel();
+        let old_generation = ANIM_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        // 新动画接管。
+        let new_generation = ANIM_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        ANIM_OWNER.store(new_generation, Ordering::SeqCst);
+
+        assert!(
+            !should_run_on_done(old_generation),
+            "新动画接管后，旧动画的 on_done 必须被拒绝"
+        );
+        assert!(
+            should_run_on_done(new_generation),
+            "新动画自己仍应能正常收尾"
+        );
     }
 }
 

@@ -703,7 +703,22 @@ const animRaw = readIfExists(ANIM_RS);
 check(`${ANIM_RS} 存在（侧栏过渡动画模块）`, animRaw !== null, `找不到 ${ANIM_RS}`);
 
 if (animRaw !== null) {
-  const animCode = findCodeMatches(animRaw, /./).length > 0 ? animRaw : animRaw;
+  // ⚠️ **必须是剔除注释后的代码**，不能直接用原文。
+  //
+  // 这里原本写的是 `findCodeMatches(animRaw, /./).length > 0 ? animRaw : animRaw`
+  // —— 两个分支都是 `animRaw`，整个表达式**恒等于原文**，等于完全没用上
+  // `findCodeMatches`。后果：下面的断言扫的是**含注释的源码**，
+  // 于是「在注释里写一句 `ANIM_GENERATION` 防抢占」就能让断言通过（假绿）。
+  // 实测过：把真代码全删、只在注释里留关键词，旧写法仍然 PASS。
+  //
+  // 现在按行剔注释（`//` 与 `///` 整行 + 行尾），得到 `animCode` 供断言使用。
+  // 注意：只用于「某 token 是否出现在**代码**里」这类判断；
+  // `SLIDE_MS` 的取值仍从原文提取（正则本身就要求是代码形态的 `const`）。
+  const animCode = animRaw
+    .split("\n")
+    .filter((line) => !/^\s*\/\//.test(line))
+    .map((line) => line.replace(/\/\/.*$/, ""))
+    .join("\n");
 
   // 必须尊重系统的「动画效果」开关：关掉时不能硬放动画。
   check(
@@ -733,6 +748,172 @@ if (animRaw !== null) {
     ms !== null && Number(ms[1]) >= 100 && Number(ms[1]) <= 300,
     ms ? `实际 SLIDE_MS = ${ms[1]}ms` : "没找到 SLIDE_MS 常量",
   );
+
+  // ⚠️ **末帧的 on_done 必须复检代次**（v0.3.2 修的竞态）。
+  //
+  // 为什么这条必须是**静态**检查：动画跑在 `std::thread::spawn` 出来的线程里，
+  // 单测只能覆盖抽出来的纯函数 `should_run_on_done`，**覆盖不到循环有没有真的调它**。
+  // 实测过：把循环里的这行删掉（退回 v0.3.1 的行为），`cargo test` **依然 48 全绿**
+  // —— 纯函数测试对「调用点被删除」完全无感。所以这里补一条结构断言。
+  //
+  // 竞态本身：代次检查只在每帧开头做，而 `last` 是之后算的；用户若在
+  // 「判定末帧 → 调用 on_done」之间点开关，旧收尾（关闭分支是 `chat.hide()`）
+  // 会把用户刚打开的侧栏藏掉 ⇒ `CHAT_VISIBLE=true` 但不可见 =「点了没反应」。
+  // ⚠️ 断言写法刻意**宽松**：只要求「在 `if` 条件里引用了
+  // `should_run_on_done(my_generation)`」，不绑定具体的语句形态。
+  //
+  // 为什么不用更严格的 `if !f() { return; }`：那样会把**语义等价**的改写
+  // （例如 `if f() { } else { return; }`）误报成失败 —— 独立验证专门指出过这点。
+  // 假阴性（噪音）比假阳性（漏掉真回归）危害小，但仍应避免。
+  //
+  // 「调用点被删除」由下一条**顺序断言**兜住：函数**定义**里是
+  // `should_run_on_done(generation)`（形参名不同），所以一旦调用点被删，
+  // `guardIdx` 就是 -1，顺序断言必然失败。两条合起来既宽松又不漏。
+  check(
+    "末帧调用 on_done 前会复检代次（should_run_on_done）",
+    /if\s*!?\s*should_run_on_done\s*\(\s*my_generation\s*\)/.test(animCode),
+    "on_done 前没有在 `if` 条件里复检代次 —— " +
+      "被抢占的旧动画仍会执行收尾（关闭分支的 hide() 会把刚打开的侧栏藏掉）",
+  );
+
+  // 反向断言：`on_done(&app)` 必须出现在那次复检**之后**。
+  //
+  // 注意 `should_run_on_done(generation)` 的函数**定义**不匹配
+  // `my_generation`，所以这里找到的一定是**调用点**，不会自我满足。
+  const onDoneIdx = animCode.indexOf("on_done(&app)");
+  const guardIdx = animCode.indexOf("should_run_on_done(my_generation)");
+  check(
+    "on_done 的调用点位于代次复检之后",
+    guardIdx !== -1 && onDoneIdx !== -1 && guardIdx < onDoneIdx,
+    guardIdx === -1
+      ? "代码里找不到 `should_run_on_done(my_generation)` 调用 —— 守卫被删了"
+      : "on_done 在代次复检之前就被调用了 —— 复检形同虚设",
+  );
+}
+
+/* ================================================================== 9. 外部链接交给系统浏览器 */
+
+section("9. 下载链接交给系统浏览器（不让「关于」窗口自己导航走）");
+
+{
+  // 「关于」窗口点「下载」若直接 `location.href = url`，窗口本身会被导航到
+  // GitHub 的下载页 ⇒ 用户回不到界面。所以必须有 Rust 侧命令用系统外壳打开。
+  const openCmd = findCodeMatches(libRaw, /async\s+fn\s+open_external\s*\(/);
+  check(
+    "lib.rs 定义了 open_external 命令（用系统默认浏览器打开链接）",
+    openCmd.length > 0,
+    "没有 open_external —— 「关于」窗口点下载会把自己导航走",
+  );
+
+  // 必须校验协议，避免把危险 scheme 交给系统外壳执行。
+  check(
+    "open_external 只允许 http / https",
+    /fn\s+open_external[\s\S]{0,600}?"http"\s*\|\s*"https"/.test(libRaw),
+    "open_external 没有做协议白名单 —— 前端若被注入 file:/javascript: 会被系统执行",
+  );
+
+  // Windows 上用 ShellExecuteW（不经过 cmd，避免引号/注入问题）。
+  check(
+    "Windows 分支用 ShellExecuteW 打开链接",
+    /ShellExecuteW\s*\(/.test(libRaw),
+    "没有用 ShellExecuteW —— 用 cmd start 之类会引入引号转义与注入风险",
+  );
+
+  // 命令必须真的注册进 invoke_handler，否则前端调用会失败。
+  check(
+    "open_external 已注册进 invoke_handler",
+    /open_external\s*,/.test(libRaw),
+    "open_external 没注册 —— 前端 invoke 会直接报「命令不存在」",
+  );
+
+  const aboutJs = readIfExists("src/about.js");
+  if (aboutJs !== null) {
+    // 前端必须调这个命令，而不是直接改 location。
+    check(
+      'about.js 用 invoke("open_external") 打开下载',
+      /invoke\(\s*"open_external"\s*,\s*\{\s*url\s*\}\s*\)/.test(aboutJs),
+      "about.js 没有调用 open_external —— 下载会让「关于」窗口自己被导航走",
+    );
+    // location.href 只允许作为降级路径出现一次。
+    const hrefUses = findCodeMatches(aboutJs, /window\.location\.href/);
+    check(
+      "about.js 里 location.href 仅作为降级路径（最多 1 处）",
+      hrefUses.length <= 1,
+      `location.href 出现了 ${hrefUses.length} 处 —— 它只应作为 open_external 失败后的兜底`,
+    );
+  }
+}
+
+/* ================================================================== 10. NSIS 开始菜单图标修复钩子 */
+
+section("10. NSIS 开始菜单图标修复钩子");
+
+{
+  const hooks = readIfExists("src-tauri/nsis-hooks.nsh");
+  check("找到 src-tauri/nsis-hooks.nsh", hooks !== null, "找不到 nsis-hooks.nsh");
+
+  if (hooks !== null) {
+    // 只留代码行（丢掉整行 `;` 注释），避免注释里的字眼骗过断言
+    // —— 这正是第 8 节那个假绿的同类问题，这里一开始就避开。
+    const hookCode = hooks
+      .split("\n")
+      .filter((l) => !/^\s*;/.test(l))
+      .join("\n");
+
+    check(
+      "定义了 NSIS_HOOK_POSTINSTALL（覆盖安装也要跑）",
+      /!macro\s+NSIS_HOOK_POSTINSTALL\b/.test(hookCode),
+      "没有 NSIS_HOOK_POSTINSTALL —— 模板自带的函数在 $UpdateMode=1 时直接 Return，旧图标永远修不好",
+    );
+    // ⚠️ 钩子**不能**被 $UpdateMode 守卫，否则就失去「修好旧安装」的意义。
+    check(
+      "钩子体内没有 $UpdateMode 守卫（否则更新时不会修复）",
+      !/\$UpdateMode/.test(hookCode),
+      "钩子里出现了 $UpdateMode —— 更新模式下会跳过，旧安装的开始菜单图标修不好",
+    );
+    check(
+      "钩子重建快捷方式时显式指定了 startmenu.ico",
+      /CreateShortcut[^\n]*startmenu\.ico/.test(hookCode),
+      "CreateShortcut 没指定 startmenu.ico —— 图标仍会继承 exe 资源（就是本次缺陷的成因）",
+    );
+    check(
+      "钩子调用 SHChangeNotify 刷新 shell 图标缓存",
+      /SHChangeNotify/.test(hookCode),
+      "没有 SHChangeNotify —— .lnk 已改对但资源管理器仍显示缓存里的旧图标",
+    );
+    // 启用了 startMenuFolder 时，必须从注册表读回文件夹名（不能假设变量还有值：
+    // 静默/被动安装会 Skip 掉 MUI_PAGE_STARTMENU）。
+    //
+    // ⚠️ 正则要匹配模板里的**完整**写法 `!if "${STARTMENUFOLDER}" != ""`。
+    // 初版漏掉了 `}` 与 `"` 之间的那部分，写成 `STARTMENUFOLDER\}\s*!=`，
+    // 于是永远为 false ⇒ 这条断言**从未执行**，把 GETFOLDER 删掉也照样全绿
+    // （变异测试发现的第二个假绿）。
+    const usesFolder = /STARTMENUFOLDER\}\s*"\s*!=\s*""/.test(hookCode);
+    if (usesFolder) {
+      check(
+        "启用 startMenuFolder 时用 MUI_STARTMENU_GETFOLDER 读回路径",
+        /MUI_STARTMENU_GETFOLDER/.test(hookCode),
+        "直接用 $AppStartMenuFolder 而不 GETFOLDER —— 静默安装（/S）下该变量可能为空，会算出错路径",
+      );
+    }
+    // 结构平衡：宏与预处理条件必须配对。
+    const count = (re) => (hookCode.match(re) ?? []).length;
+    check(
+      "NSIS 宏与预处理条件结构平衡（!macro/!if/${If} 配对）",
+      count(/^\s*!macro\s/gm) === count(/^\s*!macroend/gm) &&
+        count(/^\s*!if\b/gm) === count(/^\s*!endif\b/gm) &&
+        count(/\$\{If\}/g) === count(/\$\{EndIf\}/g),
+      `!macro=${count(/^\s*!macro\s/gm)} !macroend=${count(/^\s*!macroend/gm)} ` +
+        `!if=${count(/^\s*!if\b/gm)} !endif=${count(/^\s*!endif\b/gm)} ` +
+        `If=${count(/\$\{If\}/g)} EndIf=${count(/\$\{EndIf\}/g)}`,
+    );
+    // 桌面快捷方式的既有行为不能被破坏。
+    check(
+      "保留了 MUI_FINISHPAGE_SHOWREADME_NOTCHECKED（桌面快捷方式默认不勾选）",
+      /MUI_FINISHPAGE_SHOWREADME_NOTCHECKED/.test(hookCode),
+      "丢了 MUI_FINISHPAGE_SHOWREADME_NOTCHECKED —— 完成页的「创建桌面快捷方式」会恢复默认勾选",
+    );
+  }
 }
 
 if (lib !== null) {
@@ -751,12 +932,102 @@ if (lib !== null) {
     `只找到 ${cancels.length} 处 anim::cancel()，至少应有 2 处（Resized + hide_main_windows）`,
   );
 
-  // overlay 模式才做滑动；docked 模式必须避开逐帧重排。
+  // v0.3.2：两种模式共用同一条滑动路径，差别只在「内容页什么时候收窄」。
+  //
+  // 关键不变量（这是 v0.3.1 docked「白闪」的根治点）：
+  //   · 关闭分支：先起动画（slide_x_with）→ 再 layout，layout 负责把内容页宽度还回去；
+  //   · 打开分支：docked 必须用 slide_x_with + on_done 里 layout，**不能**在动画开始前
+  //     就 layout（那会让内容页先收窄、右侧露出一条没有页面覆盖的空带 = 白闪）。
+  //
+  // ⚠️ 断言必须**限定在打开分支的代码区间内**。
+  // 第一版写成对全文匹配 `if chat_docked() { ... slide_x_with`，
+  // 结果把「关闭分支」和「首次创建分支」的 slide_x_with 也匹配上了 ——
+  // 故意把打开分支改回 v0.3.1 的错误写法，校验**依然全绿**（假绿）。
+  // 现在先按注释锚点切出「打开」区间，再在区间内断言。
+  const openRegion = (libRaw.split("---------------- 打开 ----------------")[1] ?? "").split(
+    "首次打开",
+  )[0];
+
   check(
-    "toggle_chat_webview 按模式区分：docked 不做逐帧重排",
+    "toggle_chat_webview 按模式分流，且 docked 的收窄发生在动画之后",
     /if\s+chat_docked\s*\(\s*\)/.test(libRaw),
-    "没看到按 chat_docked() 分流的逻辑 —— docked 模式下逐帧改宽度会导致内容页每帧重排",
+    "没看到按 chat_docked() 分流的逻辑 —— docked 模式的内容页收窄时机必须与 overlay 不同",
   );
+
+  // docked 打开分支必须**紧接** slide_x_with（带 on_done），在回调里才 layout。
+  // 若有人改回「先 layout 再动画」或退回裸 slide_x，这里会失败。
+  check(
+    "docked 打开分支用 anim::slide_x_with（on_done 里才收窄内容页）",
+    openRegion !== "" && /if\s+chat_docked\s*\(\s*\)\s*\{\s*anim::slide_x_with/.test(openRegion),
+    openRegion === ""
+      ? "没能在 lib.rs 里定位「打开」分支区间（注释锚点被改动？）"
+      : "docked 打开分支没有紧跟 anim::slide_x_with —— 内容页会在侧栏滑入前就收窄，右侧露出一条无内容带（用户看到的是白闪）",
+  );
+
+  // 打开分支的 on_done 里必须真的调 layout_main_webviews，否则内容页永远不让出宽度。
+  check(
+    "docked 打开分支的 on_done 回调里会调 layout_main_webviews",
+    openRegion !== "" &&
+      /slide_x_with[\s\S]{0,300}?layout_main_webviews/.test(openRegion),
+    openRegion === ""
+      ? "没能在 lib.rs 里定位「打开」分支区间"
+      : "on_done 里没有 layout_main_webviews —— docked 模式下内容页不会让出宽度，侧栏会盖在内容页上",
+  );
+
+  // 首次创建分支也必须让 docked 走 on_done 收窄（否则第一次点「网页对话」会露出空带）。
+  const createRegion = (libRaw.split("首次打开")[1] ?? "").split("对话侧栏 webview 已创建")[0];
+  check(
+    "首次创建侧栏时 docked 同样走 on_done 收窄（第一次打开也不露空带）",
+    createRegion !== "" &&
+      /if\s+chat_docked\s*\(\s*\)\s*\{\s*anim::slide_x_with/.test(createRegion),
+    createRegion === ""
+      ? "没能在 lib.rs 里定位「首次打开」分支区间（注释锚点被改动？）"
+      : "首次创建分支里 docked 没有用 slide_x_with —— 第一次点「网页对话」时右侧会先露出一条无内容带",
+  );
+
+  // 任务栏图标：Tauri 的 set_icon 只设 ICON_SMALL，必须额外补 ICON_BIG，
+  // 否则任务栏按钮一直用 exe 里那个静态图标（v0.3.1 用户实测的缺陷）。
+  check(
+    "win_icon 模块存在（任务栏大图标槽）",
+    /^\s*mod\s+win_icon\s*;/m.test(libRaw),
+    "lib.rs 里没有 `mod win_icon;` —— 任务栏图标不会跟随主题",
+  );
+  check(
+    "apply_theme_icons 会设置任务栏大图标（ICON_BIG）",
+    /set_taskbar_icon\s*\(/.test(libRaw),
+    "没有调用 win_icon::set_taskbar_icon —— Tauri 的 set_icon() 只设 ICON_SMALL，任务栏不会变",
+  );
+
+  // 任务栏跟随的是**外壳**主题（SystemUsesLightTheme），不是应用主题。
+  const winIcon = readIfExists("src-tauri/src/win_icon.rs");
+  if (winIcon !== null) {
+    check(
+      "win_icon.rs 读 SystemUsesLightTheme（任务栏跟外壳主题，不是应用主题）",
+      /SystemUsesLightTheme/.test(winIcon),
+      "win_icon.rs 没有读 SystemUsesLightTheme —— 「应用浅色 + 系统深色」时任务栏图标会选错配色",
+    );
+    check(
+      "win_icon.rs 用 CreateIcon 从 RGBA 现场造 HICON",
+      /CreateIcon\s*\(/.test(winIcon),
+      "win_icon.rs 没有用 CreateIcon —— 图标是编译期内嵌的 PNG，没有文件路径可给 LoadImageW",
+    );
+    // ⚠️ 必须断言**调用点**用的是 ICON_BIG，不能只 grep 文件里有没有 `ICON_BIG`
+    // 这个字符串 —— 文件顶部 `use ...::{CreateIcon, SendMessageW, ICON_BIG, WM_SETICON}`
+    // 里就有它，于是「把调用点改成 ICON_SMALL/0」这种真实回归会被判成通过（假绿）。
+    // 实测过：只查字符串时该变异存活；改成查 `SendMessageW(...WM_SETICON, ICON_BIG...)
+    // 的调用点后才抓得住。
+    check(
+      "win_icon.rs 的 SendMessageW 调用点用 ICON_BIG（不是只 import 了它）",
+      /SendMessageW\s*\([^;]*WM_SETICON\s*,\s*ICON_BIG/s.test(winIcon),
+      "win_icon.rs 的 SendMessageW 调用没有传 ICON_BIG —— 设成 ICON_SMALL 等于重复 Tauri 已有的行为，任务栏仍不变",
+    );
+    // 反向断言：调用点不能出现字面量 0（= ICON_SMALL）。
+    check(
+      "win_icon.rs 的 SendMessageW 调用点没有用字面量 0（ICON_SMALL）",
+      !/SendMessageW\s*\([^;]*WM_SETICON\s*,\s*0\b/s.test(winIcon),
+      "win_icon.rs 把 ICON_SMALL（0）传给了 WM_SETICON —— 那是 Tauri 已经在做的，任务栏不会变",
+    );
+  }
 }
 
 /* ------------------------------------------------------------------ 汇总 */

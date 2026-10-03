@@ -150,12 +150,23 @@ Tauri 对图标有硬性要求：
 
 **绝对不要**把 `.png` 直接改名成 `.ico` —— 文件头不对，`makensis` 会拒绝。
 
-**正确做法**（本项目）：
+**正确做法**（本项目，v0.3.2 起）：
 
 ```bash
-node scripts/make-icon.mjs      # 生成 1024x1024 的 app-icon.png
-npm run icon                    # = tauri icon app-icon.png，派生全套尺寸
+npm run icon                    # = node scripts/post-icon.mjs → scripts/make-logo.mjs
 ```
+
+⚠️ **不要**再跑 `tauri icon app-icon.png`：`app-icon.png`、`deepseek.ico`、
+`deepseek_harness.ico`、`scripts/make-icon.mjs` 已在 v0.3.2 删除。
+图标现在只有**一个**来源 —— `scripts/make-logo.mjs`，它从 `src-tauri/icons/`
+里同一只鲸鱼的深浅两套配色（`tray-light.png` / `tray-dark.png`）派生全部产物：
+
+| 产物 | 用途 |
+| --- | --- |
+| `icon.ico`（7 档） | exe 资源、安装包 / 卸载器图标、资源管理器文件图标 |
+| `startmenu.ico`（7 档） | **开始菜单快捷方式专用**（白鲸鱼 + 细描边，深浅背景都可读） |
+| `app-dark.png` / `app-light.png` | 运行时按主题切换的窗口 / 任务栏 / 托盘图标 |
+| 各尺寸 PNG | `bundle.icon` 与 Windows Store 资源 |
 
 校验生成的 ico：
 
@@ -163,7 +174,8 @@ npm run icon                    # = tauri icon app-icon.png，派生全套尺寸
 python3 -c "import struct;d=open('src-tauri/icons/icon.ico','rb').read();n=struct.unpack('<H',d[4:6])[0];print('entries:',n,[ (d[6+i*16] or 256) for i in range(n)])"
 ```
 
-本项目 `icons/icon.ico` 实测为 `type=1, count=6`，尺寸 `16/24/32/48/64/256`，每档都是内嵌 PNG。
+本项目 `icons/icon.ico` 实测为 `type=1, count=7`，尺寸 `256/128/64/48/32/24/16`，
+每档都是内嵌 PNG。
 
 其它易错点：
 - `bundle.icon` 的路径**相对于 `src-tauri/`**，所以写 `"icons/icon.ico"` 而不是 `"src-tauri/icons/icon.ico"`。

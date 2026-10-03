@@ -1,13 +1,69 @@
 # 更新日志
 
-版本号规则见 [README §0.5](README.md#05-版本规则vabc-genx)：**`v.A.B.C GenX`**。
+版本号规则见 [README §6.3](README.md#63-版本规则)：**`v.A.B.C`**，RC 版附 ` RC` 后缀。
 
-- `A` 文集网页核心版本 · `B` 重要功能版本 · `C` 普通更新 · `GenX` 同一个 `C` 内的补丁快照
-- **`C` 提升时 `Gen` 立即重置为 1**；`Gen1` 不显示后缀
+- `A` 主版本（不兼容的大改动）· `B` 功能版本（新增能力）· `C` 修订版本（修缺陷）
+- **发布通道**：`Release` 版**不带后缀**（`v.0.3.2`）；`RC`（候选版）显示为 **`v.0.3.2 RC`**，
+  在 GitHub 上发布为 **prerelease**。`GenX` 规则**已取消**。
 - 只记录**面向用户的变化**；纯内部调整放到「内部」小节
 - 每次改版本号时，在下面**顶部**加一条新记录
 
-发版三步：`node scripts/version.mjs --set X.Y.Z`（或 `--bump-gen`）→ 在本文件顶部加记录 → 提交推送。
+发版三步：`node scripts/version.mjs --set X.Y.Z`（发 RC 前先 `--set-channel rc`）→ 在本文件顶部加记录 → 提交推送。
+
+---
+
+## v0.3.2
+
+修复「并排（docked）」模式的过渡动画；开始菜单与任务栏图标改为统一鲸鱼；版本规则改用 RC / Release 双通道。
+
+### 变更
+
+- **版本规则重做：取消 `GenX`，改为 `RC` / `Release` 双通道**
+  - 版本号格式 `v.A.B.C`；**RC 版**（release candidate，候选版）显示为 **`v.0.3.2 RC`**，
+    **Release 版**不带任何后缀。
+  - `version.json` 现在只存渠道：`{"channel":"release"}`；`--bump-gen` **已移除**，
+    改用 `node scripts/version.mjs --set-channel release|rc` 切换渠道。
+  - GitHub 发布时 RC 版**自动标记为 prerelease**（此前 workflow 里硬编码 `prerelease: false`），
+    tag 用 `v.0.3.2-rc`、正式版用 `v.0.3.2`，两者不会互相覆盖。
+  - 本版为 `v.0.3.2`（Release，无后缀）。
+- **「关于 → 检查更新」现在同时查询两条通道**，把 Release 与 RC 的版本**并列显示**，
+  并标出当前运行的是哪一条；**跨通道下载**（如 Release 用户去下 RC 版）会先弹确认。
+
+### 修复
+
+- **「并排（docked）」模式的侧栏过渡动画**
+  - 根因：v0.3.1 的 docked 模式**完全不做滑动**（当时判断「逐帧缩放会让内容页每帧重排」），
+    直接切到位 —— 用户看到的仍是「啪一下跳过去」，并且切换瞬间右侧会先露出一条
+    **没有页面覆盖的空带**（深色主题下就是白闪），侧栏才盖上来。
+  - 现在 docked 与 overlay **共用同一条滑动路径**：滑动期间内容页**不收窄**，
+    等侧栏滑到位（`on_done`）才让出宽度。于是滑动过程本身**零重排**，
+    那一次必然发生的重排被挪到「侧栏已经盖住右侧之后」，空带不再露出。
+- **开始菜单图标仍是旧图（白色圆角方块 + 深色鲸鱼）**
+  - 根因有两层：Tauri 的 NSIS 模板创建快捷方式时**没有传 `IconFile`**（于是图标继承
+    exe 内嵌资源）；而且模板的 `CreateOrUpdateStartMenuShortcut` 在**更新模式**下
+    直接 `Return` —— **覆盖安装永远不会修好已存在的旧快捷方式**。
+  - 现在新增 `NSIS_HOOK_POSTINSTALL` 钩子，**无条件**重建开始菜单快捷方式并显式指定图标，
+    同时调 `SHChangeNotify` 刷新 shell 图标缓存。
+  - 开始菜单专用图标 `startmenu.ico` = **白鲸鱼 + 细描边**：`.lnk` 的图标是静态的、
+    **不跟随系统主题**，所以用深浅背景都能看清的配色（深藏青版在深色开始菜单上几乎看不见）。
+- **任务栏按钮图标不跟随主题（深色任务栏上鲸鱼几乎看不见）**
+  - 根因同样有两层：
+    1. Tauri 的 `Window::set_icon()` 最终只设置 **`ICON_SMALL`** 槽，而任务栏按钮渲染的是
+       **`ICON_BIG`**；tao 里有 `set_taskbar_icon()`（用 `ICON_BIG`）但 **Tauri 完全没有暴露它**，
+       所以任务栏一直用 exe 里那个静态图标。
+    2. 任务栏跟的是**外壳**主题（注册表 `SystemUsesLightTheme`），而 tao 的 `Theme` 读的是
+       **应用**主题（`AppsUseLightTheme`）。用户在「个性化 → 颜色」选「自定义」时两者不一致，
+       就会给深色任务栏选到深藏青图标。
+  - 现在新增 `src/win_icon.rs`：直接从内嵌 PNG 造 `HICON` 并**单独设置 `ICON_BIG`**，
+    且按 `SystemUsesLightTheme` 选色（托盘同理，因为它也长在任务栏上）。
+
+### 内部
+
+- 删除历史遗留、已无代码引用的图标素材与脚本：`app-icon.png`、`deepseek.ico`、
+  `deepseek_harness.ico`、`scripts/make-icon.mjs`。图标现在只有**一个**来源：
+  `scripts/make-logo.mjs`（`npm run icon` 直接指向它，不再绕 `tauri icon`）。
+- 静态校验从 39 项增加到 48 项，新增的 9 项锁住本版的动画顺序与任务栏图标行为；
+  每一项都做了**变异测试**（故意改坏代码，确认校验会失败），避免出现「假绿」。
 
 ---
 
@@ -236,7 +292,7 @@
 
 - 作业对象是 Windows 机制；Linux 开发机上的 `sh` 分支**没有**这个保证（目标平台是 Windows）。
 - 如果你反而希望本地服务在关掉 GUI 后继续跑，就别勾「自动启动本地服务」，
-  改用计划任务 / NSSM 之类的外部守护（见 [README §6](README.md#6-src-taurisrclibrs--mainrs)）。
+  改用计划任务 / NSSM 之类的外部守护（见 [CONTRIBUTER_README §6](CONTRIBUTER_README.md#6-src-taurisrclibrs--mainrs)）。
 
 ---
 

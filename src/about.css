@@ -5,6 +5,9 @@
   --border: #d0d7de;
   --box: #f6f8fa;
   --accent: #0969da;
+  --ok: #1a7f37;
+  --warn: #9a6700;
+  --danger: #cf222e;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -15,6 +18,9 @@
     --border: #30363d;
     --box: #161b22;
     --accent: #2f81f7;
+    --ok: #3fb950;
+    --warn: #d29922;
+    --danger: #f85149;
   }
 }
 
@@ -33,19 +39,23 @@ body {
 .wrap {
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 10px;
   height: 100%;
-  padding: 20px;
+  padding: 16px;
+  overflow-y: auto;
 }
 
 .head { display: flex; align-items: center; gap: 12px; }
 
-.logo { font-size: 34px; line-height: 1; }
+.logo { font-size: 32px; line-height: 1; }
 
 h1 { margin: 0; font-size: 19px; }
 h2 { margin: 0 0 6px; font-size: 13px; }
 
 .ver {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   margin: 2px 0 0;
   font: 12px ui-monospace, Consolas, monospace;
   color: var(--muted);
@@ -54,7 +64,7 @@ h2 { margin: 0 0 6px; font-size: 13px; }
 .desc { margin: 0; color: var(--muted); }
 
 .box {
-  padding: 12px 14px;
+  padding: 10px 12px;
   background: var(--box);
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -69,6 +79,83 @@ h2 { margin: 0 0 6px; font-size: 13px; }
 .selectable { -webkit-user-select: text; user-select: text; }
 
 #update { white-space: pre-wrap; word-break: break-all; }
+
+/* --------------------------------------------------- 通道徽标 / 结果块 */
+
+.badge {
+  display: inline-block;
+  padding: 1px 7px;
+  font: 11px/1.5 "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+}
+
+.badge.release { color: var(--accent); border-color: var(--accent); }
+.badge.rc { color: var(--warn); border-color: var(--warn); }
+.badge.current { color: var(--ok); border-color: var(--ok); }
+
+.channels {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+  max-height: 150px;
+  overflow-y: auto;
+}
+
+.chan {
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.chan.is-current { border-color: var(--accent); }
+
+.chan-head { display: flex; align-items: center; gap: 6px; }
+
+.chan-name { font-weight: 600; }
+
+.chan-ver { margin: 2px 0 0; word-break: break-all; }
+
+.chan-meta { margin: 2px 0 0; font-size: 12px; color: var(--muted); }
+
+.chan-link {
+  display: inline-block;
+  margin-top: 6px;
+  padding: 2px 10px;
+  font-size: 12px;
+  color: var(--accent);
+  text-decoration: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.chan-link:hover { border-color: var(--accent); }
+
+/* --------------------------------------------------- 跨通道确认面板 */
+
+.confirm {
+  margin-top: 8px;
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--warn);
+  border-radius: 6px;
+}
+
+.confirm[hidden] { display: none; }
+
+.confirm-text { color: var(--fg); }
+
+.confirm-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+
+/* ------------------------------------------------------------- 页脚 */
 
 .foot {
   display: flex;

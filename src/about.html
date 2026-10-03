@@ -11,7 +11,10 @@
         <span class="logo" aria-hidden="true">🐋</span>
         <div>
           <h1>DSHTauri</h1>
-          <p class="ver" id="version">…</p>
+          <p class="ver">
+            <span id="version">…</span>
+            <span class="badge" id="channel-badge">…</span>
+          </p>
         </div>
       </header>
 
@@ -21,13 +24,23 @@
 
       <section class="box">
         <h2>检查更新</h2>
-        <p class="muted" id="update">点「检查更新」开始。</p>
+        <p class="muted" id="update">点「检查更新」会同时检查 Release 与 RC 两个通道。</p>
+        <div class="channels" id="channels"></div>
+        <div class="confirm" id="confirm" hidden>
+          <p class="confirm-text" id="confirm-text"></p>
+          <div class="confirm-actions">
+            <button id="confirm-ok" type="button">继续下载</button>
+            <button id="confirm-cancel" type="button">取消</button>
+          </div>
+        </div>
       </section>
 
       <section class="box">
         <h2>项目地址</h2>
         <p class="mono selectable">https://github.com/tianyimc/DSH-Tauri</p>
-        <p class="muted">版本规则：<span class="mono">v.A.B.C GenX</span>，详见仓库的 CHANGELOG.md。</p>
+        <p class="muted">
+          版本规则：<span class="mono">v.A.B.C</span>，RC 版附 <span class="mono"> RC</span> 后缀；发布版无后缀。详见仓库的 CHANGELOG.md。
+        </p>
       </section>
 
       <footer class="foot">

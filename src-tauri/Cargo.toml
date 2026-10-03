@@ -1,6 +1,6 @@
 [package]
 name = "dshtauri"
-version = "0.3.1"
+version = "0.3.2"
 description = "DSHTauri - lightweight Tauri 2 desktop shell for the DSH WebUI"
 authors = ["DSHTauri"]
 edition = "2021"
@@ -40,6 +40,13 @@ windows-sys = { version = "0.61", features = [
     # 读取 Windows 11「设置 → 辅助功能 → 视觉效果 → 动画效果」开关，
     # 关掉时我们不做过渡动画（见 src/anim.rs）。
     "Win32_UI_WindowsAndMessaging",
+    # RegGetValueW + HKEY_CURRENT_USER：读取 `SystemUsesLightTheme`，
+    # 判断**任务栏**（外壳）是深色还是浅色 —— 它与「应用深浅色」是两个独立开关，
+    # 任务栏图标/托盘必须按前者选色（见 src/win_icon.rs）。
+    "Win32_System_Registry",
+    # ShellExecuteW：「关于 → 检查更新」里把下载链接交给**系统默认浏览器**打开。
+    # 不启用 tauri-plugin-opener 也能做到，且不会让「关于」窗口自己被导航走。
+    "Win32_UI_Shell",
     # timeBeginPeriod / timeEndPeriod（winmm）：把系统定时器粒度压到 1ms，
     # 否则 `sleep(15ms)` 实际会睡 15~31ms，帧间隔抖动 = 看起来「一顿一顿」（见 src/anim.rs）。
     "Win32_Media",

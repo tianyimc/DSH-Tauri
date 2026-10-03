@@ -311,6 +311,38 @@ test("src/about.html：作者链接存在且是 https", () => {
   assert.match(aboutHtml, /©\s*tianyimc\.com/);
 });
 
+/*
+ * 外链拦截器必须**先检查 `event.defaultPrevented`**。
+ *
+ * 为什么这条是硬需求（v0.3.3 独立验证抓出的真实缺陷）：
+ * 下载链接本身就是 `<a href="https://…" data-download-url="…">`，
+ * 于是它会同时命中两个 click 监听器 —— `channelsBox` 上的（先跑，负责
+ * 「跨通道先弹确认」）和 document 上的外链拦截（后跑）。若外链拦截不检查
+ * `defaultPrevented`，它会**无条件**打开链接，后果是：
+ *   · 同通道：重复调用 open_external（打开两次）；
+ *   · 跨通道：**确认面板被旁路** —— 用户还没点「继续下载」，下载就已经开始了。
+ * 也就是「跨渠道下载需用户确认」这条需求被破坏。
+ */
+test("src/about.js：外链拦截器先检查 defaultPrevented（不旁路跨通道确认）", () => {
+  const idx = aboutJsCode.search(/closest\?\.\("a\[href\]"\)|closest\("a\[href\]"\)/);
+  assert.notEqual(idx, -1, "找不到 a[href] 拦截器");
+  // 取拦截器之前的监听器开头 + 其后一小段，确认 defaultPrevented 检查在 preventDefault 之前。
+  const scopeStart = aboutJsCode.lastIndexOf("document.addEventListener", idx);
+  const scope = aboutJsCode.slice(scopeStart === -1 ? 0 : scopeStart, idx + 400);
+  assert.match(
+    scope,
+    /defaultPrevented/,
+    "外链拦截器没有检查 defaultPrevented —— 会旁路跨通道下载确认，并重复打开同通道链接",
+  );
+  // 检查必须在 preventDefault 之前（否则它已经被自己的 preventDefault 影响）。
+  const dpIdx = scope.indexOf("defaultPrevented");
+  const pdIdx = scope.indexOf("event.preventDefault()");
+  assert.ok(
+    dpIdx !== -1 && (pdIdx === -1 || dpIdx < pdIdx),
+    "defaultPrevented 检查必须出现在 event.preventDefault() 之前",
+  );
+});
+
 test("src/about.html：版本规则已更新为 v.A.B.C，且不再出现 GenX", () => {
   assert.doesNotMatch(aboutHtml, /Gen/);
   assert.match(aboutHtml, /v\.A\.B\.C/);

@@ -56,6 +56,144 @@ function readIfExists(rel) {
   return existsSync(p) ? readFileSync(p, "utf8") : null;
 }
 
+/**
+ * 切出 CSS 里**所有** `@media (prefers-color-scheme: dark)` 块的块内容。
+ *
+ * 为什么需要：只 grep `prefers-color-scheme` 这个 token 的话，注释里留一句就够
+ * 满足断言 —— 而「整个 @media 块被删掉」这种真实回归会**静默通过**
+ * （独立验证的 M11 变异）。所以必须切出块内容再断言块内真的做了切换。
+ *
+ * ⚠️ 必须返回**所有**块，不能只返回第一个：`about.css` 里有两个深色媒体查询
+ * （第一个是主题变量，第二个才是 logo 切换）。初版只取第一个 ⇒ 断言永远失败。
+ */
+function extractCssAtMediaDarkBlocks(code) {
+  const blocks = [];
+  const re = /@media[^{]*prefers-color-scheme\s*:\s*dark[^{]*\{/gi;
+  let m;
+  while ((m = re.exec(code)) !== null) {
+    const braceStart = m.index + m[0].length - 1;
+    let depth = 0;
+    for (let i = braceStart; i < code.length; i += 1) {
+      if (code[i] === "{") depth += 1;
+      else if (code[i] === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          blocks.push(code.slice(braceStart, i + 1));
+          // 从块尾继续找下一个媒体查询。
+          re.lastIndex = i + 1;
+          break;
+        }
+      }
+    }
+  }
+  return blocks;
+}
+
+/**
+ * 把 Rust 源码里所有 `&[u16] = &['A' as u16, 'p' as u16, …, 0]` 形式的
+ * UTF-16 字面量**解码回字符串**。
+ *
+ * 为什么必须这样做：`win_icon.rs` 里的注册表值名是用 UTF-16 字符数组写的
+ * （`RegGetValueW` 要 `PCWSTR`），**代码里根本没有 `AppsUseLightTheme` 这个字符串**
+ * —— 它只出现在注释里。于是「扫含注释的原文」会得到一个**永远为真**的断言
+ * （注释里留着名字就行），而「把真正使用的值名换掉」这种回归**抓不住**
+ * （独立验证的 M7 变异）。解码字符数组才能断言**代码实际使用的**值名。
+ */
+function decodeRustU16CharArrays(code) {
+  const decoded = [];
+  const re = /&\s*\[u16\]\s*=\s*&\[([\s\S]*?)\]/g;
+  let m;
+  while ((m = re.exec(code)) !== null) {
+    const chars = [...m[1].matchAll(/'((?:\\.|[^'\\])*)'\s*as\s*u16/g)].map((x) =>
+      x[1].replace(/\\'/g, "'").replace(/\\\\/g, "\\"),
+    );
+    // 去掉结尾的 NUL 终止符（字面量末尾的 `0`）。
+    decoded.push(chars.filter((c) => c !== "\0").join(""));
+  }
+  return decoded;
+}
+
+/**
+ * 去掉 Rust 源码里的注释，只留代码 —— 供「某 token 是否出现在**代码**里」这类断言使用。
+ *
+ * 为什么需要：直接扫含注释的原文时，「在注释里写一句关键词」就能满足断言（假绿）。
+ * 独立验证用这种方式抓出过多条假绿（例如把注册表值名换掉、但注释里还留着旧名字）。
+ *
+ * 处理 `//`（含 `///`、`//!`）与块注释（含文档块注释）两种形式。
+ * ⚠️ 不处理字符串字面量里的 `//`：Rust 代码里出现 `"http://…"` 很常见，
+ * 简单按行剔除会把它截断。所以这里对**字符串感知**地扫描：
+ * 遇到 `"` 就跳到配对的 `"`（跳过转义），遇到注释起始才进入注释状态。
+ */
+function stripRustComments(src) {
+  let out = "";
+  let i = 0;
+  const n = src.length;
+  while (i < n) {
+    const c = src[i];
+    const c2 = src.slice(i, i + 2);
+    // 块注释
+    if (c2 === "/*") {
+      const end = src.indexOf("*/", i + 2);
+      i = end === -1 ? n : end + 2;
+      out += " ";
+      continue;
+    }
+    // 行注释
+    if (c2 === "//") {
+      const end = src.indexOf("\n", i);
+      i = end === -1 ? n : end;
+      continue;
+    }
+    // 字符串字面量：整段原样保留（含其中的 //）
+    if (c === '"') {
+      let j = i + 1;
+      while (j < n) {
+        if (src[j] === "\\") {
+          j += 2;
+          continue;
+        }
+        if (src[j] === '"') {
+          j += 1;
+          break;
+        }
+        j += 1;
+      }
+      out += src.slice(i, j);
+      i = j;
+      continue;
+    }
+    out += c;
+    i += 1;
+  }
+  return out;
+}
+
+/**
+ * 从 Rust 源码里切出某个函数的**函数体**（大括号配对），用于把断言限定在函数内部。
+ *
+ * 为什么需要：用固定长度的 `[\s\S]{0,600}` 窗口会**越过函数边界**，落进后面的
+ * 其它函数（甚至测试函数），于是「删掉目标函数里的某段代码」仍能被别处的代码满足
+ * —— 独立验证的 M5 变异就是这么骗过断言的（测试自身的源码满足了产品断言）。
+ *
+ * 返回 `null` 表示找不到该函数。
+ */
+function extractRustFnBody(code, fnName) {
+  const re = new RegExp(`\\bfn\\s+${fnName}\\s*[<(]`);
+  const m = re.exec(code);
+  if (!m) return null;
+  const braceStart = code.indexOf("{", m.index);
+  if (braceStart === -1) return null;
+  let depth = 0;
+  for (let i = braceStart; i < code.length; i += 1) {
+    if (code[i] === "{") depth += 1;
+    else if (code[i] === "}") {
+      depth -= 1;
+      if (depth === 0) return code.slice(braceStart, i + 1);
+    }
+  }
+  return null;
+}
+
 /** 递归列出目录下所有文件（跳过 node_modules / target / .git）。 */
 function walk(dir, out = []) {
   if (!existsSync(dir)) return out;
@@ -1039,30 +1177,75 @@ section("11. v0.3.3：窗口图标、页内 logo、许可证");
   //
   // 「关于」/「设置」窗口是点菜单时才创建的，远晚于 `apply_theme_icons` 的最后一次调用，
   // 所以必须在自己的创建路径里设一次，否则会一直用 bundle 里那个静态深藏青 icon.ico。
+  //
+  // ⚠️ 本节所有断言都建立在**去注释后的 Rust 源码**上（`libCode`）。
+  // 独立验证指出：初版直接用 `libRaw`（含注释），于是「注释里留一句关键词」
+  // 就能满足断言（假绿）。
+  const libCode = stripRustComments(libRaw);
+  const winIcon2Raw = readIfExists("src-tauri/src/win_icon.rs");
+  const winIconCode = winIcon2Raw !== null ? stripRustComments(winIcon2Raw) : null;
+
+  // ⚠️ 正则必须用词边界：`set_creation_icon` **包含** `creation_icon` 子串，
+  // 初版 `/fn\s+set_creation_icon/` 在把 `creation_icon` 整体改名后**仍能命中**
+  // （残留的 `set_creation_icon` 让它通过）—— 独立验证的 M4 变异证明了这个假绿。
   check(
     "lib.rs 定义了 set_creation_icon（创建后立刻设主题图标）",
-    /fn\s+set_creation_icon/.test(libRaw),
+    /\bfn\s+set_creation_icon\s*[<(]/.test(libCode),
     "没有 set_creation_icon —— 按需创建的窗口会退回静态图标",
+  );
+  check(
+    "lib.rs 定义了 creation_icon（创建期主题解析）",
+    /\bfn\s+creation_icon\s*[<(]/.test(libCode),
+    "没有 creation_icon —— 创建第一个窗口时拿不到主题",
   );
   for (const varName of ["selector", "about", "settings"]) {
     check(
       `lib.rs 里 ${varName} 窗口创建后调用了 set_creation_icon`,
-      new RegExp(`set_creation_icon\\(&${varName}\\);`).test(libRaw),
+      new RegExp(`set_creation_icon\\(&${varName}\\);`).test(libCode),
       `${varName} 窗口缺少 set_creation_icon 调用 —— 它的标题栏图标不会跟随主题`,
     );
   }
-  // 主题来源不能只靠 current_theme：创建第一个窗口时还没有任何窗口可问。
+
+  // ⚠️ 必须**先切出 `creation_icon` 的函数体**再断言，不能用一个固定长度的
+  // `[\s\S]{0,600}` 窗口：初版那个窗口会**越过函数边界**，落进下面的测试函数
+  // `creation_icon_is_available_without_any_window`（它里面就有 `apps_prefers_light()`），
+  // 于是把 `creation_icon` 里的注册表分支删掉后**断言依然通过**
+  // —— 独立验证的 M5 变异证明了它（用测试自身的源码满足了产品断言）。
+  const creationBody = extractRustFnBody(libCode, "creation_icon");
   check(
-    "creation_icon 优先读注册表（不依赖已有窗口）",
-    /fn\s+creation_icon[\s\S]{0,600}?apps_prefers_light\s*\(/.test(libRaw),
-    "creation_icon 没有走注册表 —— 创建第一个窗口时拿不到主题，浅色系统上会错用白色鲸鱼",
+    "creation_icon 函数体存在且优先读注册表（不依赖已有窗口）",
+    creationBody !== null && /apps_prefers_light\s*\(/.test(creationBody),
+    creationBody === null
+      ? "找不到 creation_icon 的函数体（签名或大括号被改动？）"
+      : "creation_icon 函数体里没有 apps_prefers_light —— 创建第一个窗口时拿不到主题，浅色系统上会错用白色鲸鱼",
   );
-  const winIcon2 = readIfExists("src-tauri/src/win_icon.rs");
-  if (winIcon2 !== null) {
+
+  if (winIconCode !== null) {
+    // ⚠️ 注册表值名在**代码**里是 UTF-16 字符数组（`RegGetValueW` 要 `PCWSTR`），
+    // 字符串形式只出现在注释里。所以必须解码字符数组来断言**实际使用的**值名
+    // —— 否则「注释里留着名字」就能满足断言（独立验证的 M7 假绿）。
+    const u16Names = decodeRustU16CharArrays(winIconCode);
     check(
-      "win_icon.rs 提供 apps_prefers_light（应用主题，读 AppsUseLightTheme）",
-      /pub\s+fn\s+apps_prefers_light/.test(winIcon2) && /AppsUseLightTheme/.test(winIcon2),
-      "win_icon.rs 没有 apps_prefers_light / 没读 AppsUseLightTheme",
+      "win_icon.rs 提供 apps_prefers_light（应用主题）",
+      /\bfn\s+apps_prefers_light\s*[<(]/.test(winIconCode),
+      "win_icon.rs 没有 apps_prefers_light",
+    );
+    // 两个值名必须都**真实出现在代码的 UTF-16 字面量里**（不是只在注释里）。
+    for (const [label, name] of [
+      ["应用主题", "AppsUseLightTheme"],
+      ["外壳主题", "SystemUsesLightTheme"],
+    ]) {
+      check(
+        `win_icon.rs 代码里真的读取 ${name}（${label}）`,
+        u16Names.includes(name),
+        `代码的 UTF-16 字面量里没有 ${name} —— 只有注释提到它（断言会变成永远为真）`,
+      );
+    }
+    // 两者必须是**不同的**值：应用主题与外壳主题是两个独立开关，混用会让配色错。
+    check(
+      "win_icon.rs 里应用主题与外壳主题是两个不同的注册表值",
+      u16Names.includes("AppsUseLightTheme") && u16Names.includes("SystemUsesLightTheme"),
+      "缺少其中一个主题值 —— 应用主题与外壳主题被混用了",
     );
   }
 
@@ -1081,15 +1264,46 @@ section("11. v0.3.3：窗口图标、页内 logo、许可证");
       `${page} 没有引用 logo-on-dark.png / logo-on-light.png`,
     );
   }
+  // ⚠️ 这段断言必须检查 **`@media (prefers-color-scheme: dark)` 块内部**真的有
+  // 显隐切换，不能只 grep 三个 token。
+  //
+  // 为什么（独立验证的 M11 变异，最严重的一处假绿）：只 grep token 时，
+  // **整个删掉 @media 块**仍能通过 —— 因为
+  //   · `prefers-color-scheme` 还残留在上方注释里；
+  //   · `.logo-on-dark` 还残留在基础规则 `.logo-on-dark { display: none; }` 里；
+  //   · `.logo-on-light` 还残留在 HTML/其它规则里。
+  // 而删掉 @media 的**实际后果**是：`.logo-on-dark { display: none }` 在两种主题下
+  // 都生效、`.logo-on-light` 无规则恒可见 ⇒ **深色系统上显示深色鲸鱼、落在深色背景
+  // 上看不见** —— 正是本轮要修的缺陷静默复发，而当时 89 条检查全绿。
+  //
+  // 所以这里改成：先把 CSS 注释去掉，再**切出 @media 块**，断言块内同时含
+  // `.logo-on-dark { display: block }` 与 `.logo-on-light { display: none }`。
   for (const css of ["src/about.css", "src/settings.css"]) {
     const text = readIfExists(css);
     if (text === null) continue;
+    const code = text.replace(/\/\*[\s\S]*?\*\//g, ""); // 去 CSS 注释
+    const darkBlocks = extractCssAtMediaDarkBlocks(code);
     check(
-      `${css} 按 prefers-color-scheme 切换 logo`,
-      /prefers-color-scheme/.test(text) &&
-        /\.logo-on-dark/.test(text) &&
-        /\.logo-on-light/.test(text),
-      `${css} 缺少 logo 的明暗切换规则`,
+      `${css} 存在 @media (prefers-color-scheme: dark) 块`,
+      darkBlocks.length > 0,
+      `${css} 没有深色主题媒体查询 —— 深色系统下会显示深色鲸鱼，落在深色背景上看不见`,
+    );
+    // 至少要有一个深色块真的完成了 logo 显隐切换。
+    const switchBlock = darkBlocks.find(
+      (b) =>
+        /\.logo-on-dark\s*\{[^}]*display\s*:\s*block/.test(b) &&
+        /\.logo-on-light\s*\{[^}]*display\s*:\s*none/.test(b),
+    );
+    check(
+      `${css} 的某个深色块内切换到 logo-on-dark / 隐藏 logo-on-light`,
+      switchBlock !== undefined,
+      `${css} 的 @media 块里没有完成 logo 显隐切换 —— 深色主题下 logo 会不可见`,
+    );
+    // 基础（浅色）规则也必须在：浅色下显示深藏青、隐藏白色。
+    check(
+      `${css} 基础规则默认隐藏 logo-on-dark（浅色下显示深藏青版）`,
+      /\.logo-on-dark\s*\{[^}]*display\s*:\s*none/.test(code),
+      `${css} 基础规则没有隐藏 logo-on-dark —— 浅色主题下会同时显示两个 logo`,
     );
   }
   // 两个 logo 资源必须真的存在（否则页面会显示裂图）。

@@ -391,10 +391,24 @@ function boot() {
    * 为什么需要：这是 WebView2 里的本地页面，`<a href="https://…" target="_blank">`
    * 在 Tauri 里**不保证**会开新窗口 —— 某些情况下会把**「关于」窗口自己**导航走，
    * 用户点一下作者链接，界面就变成网页、再也回不来了。
-   * 所以这里统一拦截所有 http/https 外链，复用 Rust 侧的 `open_external`
-   * （与「检查更新」的下载按钮走同一条路径，它也只允许 http/https）。
+   *
+   * ⚠️ **必须先看 `event.defaultPrevented`**（v0.3.3 独立验证抓出的缺陷）。
+   *
+   * 下载链接本身就是 `<a href="https://…" data-download-url="…">`（见 `renderChannelBlock`），
+   * 于是它会同时命中**两个**监听器：
+   *   1. `channelsBox` 上的处理器（先跑）：同通道直接下载；**跨通道先弹确认、不下载**；
+   *   2. 本处理器（冒泡到 document，后跑）。
+   *
+   * 没有下面这行 `defaultPrevented` 判断时，第 2 个处理器会**无条件**打开链接，于是：
+   *   · 同通道：**重复**调用 `open_external`（打开两次）；
+   *   · 跨通道：**确认面板被完全旁路** —— 用户还没点「继续下载」，浏览器就已经开始下载了
+   *     （这正是「跨渠道下载需用户确认」这条需求被破坏）。
+   *
+   * 第 1 个处理器已经调过 `preventDefault()`，所以这里能读到 `true` 并安全跳过。
    */
   document.addEventListener("click", (event) => {
+    // 已被更具体的处理器处理过（下载链接）⇒ 不要再插手。
+    if (event.defaultPrevented) return;
     const anchor = event.target?.closest?.("a[href]");
     if (!anchor) return;
     const href = anchor.getAttribute("href") ?? "";

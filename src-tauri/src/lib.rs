@@ -1200,7 +1200,14 @@ fn apply_theme_icons<R: Runtime>(app: &AppHandle<R>, theme: Option<Theme>) {
     }
 }
 
-/// 读取当前窗口主题。`setup` 跑之前配置里的选择窗口就已经创建好了，所以这里能拿到。
+/// 读取当前窗口主题。
+///
+/// ⚠️ **只在「已经有窗口」时才拿得到**：`Window::theme()` 需要窗口存在。
+/// 选择窗口是在 `setup()` **内部**创建的（`create_selector_window`），
+/// 所以 `setup()` 里**第一次**调用本函数（创建选择窗口之前/之中）可能得到 `None`。
+///
+/// 需要「创建期」的主题时请用 [`creation_icon`] —— 它优先读注册表，不依赖窗口存在。
+/// （早期这里的注释写反了，声称「setup 跑之前选择窗口就已创建」，与事实矛盾。）
 fn current_theme<R: Runtime>(app: &AppHandle<R>) -> Option<Theme> {
     [SELECTOR_LABEL, MAIN_LABEL]
         .iter()

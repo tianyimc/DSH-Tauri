@@ -107,7 +107,7 @@ CI（windows-latest）实测：**挂起 API 确实调用成功**（应用日志�
 | 项目 | 结果 |
 | --- | --- |
 | `npm run test:js` | 112 通过 |
-| `npm run verify` | 142 通过（v0.3.4 新增 17 条守卫，每条都做过变异测试） |
+| `npm run verify` | 143 通过（v0.3.4 新增 18 条守卫，每条都做过变异测试） |
 | `cargo test` | 62 通过 |
 | CI 冒烟（windows-latest） | 45 通过 / 0 失败 |
 

@@ -34,6 +34,117 @@ function Check([string]$Name, [bool]$Ok, [string]$Detail = "") {
   }
 }
 
+# ============================================================================
+# 内存采样（v0.3.4 阶段 0）
+# ============================================================================
+#
+# 目的：把「各阶段到底占多少内存」变成 CI 上可复现的数字，而不是靠猜。
+# 后续阶段（挂起 chat / 销毁 about+settings / 托盘挂起 content）都要拿它做前后对比。
+#
+# 口径说明（重要，否则数字没有意义）：
+#   · 以 dshtauri.exe 的 PID 为根，**递归**遍历其子进程（WebView2 的 browser/GPU/
+#     utility/renderer 全是它的子进程），只统计这棵树里的进程。
+#     不统计「全机所有 msedgewebview2.exe」—— CI 机器上可能有其它 WebView2 宿主，
+#     那样会把无关进程算进来。
+#   · WorkingSet = 任务管理器「内存」列的口径（物理内存工作集，含可共享部分，
+#     所以多个进程相加会**重复计算**共享的 DLL 页，数值偏高）。
+#   · Private      = 私有提交内存，不重复计算共享页，更能反映真实占用。
+#     两个都记录，便于与用户的任务管理器数字对上。
+#   · 采样本身只读进程信息，不改应用行为。
+
+$script:MemSamples = @()
+
+function Get-AppProcessTree([int]$RootPid) {
+  # 一次取全量进程表，再在内存里做 BFS —— 比每个节点查一次 WMI 快得多，
+  # 也避免「父进程已退出导致子进程查不到」的竞态。
+  $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Select-Object ProcessId, ParentProcessId, Name, WorkingSetSize, PrivatePageCount)
+  $byPid = @{}
+  $byParent = @{}
+  foreach ($p in $all) {
+    $byPid[[int]$p.ProcessId] = $p
+    $ppid = [int]$p.ParentProcessId
+    if (-not $byParent.ContainsKey($ppid)) { $byParent[$ppid] = @() }
+    $byParent[$ppid] += $p
+  }
+
+  # ⚠️ 必须**去重**后再聚合，不能一边 BFS 一边累加：
+  # 真实进程表的 PID 唯一，但「同一 PID 出现在两个父下」的脏数据、以及
+  # 我们自己重复入队都会让同一个进程被算两次（实测过一次：汇总虚高）。
+  # 所以这里只负责收集**唯一的 PID 集合**（含根进程自己），聚合交给调用方。
+  $pids = [System.Collections.Generic.List[int]]::new()
+  $seen = @{}
+  $queue = [System.Collections.Queue]::new()
+  $queue.Enqueue($RootPid)
+  while ($queue.Count -gt 0) {
+    $cur = [int]$queue.Dequeue()
+    if ($seen.ContainsKey($cur)) { continue }
+    $seen[$cur] = $true
+    $pids.Add($cur)
+    # ⚠️ 必须先判 ContainsKey 再取：`@($byParent[$cur])` 在**没有子进程**时
+    # 会得到 `@($null)`（一个元素、值为 $null），循环里会塞进空行 —— 实测会让
+    # 「进程数」凭空变大。
+    if (-not $byParent.ContainsKey($cur)) { continue }
+    foreach ($child in $byParent[$cur]) { $queue.Enqueue([int]$child.ProcessId) }
+  }
+  return [pscustomobject]@{ Pids = $pids; ByPid = $byPid }
+}
+
+function Get-AppMemoryMB([int]$RootPid) {
+  $tree = Get-AppProcessTree $RootPid
+  $ws = [long]0
+  $pv = [long]0
+  $renderers = 0
+  $count = 0
+  # ⚠️ 循环变量**不能叫 `$pid`** —— PowerShell 里 `$PID` 是只读自动变量
+  # （当前进程 ID），赋值会直接抛 "Cannot overwrite variable PID"。
+  foreach ($procId in $tree.Pids) {
+    $p = $tree.ByPid[$procId]
+    if ($null -eq $p) { continue }   # 进程可能在采样瞬间退出
+    $ws += [long]$p.WorkingSetSize
+    $pv += [long]$p.PrivatePageCount
+    $count++
+    # WebView2 的渲染进程（每个 webview 一个）—— 用来解释「多开一个页面」的增量
+    if ($p.Name -eq "msedgewebview2.exe") { $renderers++ }
+  }
+  return [pscustomobject]@{
+    WorkingSetMB = [math]::Round($ws / 1MB, 1)
+    PrivateMB    = [math]::Round($pv / 1MB, 1)
+    WebViewProcs = $renderers
+    ProcCount    = $count
+  }
+}
+
+function Write-MemSample([string]$Stage, [int]$RootPid) {
+  if ($RootPid -le 0) { return }
+  try {
+    $m = Get-AppMemoryMB $RootPid
+  } catch {
+    Write-Host "  [INFO] 内存采样失败（$Stage）：$($_.Exception.Message)" -ForegroundColor DarkYellow
+    return
+  }
+  $line = "  [MEM] {0,-34} 工作集 {1,7} MB | 私有 {2,7} MB | WebView2 进程 {3}" -f `
+    $Stage, $m.WorkingSetMB, $m.PrivateMB, $m.WebViewProcs
+  Write-Host $line -ForegroundColor Cyan
+  $script:MemSamples += [pscustomobject]@{
+    Stage = $Stage; WorkingSetMB = $m.WorkingSetMB; PrivateMB = $m.PrivateMB
+    WebViewProcs = $m.WebViewProcs; ProcCount = $m.ProcCount
+  }
+}
+
+# 打印汇总表。**只打印、不断言** —— 阶段 0 的目的是先拿到基线数字，
+# 若一上来就写死阈值，CI 会因为内存抖动而 flaky（阶段 1/2 再按实测加相对断言）。
+function Write-MemSummary {
+  if ($script:MemSamples.Count -eq 0) { return }
+  Write-Host ""
+  Write-Host "== 内存采样汇总（工作集=任务管理器口径；私有=不重复计共享页）==" -ForegroundColor Cyan
+  Write-Host ("  {0,-34} {1,>10} {2,>10} {3,>8}" -f "阶段", "工作集MB", "私有MB", "WV2进程")
+  foreach ($s in $script:MemSamples) {
+    Write-Host ("  {0,-34} {1,10} {2,10} {3,8}" -f $s.Stage, $s.WorkingSetMB, $s.PrivateMB, $s.WebViewProcs)
+  }
+  Write-Host ""
+}
+
 Add-Type @'
 using System;
 using System.Collections.Generic;
@@ -323,6 +434,9 @@ try {
   }
   Check "选择窗口未卡死" $responsive "进程窗口：$(Format-WindowList $proc.Id)"
 
+  # 阶段 0 采样点 1：只有选择窗口（本地小页面）时的基线
+  Write-MemSample "1-选择窗口" $proc.Id
+
   Write-Host "== 5. 点击「本地」= =="
   # 窗口响应了不代表页面已经渲染完（CI 上 build job 并行跑，CPU 抢占会让启动明显变慢），
   # 页面没就绪时点击会落空，所以这里多等一会儿。
@@ -361,6 +475,9 @@ try {
     Check "本地服务($Port)收到 WebView2 的请求" ((Get-Content $LOG_A -Raw) -match "GET /") "日志：'$(Get-Content $LOG_A -Raw)'"
     # 这条走的是 Tauri 自己的 show/hide，可见性状态同步，断言有效
     Check "首次连接后选择窗口已隐藏" (-not [Win32]::IsWindowVisible($sel))
+
+    # 阶段 0 采样点 2：连接后（顶栏 + 内容页，选择窗口已隐藏但**未销毁**）
+    Write-MemSample "2-连接后(未开侧栏)" $proc.Id
 
     Write-Host "== 6.5 顶栏子 webview（新架构：主窗口内的子 webview）=="
     # 这一段专门盯住用户报告的缺陷 2（顶栏错位）与缺陷 1（点「网页对话」卡死）。
@@ -449,10 +566,18 @@ try {
       ("期望左边缘≈{0}（客户区宽 {1} - 侧栏宽 {2}）；实际子 webview：{3}" -f `
         $expectChatX, $ms[0], $chatW, $sbDesc)
 
+    # 阶段 0 采样点 3：侧栏已打开（多了一个 chat.deepseek.com 的重 renderer）
+    Write-MemSample "3-侧栏已打开" $proc.Id
+
     # 再点一次收起，确认反复切换也不会卡
     [Win32]::ClickClient($main, [int]($CHAT_BTN_X * $scale), [int](20 * $scale))
     Start-Sleep -Seconds 4
     Check "再次点击收起侧栏后仍响应（可反复切换）" ([Win32]::IsResponsive($main, 5000))
+
+    # 阶段 0 采样点 4：侧栏已关闭 —— 关键对比点！
+    # 当前实现只 `chat.hide()`、**不销毁也不挂起**，所以这个数字应当与采样点 3 接近。
+    # 阶段 1（挂起 chat）就是要让这里明显低于采样点 3。
+    Write-MemSample "4-侧栏已关闭" $proc.Id
 
     Write-Host "== 6.7 设置窗口（v0.3.0 新增）=="
     # 「应用 → 设置」走**系统原生菜单**，菜单是系统级弹出窗口、不是 DOM 元素，
@@ -472,6 +597,11 @@ try {
     Check "关闭后进程仍存活" (-not $proc.HasExited)
     Check "关闭后主窗口不可见（已隐藏到托盘）" (-not [Win32]::IsWindowVisible($main)) `
       "IsWindowVisible=$([Win32]::IsWindowVisible($main))"
+
+    # 阶段 0 采样点 5：已收进托盘 —— 关键对比点！
+    # 当前实现只 `main.hide()`，子 webview 的 controller 仍认为可见 ⇒ DSH 页面继续跑，
+    # 数字应当与采样点 2 接近。阶段 3（托盘挂起 content）就是要让这里明显下降。
+    Write-MemSample "5-已收进托盘" $proc.Id
   }
 
   # ======================================================= B. 切换连接方式
@@ -496,6 +626,10 @@ try {
     Check "切换后主窗口可见" ([Win32]::IsWindowVisible($main))
     $logB = Get-Content $LOG_B -Raw
     Check "新地址($Port2)收到 WebView2 的请求（确实切过去了）" ($logB -match "GET /") "日志：'$logB'"
+
+    # 阶段 0 采样点 6：从托盘恢复（主窗口重新可见、内容页已加载新地址）
+    # 用来对比采样点 5，确认「恢复」后内存回到正常水平（阶段 3 的挂起必须能正确恢复）。
+    Write-MemSample "6-从托盘恢复" $proc.Id
   }
   # 这里**不**断言「选择窗口重新隐藏」：本测试是用外部 ShowWindow 把它显示出来的，
   # 绕过了 Tauri/tao 内部的可见性状态；tao 认为它「本来就是隐藏的」，
@@ -699,6 +833,10 @@ catch {
   Check "脚本异常中止" $false $_.Exception.Message
 }
 finally {
+  # ⚠️ 内存汇总必须在**杀进程之前**打印 —— 下面的 Stop-App 会把采样对象干掉，
+  # 之后连进程都查不到（采样值是当时记录的，但汇总表放在这里更醒目、
+  # 且确保「脚本异常中止」时也一定能打出来）。
+  Write-MemSummary
   Write-Host "== 清理 =="
   foreach ($f in @((Join-Path $WORK "app.log"), (Join-Path $WORK "app.log.err"),
                    (Join-Path $WORK "app.log.2"), (Join-Path $WORK "app.log.2.err"))) {

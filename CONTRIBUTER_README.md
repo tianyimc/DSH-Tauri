@@ -20,6 +20,7 @@ This file is intended for project contributors and AI Agents. It contains variou
 - [5. `src-tauri/Cargo.toml`](#5-src-tauricargotoml)
 - [6. `src-tauri/src/lib.rs` + `main.rs`](#6-src-taurisrclibrs--mainrs)
 - [6.5 自定义标题栏 / 右侧对话侧栏 / 关于窗口](#65-自定义标题栏--右侧对话侧栏--关于窗口)
+- [6.6 内存与挂起策略（v0.3.4）](#66-内存与挂起策略v034)
 - [7. `src-tauri/capabilities/` 权限配置](#7-src-tauricapabilities-权限配置)
 - [8. `.github/workflows/release-windows.yml`](#8-githubworkflowsrelease-windowsyml)
 - [9. 在 Debian 上从零到推送的完整命令](#9-在-debian-上从零到推送的完整命令)
@@ -1281,6 +1282,75 @@ npm run tauri build -- --bundles nsis --verbose 2>&1 | tail -100   # 完整打�
 > 说明：`cargo check --target x86_64-pc-windows-msvc` 在 Debian 上需要 `llvm`（提供 `llvm-rc`，`tauri-build` 用它嵌入 Windows 资源）。这只影响**在 Linux 上预检 Windows 目标**；GitHub Actions 上用的是真正的 MSVC 工具链，不需要这一步。
 >
 > 踩过的坑记录：`xdotool windowclose` 是**销毁窗口**（不触发 `CloseRequested`），用它测「关闭到托盘」会得到假结论。必须用 `wmctrl -i -c` 发送真正的 `WM_DELETE_WINDOW`。`scripts/smoke-linux.sh` 里用的是后者。
+
+---
+
+## 6.6 内存与挂起策略（v0.3.4）
+
+### 模块
+
+`src-tauri/src/wv_suspend.rs` —— WebView2 挂起（等价 Edge 的「标签页休眠」）。
+
+- `SuspendSlot`：每个 webview 一份「代次 + 挂起标志」，纯逻辑、可单测。
+- `suspend()` / `resume()`：调 `ICoreWebView2_3::TrySuspend` / `Resume`。
+- `set_controller_visible()`：显式设 controller 可见性。
+- 非 Windows 下全部为空实现（保证 Linux 上 `cargo test` / `cargo check` 通过）。
+
+### 两个硬性约束（违反会**静默失效**）
+
+1. **`TrySuspend` 要求 controller 的 `IsVisible == false`**，否则返回
+   `ERROR_INVALID_STATE`。
+   - 子 webview 的 `hide()` 会设它 ⇒ 「关侧栏挂起 chat」顺序天然正确；
+   - 但 `Window::hide()`（收托盘）**不会** ⇒ 必须先 `set_controller_visible(false)`。
+   两条路径的顺序都有静态守卫断言。
+2. **`GetCookies` 这类 API 可能意外唤醒挂起的 webview** ⇒ cookie 保活线程
+   （每 20 秒遍历 content/chat）必须先查 `should_skip_cookie_persist()`，
+   否则挂起每 20 秒失效一次。
+
+### 代次（generation）防竞态
+
+`TrySuspend` 回调是异步的，用户可能「关掉侧栏立刻又打开」。
+`confirm_suspend(generation, ok)` 只在代次未变时认账；代次变了就拒绝
+（否则迟到的回调会把刚打开的侧栏又标记成挂起 —— 与 `anim.rs` 的
+`ANIM_GENERATION` / `should_run_on_done` 是同一类防护）。
+
+### 关闭策略（`close_disposition`）
+
+| label | 点「×」时 | 理由 |
+| --- | --- | --- |
+| `main` | 收进托盘 | 关闭 ≠ 退出 |
+| `selector` | 隐藏 | 常驻入口，销毁会让每次切换都要重建 |
+| `about` / `settings` | **销毁** | 本地小页面，重建快；隐藏则 renderer 一直占内存 |
+| 其它 | 隐藏 | 保守，绝不误销毁未知窗口 |
+
+`about` / `settings` 重建走 `build_with_retry`（一次重试，间隔 150ms）：
+`destroy()` 是异步的，`build()` 可能赶在旧 WebView2 释放前执行。
+
+### ⚠️ 实测结论：挂起**不降**任务管理器数字
+
+CI（windows-latest）实测：`TrySuspend` **调用成功**（日志有「已挂起 webview」），
+但工作集与私有内存**都没下降**。原因是 API 语义 —— 文档原文
+*"allows the operating system to **reuse** the memory"*，即标记为**可回收**
+而非立即释放；测试机有约 13GB 空闲内存，内核没有回收压力。
+
+**因此不要用「内存下降」来验证挂起是否生效** —— 必须看日志。
+也不能用「隐藏后页面心跳停止」验证：Chromium 自己就会节流隐藏页的定时器，
+两者行为上无法区分（这个推理错误在 v0.3.4 开发中被发现并修正）。
+
+真正降常驻内存只能靠**销毁**（`selector` 约 105MB 私有、`chat` 约 110MB），
+代价见 README §4.7。
+
+### 内存测量
+
+`scripts/smoke-windows.ps1` 的 `Get-AppMemoryMB` / `Write-MemSample`：
+以 `dshtauri.exe` 为根**递归**收集子进程（只统计这棵树，避免把 CI 机器上
+其它 WebView2 宿主算进来），记录工作集 + 私有 + WV2 进程数 + 系统可用内存。
+
+⚠️ 实现中踩过的坑（都已修）：
+- `@($byParent[$cur])` 在无子进程时得到 `@($null)` ⇒ 会往结果里塞空行；
+- 循环变量**不能叫 `$pid`**（PowerShell 只读自动变量，赋值直接抛异常）；
+- 汇总表用 `"{1,>10}"` 会**运行时**抛 .NET 格式异常（`ParseFile` 语法检查抓不住），
+  已加静态守卫拦 `{n,>...}`。
 
 ---
 

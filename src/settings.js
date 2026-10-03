@@ -8,7 +8,7 @@
  *   load_config()                     -> AppConfig
  *   save_config({ config })           -> null   // Rust 侧是**补丁语义**
  *   chrome_action({ action })         -> null   // action: "reconnect"
- *   window_control({ action })        -> null   // action: "hide-settings"
+ *   window_control({ action })        -> null   // action: "close-settings"
  *   app_version()                     -> "v.0.3.2"（RC 版是 "v.0.3.2 RC"）
  *   app_channel()                     -> "release" | "rc"
  *
@@ -176,7 +176,7 @@ ui.reconnect.addEventListener("click", async () => {
     await invoke("chrome_action", { action: "reconnect" });
     setStatus("已打开「选择 DSH 连接方式」窗口。", "ok");
     // 选择窗口会居中弹出；把设置窗口收起来，免得盖在它上面。
-    await invoke("window_control", { action: "hide-settings" }).catch(() => {});
+    await invoke("window_control", { action: "close-settings" }).catch(() => {});
   } catch (err) {
     setStatus(`无法打开选择窗口：${err}`, "err");
   } finally {
@@ -185,7 +185,7 @@ ui.reconnect.addEventListener("click", async () => {
 });
 
 ui.close.addEventListener("click", () => {
-  invoke("window_control", { action: "hide-settings" }).catch(() => {
+  invoke("window_control", { action: "close-settings" }).catch(() => {
     // 兜底：直接关掉本窗口
     window.close();
   });

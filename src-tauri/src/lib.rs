@@ -64,6 +64,36 @@ pub const ABOUT_LABEL: &str = "about";
 /// 「设置」窗口的 label（独立 `WebviewWindow`，加载本地 `settings.html` ⇒ 有 IPC）。
 pub const SETTINGS_LABEL: &str = "settings";
 
+/// 用户点窗口「×」时该怎么处理。
+///
+/// 抽成纯函数是为了**可测**：三个分支的取舍理由见下面的文档与 `close_disposition`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseAction {
+    /// 主窗口：收进托盘（不退出程序）。
+    HideToTray,
+    /// 选择窗口：只隐藏，**永不销毁** —— 它是「重新选择连接方式」的常驻入口，
+    /// 且承载着当前配置的回显。
+    Hide,
+    /// 关于 / 设置：**放行关闭**，让它被真正销毁以释放 renderer。
+    Destroy,
+}
+
+/// 按窗口 label 决定「点 × 时怎么办」。
+///
+/// - `main` → 收托盘（关闭 ≠ 退出，由托盘菜单「退出」真正结束）。
+/// - `selector` → 隐藏。它是常驻入口，销毁会让每次切换都要重建。
+/// - `about` / `settings` → 销毁。本地小页面，重建很快；而隐藏会让它的 renderer
+///   一直占内存（v0.3.4 优化目标之一）。
+/// - 其它（理论上不存在）→ 保守地按隐藏处理，绝不误销毁未知窗口。
+pub fn close_disposition(label: &str) -> CloseAction {
+    match label {
+        MAIN_LABEL => CloseAction::HideToTray,
+        SELECTOR_LABEL => CloseAction::Hide,
+        ABOUT_LABEL | SETTINGS_LABEL => CloseAction::Destroy,
+        _ => CloseAction::Hide,
+    }
+}
+
 /// 版本号（`v.A.B.C`，可选 ` RC` 后缀），由 `build.rs` 从 `Cargo.toml` + `version.json` 生成。
 ///
 /// - `APP_VERSION`：`0.3.2`（纯数字三段，不带前缀）
@@ -957,21 +987,58 @@ fn show_about_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         let _ = about.set_focus();
         return Ok(());
     }
-    let builder = WebviewWindowBuilder::new(app, ABOUT_LABEL, WebviewUrl::App("about.html".into()))
-        .title(ABOUT_TITLE)
-        .inner_size(ABOUT_WIDTH, ABOUT_HEIGHT)
-        .resizable(false)
-        .maximizable(false)
-        .minimizable(false)
-        .center()
-        .visible(true);
-    let about = with_shared_profile(app, builder)
-        .build()
-        .map_err(|e| format!("打开关于窗口失败：{e}"))?;
+    let about = build_with_retry("打开关于窗口失败", || {
+        let builder =
+            WebviewWindowBuilder::new(app, ABOUT_LABEL, WebviewUrl::App("about.html".into()))
+                .title(ABOUT_TITLE)
+                .inner_size(ABOUT_WIDTH, ABOUT_HEIGHT)
+                .resizable(false)
+                .maximizable(false)
+                .minimizable(false)
+                .center()
+                .visible(true);
+        with_shared_profile(app, builder).build()
+    })?;
     // v0.3.3：关于窗口是**按需创建**的，远晚于 `apply_theme_icons` 的最后一次调用，
     // 不在这里设图标就会一直用 bundle 里那个静态深藏青 `icon.ico`（用户实测的缺陷）。
     set_creation_icon(&about);
     Ok(())
+}
+
+/// 按需创建窗口（关于 / 设置），**带一次重试**。
+///
+/// 为什么需要重试：v0.3.4 起这两个窗口「关闭即销毁」，于是它们会被**反复重建**。
+/// 而 `destroy()` 走的是 `send_event` —— 异步的，`build()` 可能赶在底层
+/// WebView2 真正释放之前执行。此时同 label 的 `build()` 在 Windows 上会失败
+/// （代码里原有注释就记着这个坑：「重复 `build()` 同 label 窗口在 Windows 上会因
+/// 旧 WebView2 尚未销毁而失败」）。
+///
+/// 做法：失败后等 150ms 再试一次。`builder_factory` 每次重新构造 builder，
+/// 因为 `build()` 会**消耗** builder（不能复用）。
+///
+/// ⚠️ 这里用 `std::thread::sleep` 阻塞等待：调用方是 `async` 命令
+/// （`chrome_action` / `run_action`），跑在 tokio 的阻塞池之外的异步上下文里，
+/// 阻塞 150ms 只影响这一次打开操作，不会卡住 UI 主线程。
+fn build_with_retry<R, F>(err_prefix: &str, build: F) -> Result<tauri::WebviewWindow<R>, String>
+where
+    R: Runtime,
+    F: Fn() -> tauri::Result<tauri::WebviewWindow<R>>,
+{
+    // 最多两次：第一次直接用；失败（多半是旧 WebView2 还没释放）等一会再试。
+    let mut last_err = String::new();
+    for attempt in 0..2 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+        match build() {
+            Ok(window) => return Ok(window),
+            Err(err) => {
+                last_err = err.to_string();
+                eprintln!("[DSHTauri] {err_prefix}（第 {} 次）：{err}", attempt + 1);
+            }
+        }
+    }
+    Err(format!("{err_prefix}：{last_err}"))
 }
 
 /// 「设置」窗口。
@@ -989,19 +1056,19 @@ fn show_settings_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         let _ = settings.set_focus();
         return Ok(());
     }
-    let builder =
-        WebviewWindowBuilder::new(app, SETTINGS_LABEL, WebviewUrl::App("settings.html".into()))
-            .title(SETTINGS_TITLE)
-            .inner_size(SETTINGS_WIDTH, SETTINGS_HEIGHT)
-            .min_inner_size(480.0, 400.0)
-            .resizable(true)
-            .maximizable(false)
-            .minimizable(true)
-            .center()
-            .visible(true);
-    let settings = with_shared_profile(app, builder)
-        .build()
-        .map_err(|e| format!("打开设置窗口失败：{e}"))?;
+    let settings = build_with_retry("打开设置窗口失败", || {
+        let builder =
+            WebviewWindowBuilder::new(app, SETTINGS_LABEL, WebviewUrl::App("settings.html".into()))
+                .title(SETTINGS_TITLE)
+                .inner_size(SETTINGS_WIDTH, SETTINGS_HEIGHT)
+                .min_inner_size(480.0, 400.0)
+                .resizable(true)
+                .maximizable(false)
+                .minimizable(true)
+                .center()
+                .visible(true);
+        with_shared_profile(app, builder).build()
+    })?;
     // v0.3.3：同「关于」窗口 —— 按需创建，必须在这里设图标（见 `set_creation_icon`）。
     set_creation_icon(&settings);
     Ok(())
@@ -1492,19 +1559,39 @@ fn open_url_in_system(url: &str) -> Result<(), String> {
 /// 放到异步运行时执行，避免占住主线程。
 #[tauri::command]
 async fn window_control(app: AppHandle, action: String) -> Result<(), String> {
-    // 关于窗口自己就能关自己，不需要主窗口存在
-    if action == "hide-about" {
+    // 关于窗口自己就能关自己，不需要主窗口存在。
+    //
+    // v0.3.4：**从 `hide()` 改成 `destroy()`** —— 这两个窗口是本地小页面，
+    // 重建很快（<100ms），而隐藏会让它的 renderer 一直占着内存。
+    // 用户实测「平时非活动 350–450MB」，其中就有这两个窗口的份额。
+    //
+    // 为什么 `destroy()` 在这里是安全的（都核查过）：
+    //   1. 本命令是 `async`，不在主线程上跑；
+    //   2. `WindowDispatcher::destroy` 用的是 `send_event`（**不是**
+    //      `send_user_message`），所以不会命中 `handle_user_message` 里的
+    //      `panic!("cannot handle WindowMessage::Destroy on the main thread")`；
+    //   3. 销毁后 `on_window_close` 会把窗口从 Tauri 注册表移除，
+    //      底层 `InnerWebView::drop` → `controller.Close()` 真正释放 renderer；
+    //   4. 之后再打开走 `show_about_window` 的**重建**分支（已加重试，见那里）。
+    if action == "close-about" {
         if let Some(about) = app.get_webview_window(ABOUT_LABEL) {
-            let _ = about.hide();
+            if let Err(err) = about.destroy() {
+                // 销毁失败时退回隐藏：至少别让「关闭」这个操作看起来没反应。
+                eprintln!("[DSHTauri] 销毁关于窗口失败，退回隐藏：{err}");
+                let _ = about.hide();
+            }
         }
         return Ok(());
     }
 
     // 设置窗口同理：它可能是在**没有主窗口**的情况下打开的（比如用户还没连接），
     // 所以这个分支必须放在取 `main` 之前。
-    if action == "hide-settings" {
+    if action == "close-settings" {
         if let Some(settings) = app.get_webview_window(SETTINGS_LABEL) {
-            let _ = settings.hide();
+            if let Err(err) = settings.destroy() {
+                eprintln!("[DSHTauri] 销毁设置窗口失败，退回隐藏：{err}");
+                let _ = settings.hide();
+            }
         }
         return Ok(());
     }
@@ -1883,14 +1970,25 @@ pub fn run() {
             // 关闭窗口 ≠ 退出程序：隐藏到托盘，由托盘菜单「退出」真正结束。
             // 托盘不可用时不能隐藏，否则用户再也找不回窗口。
             WindowEvent::CloseRequested { api, .. } => {
-                if TRAY_READY.load(Ordering::Relaxed) {
-                    api.prevent_close();
-                    if window.label() == MAIN_LABEL {
-                        // 主窗口关闭 = 整个主界面（含标题栏、侧栏）一起收进托盘
+                if !TRAY_READY.load(Ordering::Relaxed) {
+                    return; // 托盘没起来：放行真正的关闭，否则用户再也找不回窗口
+                }
+                match close_disposition(window.label()) {
+                    // 主窗口关闭 = 整个主界面（含标题栏、侧栏）一起收进托盘
+                    CloseAction::HideToTray => {
+                        api.prevent_close();
                         hide_main_windows(window.app_handle());
-                    } else {
+                    }
+                    // 选择窗口是「重新选择连接方式」的常驻入口，只隐藏、不销毁
+                    // （销毁的话每次切换都要重建，而且它承载着当前配置的回显）。
+                    CloseAction::Hide => {
+                        api.prevent_close();
                         let _ = window.hide();
                     }
+                    // v0.3.4：关于 / 设置**不阻止关闭**，让它被真正销毁
+                    // ⇒ 底层 `InnerWebView::drop` → `controller.Close()` 释放 renderer。
+                    // 这两个是本地小页面，重建很快（见 `show_about_window`）。
+                    CloseAction::Destroy => {}
                 }
             }
             // 主窗口缩放 / DPI 变化时，重新摆放子 webview（顶栏恒 40 逻辑 px、内容占满剩余）。
@@ -2451,6 +2549,43 @@ mod tests {
         for other in [MAIN_LABEL, TITLEBAR_LABEL, CONTENT_LABEL, CHAT_LABEL, SELECTOR_LABEL] {
             assert_ne!(SETTINGS_LABEL, other);
         }
+    }
+
+    /// v0.3.4：点窗口「×」时的处置策略。
+    ///
+    /// 这组断言保护的是**内存优化**：关于/设置必须被销毁（否则 renderer 一直占内存），
+    /// 而主窗口必须收托盘（不能真退出），选择窗口必须只隐藏（它是常驻入口）。
+    #[test]
+    fn close_disposition_destroys_only_about_and_settings() {
+        assert_eq!(close_disposition(MAIN_LABEL), CloseAction::HideToTray);
+        assert_eq!(close_disposition(SELECTOR_LABEL), CloseAction::Hide);
+        assert_eq!(close_disposition(ABOUT_LABEL), CloseAction::Destroy);
+        assert_eq!(close_disposition(SETTINGS_LABEL), CloseAction::Destroy);
+        // 未知 label 保守处理：只隐藏，绝不误销毁。
+        assert_eq!(close_disposition("some-unknown"), CloseAction::Hide);
+    }
+
+    /// 关于/设置必须是「销毁」，否则 v0.3.4 的省内存目标落空。
+    #[test]
+    fn about_and_settings_are_destroyed_on_close() {
+        for label in [ABOUT_LABEL, SETTINGS_LABEL] {
+            assert_eq!(
+                close_disposition(label),
+                CloseAction::Destroy,
+                "{label} 窗口关闭时没有销毁 —— 它的 renderer 会一直占着内存"
+            );
+        }
+    }
+
+    /// 选择窗口**绝不能**被销毁：它是「重新选择连接方式」的常驻入口，
+    /// 而且承载着当前配置的回显。销毁会让每次切换都要重建。
+    #[test]
+    fn selector_is_never_destroyed_on_close() {
+        assert_ne!(
+            close_disposition(SELECTOR_LABEL),
+            CloseAction::Destroy,
+            "选择窗口被改成销毁了 —— 每次切换连接方式都要重建"
+        );
     }
 
     /// 顶栏高度是逻辑值，必须原样交给 Tauri（**不许**再乘 scale）。

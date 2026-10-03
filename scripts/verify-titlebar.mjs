@@ -1519,6 +1519,102 @@ section("12. v0.3.4：WebView2 挂起、销毁 about/settings");
   }
 }
 
+{
+  // ---- 关于 / 设置：关闭即**销毁**（v0.3.4 阶段 2）----
+  //
+  // 这两个窗口是本地小页面，重建很快；而隐藏会让它的 renderer 一直占内存。
+  // 断言分三层：①纯函数分类正确 ②`window_control` 真的调 destroy() ③
+  // 原生 × 路径不再 prevent_close。
+  const libCode2 = stripRustComments(libRaw);
+
+  const closeFn = extractRustFnBody(libCode2, "close_disposition");
+  check(
+    "lib.rs 定义了 close_disposition（可单测的关闭策略）",
+    closeFn !== null,
+    "没有 close_disposition —— 关闭策略散在事件处理器里，无法单测",
+  );
+  if (closeFn !== null) {
+    check(
+      "close_disposition 把 about / settings 归为 Destroy",
+      /ABOUT_LABEL\s*\|\s*SETTINGS_LABEL\s*=>\s*CloseAction::Destroy/.test(closeFn),
+      "about/settings 没被归为 Destroy —— 关闭后 renderer 仍占内存",
+    );
+    check(
+      "close_disposition 把 selector 归为 Hide（常驻入口，不能销毁）",
+      /SELECTOR_LABEL\s*=>\s*CloseAction::Hide/.test(closeFn),
+      "selector 被归成销毁 —— 每次切换连接方式都要重建",
+    );
+    check(
+      "close_disposition 把 main 归为 HideToTray（关闭≠退出）",
+      /MAIN_LABEL\s*=>\s*CloseAction::HideToTray/.test(closeFn),
+      "main 不再收托盘 —— 关闭窗口会直接退出程序",
+    );
+  }
+
+  const wcFn = extractRustFnBody(libCode2, "window_control");
+  check(
+    "window_control 里 about/settings 走 destroy() 而不是 hide()",
+    wcFn !== null && /about\.destroy\(\)/.test(wcFn) && /settings\.destroy\(\)/.test(wcFn),
+    "window_control 没有销毁这两个窗口 —— 省内存目标落空",
+  );
+  check(
+    "销毁失败时有 hide() 兜底（不能让「关闭」看起来没反应）",
+    wcFn !== null && (wcFn.match(/\.hide\(\)/g) || []).length >= 2,
+    "destroy 失败没有兜底 —— 用户点了关闭窗口却还在",
+  );
+
+  // 原生 × 路径：CloseRequested 必须按 close_disposition 分派，
+  // 且 Destroy 分支**不能**调 api.prevent_close()。
+  const evIdx = libCode2.indexOf("CloseRequested { api, .. }");
+  check(
+    "CloseRequested 处理器存在",
+    evIdx !== -1,
+    "找不到 CloseRequested 处理 —— 原生 × 按钮行为无法断言",
+  );
+  if (evIdx !== -1) {
+    // 取该 match 分支的一小段。
+    const branch = libCode2.slice(evIdx, evIdx + 1200);
+    check(
+      "CloseRequested 按 close_disposition 分派（而不是硬编码 label 判断）",
+      /close_disposition\s*\(/.test(branch),
+      "CloseRequested 没用 close_disposition —— 关闭策略与单测脱节",
+    );
+    check(
+      "Destroy 分支不调用 prevent_close（否则窗口不会被销毁）",
+      /CloseAction::Destroy\s*=>\s*\{\s*\}/.test(branch),
+      "Destroy 分支不是空实现 —— 可能仍在 prevent_close，窗口销毁不掉",
+    );
+  }
+
+  // 动作名必须如实反映语义：既然是销毁，就不该再叫 hide-about。
+  const aboutJs = readIfExists("src/about.js");
+  const settingsJs = readIfExists("src/settings.js");
+  if (aboutJs !== null && settingsJs !== null) {
+    check(
+      "前端动作名已改为 close-about / close-settings（不再是误导性的 hide-*）",
+      /"close-about"/.test(aboutJs) &&
+        /"close-settings"/.test(settingsJs) &&
+        !/hide-about/.test(aboutJs) &&
+        !/hide-settings/.test(settingsJs),
+      "动作名仍叫 hide-* 但实际行为是销毁 —— 名实不符，后续维护会被误导",
+    );
+    check(
+      "lib.rs 的命令分支用的是新动作名",
+      /action == "close-about"/.test(libCode2) && /action == "close-settings"/.test(libCode2),
+      "Rust 侧仍匹配 hide-* —— 前端点了关闭会没有任何反应",
+    );
+  }
+
+  // 重建必须有重试：destroy() 是异步的，build() 可能赶在旧 WebView2 释放前执行。
+  check(
+    "按需窗口的重建有重试（destroy 是异步的，build 可能撞上旧实例未释放）",
+    /fn build_with_retry/.test(libCode2) &&
+      /build_with_retry\("打开关于窗口失败"/.test(libCode2) &&
+      /build_with_retry\("打开设置窗口失败"/.test(libCode2),
+    "重建没有重试 —— 「关闭关于窗口后立刻再打开」可能失败",
+  );
+}
+
 /* ------------------------------------------------------------------ 汇总 */
 
 console.log("\n" + "=".repeat(60));

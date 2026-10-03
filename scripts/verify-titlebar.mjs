@@ -1482,6 +1482,43 @@ section("12. v0.3.4：WebView2 挂起、销毁 about/settings");
   }
 }
 
+{
+  // ---- 冒烟脚本里的内存采样：格式串必须合法 ----
+  //
+  // ⚠️ 这条守卫是被一次真实 CI 失败逼出来的：
+  // 我写了 `"{1,>10}" -f ...` —— `>` 是 PowerShell 习惯，**.NET 的 `-f` 不认**，
+  // 运行时抛 "Error formatting a string: Input string was not in a correct format"，
+  // 直接把整个冒烟脚本搞挂（前面所有断言都过了，却因为最后打汇总表而失败）。
+  //
+  // **语法检查抓不住它**（`ParseFile` 通过），所以必须在这里静态拦：
+  // .NET 复合格式串的对齐只能是可选的**正负号 + 数字**，`>` 一律非法。
+  const smoke = readIfExists("scripts/smoke-windows.ps1");
+  if (smoke !== null) {
+    check(
+      "冒烟脚本存在内存采样（阶段 0）",
+      /Write-MemSample/.test(smoke) && /Write-MemSummary/.test(smoke),
+      "冒烟脚本没有内存采样 —— 无法用真机数字验证优化效果",
+    );
+    check(
+      "冒烟脚本的内存汇总在杀进程之前打印",
+      (() => {
+        const fin = smoke.indexOf("finally {");
+        const summ = smoke.indexOf("Write-MemSummary", fin);
+        const cleanup = smoke.indexOf("== 清理 ==", fin);
+        return fin !== -1 && summ !== -1 && cleanup !== -1 && summ < cleanup;
+      })(),
+      "汇总表在 Stop-App 之后才打印 —— 进程已杀，拿不到数据",
+    );
+    // 抓 `{n,>...}` 这类非法对齐。
+    const badAlign = smoke.match(/\{\d+,\s*[^}]*[<>][^}]*\}/g);
+    check(
+      "冒烟脚本没有非法的 .NET 格式串对齐（`{n,>10}` 会运行时抛异常）",
+      badAlign === null,
+      `发现非法格式串：${badAlign ? badAlign.join(", ") : ""} —— .NET 的 -f 只接受「符号+数字」对齐`,
+    );
+  }
+}
+
 /* ------------------------------------------------------------------ 汇总 */
 
 console.log("\n" + "=".repeat(60));

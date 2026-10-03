@@ -138,9 +138,13 @@ function Write-MemSummary {
   if ($script:MemSamples.Count -eq 0) { return }
   Write-Host ""
   Write-Host "== 内存采样汇总（工作集=任务管理器口径；私有=不重复计共享页）==" -ForegroundColor Cyan
-  Write-Host ("  {0,-34} {1,>10} {2,>10} {3,>8}" -f "阶段", "工作集MB", "私有MB", "WV2进程")
+  # ⚠️ 对齐只能用 .NET 的 `{n,width}`，**不能写 `{n,>10}`** ——
+  # `>` 是 PowerShell 的字符串格式化习惯，.NET 的 `-f` 不认，会抛
+  # "Error formatting a string: Input string was not in a correct format"
+  # （实测在 CI 上就是这个把整个冒烟脚本搞挂的）。负数宽度本身就是右对齐。
+  Write-Host ("  {0,-34}{1,10}{2,10}{3,10}" -f "阶段", "工作集MB", "私有MB", "WV2进程")
   foreach ($s in $script:MemSamples) {
-    Write-Host ("  {0,-34} {1,10} {2,10} {3,8}" -f $s.Stage, $s.WorkingSetMB, $s.PrivateMB, $s.WebViewProcs)
+    Write-Host ("  {0,-34}{1,10}{2,10}{3,10}" -f $s.Stage, $s.WorkingSetMB, $s.PrivateMB, $s.WebViewProcs)
   }
   Write-Host ""
 }

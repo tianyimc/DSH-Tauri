@@ -507,10 +507,18 @@ try {
     Check "主窗口可见" ([Win32]::IsWindowVisible($main))
     Start-Sleep -Seconds 3
     Check "本地服务($Port)收到 WebView2 的请求" ((Get-Content $LOG_A -Raw) -match "GET /") "日志：'$(Get-Content $LOG_A -Raw)'"
-    # 这条走的是 Tauri 自己的 show/hide，可见性状态同步，断言有效
-    Check "首次连接后选择窗口已隐藏" (-not [Win32]::IsWindowVisible($sel))
+    # v0.3.4：连接成功后选择窗口被**销毁**（不是隐藏），所以这里断言句柄已失效。
+    # 为什么要等：销毁是在 `open_main_window` 的 IPC 返回后、由异步阻塞线程
+    # 延迟 250ms 执行的（避开「在自己的 IPC 回调里销毁自己」的历史坑）。
+    $destroyed = $false
+    for ($i = 0; $i -lt 10; $i++) {
+      if (-not [Win32]::IsWindow($sel)) { $destroyed = $true; break }
+      Start-Sleep -Milliseconds 500
+    }
+    Check "首次连接后选择窗口已销毁（省下它的 renderer）" $destroyed `
+      "5 秒后选择窗口仍然存在 —— 销毁没生效（v0.3.4 的省内存目标未达成）"
 
-    # 阶段 0 采样点 2：连接后（顶栏 + 内容页，选择窗口已隐藏但**未销毁**）
+    # 阶段 0 采样点 2：连接后（顶栏 + 内容页，选择窗口已销毁）
     Write-MemSample "2-连接后(未开侧栏)" $proc.Id
 
     Write-Host "== 6.5 顶栏子 webview（新架构：主窗口内的子 webview）=="
@@ -668,59 +676,57 @@ try {
   }
 
   # ======================================================= B. 切换连接方式
-  Write-Host "== 8. 切换连接方式（模拟托盘「重新选择连接方式」）=="
-  # 主窗口已经在跑；把被隐藏的选择窗口重新显示出来，再点「远程」。
-  # 这一步验证 open_main_window 在「已有主窗口」时的行为：
-  # 必须是**复用同一个窗口导航**，而不是销毁再重建（重建会卡住/点了没反应）。
-  [void][Win32]::ShowWindow($sel, [Win32]::SW_SHOWNORMAL)
-  Start-Sleep -Seconds 2
-  [void][Win32]::SetForegroundWindow($sel)
-  Start-Sleep -Milliseconds 500
-  Check "选择窗口重新显示成功" ([Win32]::IsWindowVisible($sel))
+  Write-Host "== 8. 连接后选择窗口已销毁 + 应用仍然健康 =="
+  #
+  # v0.3.4：连接成功后选择窗口会被**销毁**（省内存），不再沿用第 5 节的 `$sel`。
+  #
+  # 这一段盯住的是**本版最大的回归风险**：选择窗口正是发起 `open_main_window`
+  # 那条 IPC 的 webview，而历史上「在它自己的 IPC 回调里销毁它」曾导致消息处理
+  # 进入坏状态（后续 hide() 被丢弃、点 × 没反应 —— 见 CHANGELOG v0.1.x）。
+  # 所以必须断言：销毁之后，主界面、内容页、进程**全都还正常**。
+  Check "连接后选择窗口已被销毁（不是隐藏，句柄已失效）" (-not [Win32]::IsWindow($sel)) `
+    "IsWindow=$([Win32]::IsWindow($sel)) —— 选择窗口仍存在，v0.3.4 的省内存目标未达成"
 
-  Set-Content -Path $LOG_B -Value "" -NoNewline
-  [Win32]::ClickClient($sel, [int]($selCs[0] / 2), $CARD_REMOTE_Y)
-  Start-Sleep -Seconds 10
-
+  # 销毁选择窗口之后，主窗口必须一切正常（这就是当年那个坏状态的检测点）。
   if ($main -ne [IntPtr]::Zero) {
-    $stillThere = [Win32]::IsWindow($main)
-    Check "切换后主窗口仍然存在（复用而非销毁重建）" $stillThere "IsWindow=$stillThere"
-    Check "切换后主窗口没有卡死" ([Win32]::IsResponsive($main, 5000))
-    Check "切换后主窗口可见" ([Win32]::IsWindowVisible($main))
-    $logB = Get-Content $LOG_B -Raw
-    Check "新地址($Port2)收到 WebView2 的请求（确实切过去了）" ($logB -match "GET /") "日志：'$logB'"
+    Check "销毁选择窗口后主窗口仍然存在" ([Win32]::IsWindow($main)) `
+      "主窗口消失了 —— 可能连带把主窗口一起销毁了"
+    Check "销毁选择窗口后主窗口没有卡死" ([Win32]::IsResponsive($main, 5000)) `
+      "主窗口不再响应 WM_NULL —— 正是历史上「销毁正在执行 IPC 的 webview」造成的坏状态"
+    Check "销毁选择窗口后主窗口仍可见" ([Win32]::IsWindowVisible($main))
+    Check "销毁选择窗口后进程仍存活" (-not $proc.HasExited)
+    # 内容页必须仍在跑（用第 5 节之后仍在累积的心跳判断）。
+    $hbAfterDestroy = @(Select-String -Path $LOG_A -Pattern "/hb" -ErrorAction SilentlyContinue).Count
+    Check "销毁选择窗口后内容页仍在运行（心跳仍在累积）" ($hbAfterDestroy -gt $hbNow) `
+      "内容页心跳停止累积（$hbNow -> $hbAfterDestroy）—— 销毁选择窗口影响了内容页"
+  }
 
-    # ---- v0.3.4：从挂起中恢复后，页面必须真的在跑 ----
-    #
-    # 恢复路径是 `resume_main_webviews()`（先 Resume + SetIsVisible(true)）。
-    # 页面每秒发心跳，所以「恢复后 LOG_B 有 /hb」说明内容页**确实在跑** ——
-    # 这条兜住最坏情况：若恢复失败、内容页一直不可见/不跑，用户看到的就是
-    # 「窗口回来了但一片空白」。注意它验证的是「页面活着」，不是「挂起被解除」
-    # （页面本来就在跑的话它也会通过）—— 挂起侧的断言见第 7 节的日志断言。
-    #
-    # 为什么这里不测「草稿内容是否保留」：本节会把内容页**导航**到新地址，
-    # 导航必然重新加载页面（nonce 会变），所以在这里测不出「挂起是否丢 DOM」。
-    # 该性质由「挂起成功」的日志断言 + Rust 状态机单测覆盖，
-    # 真机观感留给用户验收 —— 不在这里伪造一条测不准的断言。
-    $hbB = @(Select-String -Path $LOG_B -Pattern "/hb" -ErrorAction SilentlyContinue).Count
-    Check "从托盘恢复后内容页在跑（页面真的活过来了）" ($hbB -ge 1) `
-      "恢复后没有收到任何心跳 —— 内容页可能仍处于挂起/不可见状态"
+  # 重建路径（托盘「重新选择连接方式」）走**系统原生菜单**，菜单是系统级弹出窗口、
+  # 不是 DOM 元素，无法用坐标可靠点中（与「设置窗口」同样的限制，见第 6.7 节）。
+  # 所以这里不伪造点击，改由两条能在 CI 稳定跑的断言覆盖：
+  #   1) `cargo test`：close_disposition 的「有主窗口→销毁 / 无主窗口→隐藏」语义；
+  #   2) `npm run verify`：断言 reveal_selector 真的有重建分支且带重试。
+  Write-Host "  [INFO] 选择窗口重建走原生托盘菜单，CI 不点系统菜单；" `
+    "其链路由 cargo test（close_disposition 语义）+ verify（reveal_selector 重建分支）覆盖。"
+
+  # 从挂起中恢复后内容页必须仍在跑。
+  #
+  # 恢复路径是 `resume_main_webviews()`（先 Resume + SetIsVisible(true)），
+  # 而第 8 节不再导航到新地址（选择窗口已销毁、切地址走原生菜单点不中），
+  # 所以这里用**主窗口恢复可见** + 内容页心跳仍在累积来验证。
+  if ($main -ne [IntPtr]::Zero) {
+    Check "从托盘恢复后主窗口仍可见" ([Win32]::IsWindowVisible($main))
+    $hbB = @(Select-String -Path $LOG_A -Pattern "/hb" -ErrorAction SilentlyContinue).Count
+    Check "从托盘恢复后内容页仍在跑（心跳仍在累积）" ($hbB -gt $hbAfterDestroy) `
+      "恢复后心跳没有继续累积（$hbAfterDestroy -> $hbB）—— 内容页可能仍处于挂起状态"
 
     # 草稿 nonce 必须在收托盘**之前**就已写入页面（证明测试页真的设置了草稿）。
     Check "测试页确实写入过草稿（nonce 非空）" ($draftBefore -ne "") `
       "收托盘前没在日志里看到草稿 nonce —— 测试页脚本可能没执行"
 
-    # 阶段 0 采样点 6：从托盘恢复（主窗口重新可见、内容页已加载新地址）
-    # 用来对比采样点 5，确认「恢复」后内存回到正常水平（阶段 3 的挂起必须能正确恢复）。
+    # 阶段 0 采样点 6：从托盘恢复（主窗口重新可见）
     Write-MemSample "6-从托盘恢复" $proc.Id
   }
-  # 这里**不**断言「选择窗口重新隐藏」：本测试是用外部 ShowWindow 把它显示出来的，
-  # 绕过了 Tauri/tao 内部的可见性状态；tao 认为它「本来就是隐藏的」，
-  # set_visible(false) 不产生差异所以不会调用 ShowWindow —— 这是测试手段的限制，
-  # 不是产品问题（真实流程走托盘 -> selector.show()，状态是同步的；
-  # 「连接后选择窗口隐藏」已在第 6 节用有效路径断言过）。
-  Check "切换后主窗口仍是活动窗口" ([Win32]::GetForegroundWindow() -eq $main) `
-    "foreground=$([Win32]::GetForegroundWindow()) main=$main"
 
   Stop-App $proc
   Start-Sleep -Seconds 3

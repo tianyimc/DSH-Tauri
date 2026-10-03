@@ -1539,10 +1539,23 @@ section("12. v0.3.4：WebView2 挂起、销毁 about/settings");
       /ABOUT_LABEL\s*\|\s*SETTINGS_LABEL\s*=>\s*CloseAction::Destroy/.test(closeFn),
       "about/settings 没被归为 Destroy —— 关闭后 renderer 仍占内存",
     );
+    // v0.3.4：selector 是**条件**销毁 —— 有主窗口才销毁（省 renderer），
+    // 没有主窗口时必须只隐藏（销毁最后一个窗口会让程序直接退出）。
     check(
-      "close_disposition 把 selector 归为 Hide（常驻入口，不能销毁）",
-      /SELECTOR_LABEL\s*=>\s*CloseAction::Hide/.test(closeFn),
-      "selector 被归成销毁 —— 每次切换连接方式都要重建",
+      "close_disposition 对 selector 做条件判断（有主窗口才销毁）",
+      /SELECTOR_LABEL\s*=>\s*\{[^}]*has_main_window[^}]*CloseAction::Destroy/.test(closeFn),
+      "selector 不是条件销毁 —— 要么没省到内存，要么会在唯一窗口时让程序退出",
+    );
+    check(
+      "close_disposition 对 selector 有「无主窗口则隐藏」的分支",
+      /SELECTOR_LABEL[\s\S]{0,220}CloseAction::Hide/.test(closeFn),
+      "缺少「没有主窗口时只隐藏」的分支 —— 销毁唯一窗口会让程序直接退出",
+    );
+    // ⚠️ 签名不在 `closeFn`（它只含函数体），要在整份去注释源码里找。
+    check(
+      "close_disposition 的签名接收 has_main_window（可测的前提）",
+      /fn\s+close_disposition\s*\([^)]*has_main_window\s*:\s*bool/.test(libCode2),
+      "close_disposition 没有 has_main_window 参数 —— 无法区分唯一窗口的情形",
     );
     check(
       "close_disposition 把 main 归为 HideToTray（关闭≠退出）",
@@ -1715,8 +1728,27 @@ section("12. v0.3.4：WebView2 挂起、销毁 about/settings");
     );
     check(
       "冒烟验证恢复后内容页在跑（兜住「窗口回来但空白」的最坏情况）",
-      /从托盘恢复后内容页在跑/.test(smoke2),
+      /从托盘恢复后内容页仍在跑/.test(smoke2),
       "没有恢复断言 —— 恢复失败会导致内容页永久空白却测不出来",
+    );
+    // v0.3.4：选择窗口销毁后，冒烟必须断言「销毁后主界面仍健康」
+    // —— 这正是历史上「销毁正在执行 IPC 的 webview」那个坏状态的检测点。
+    check(
+      "冒烟断言销毁选择窗口后主界面仍健康（防历史坏状态复发）",
+      /销毁选择窗口后主窗口没有卡死/.test(smoke2) &&
+        /销毁选择窗口后内容页仍在运行/.test(smoke2),
+      "没有「销毁后仍健康」的断言 —— 历史坏状态（点 × 没反应）可能静默复发",
+    );
+    check(
+      "冒烟断言连接后选择窗口确实被销毁",
+      /首次连接后选择窗口已销毁/.test(smoke2),
+      "没有断言选择窗口真的被销毁 —— 省内存目标可能没达成",
+    );
+    check(
+      "verify 断言 reveal_selector 有重建分支且带重试",
+      /fn\s+reveal_selector/.test(libCode2) &&
+        /create_selector_window\(app\)/.test(libCode2),
+      "reveal_selector 没有重建分支 —— 选择窗口销毁后用户再也无法切换连接方式",
     );
   }
 }

@@ -66,29 +66,42 @@ pub const SETTINGS_LABEL: &str = "settings";
 
 /// 用户点窗口「×」时该怎么处理。
 ///
-/// 抽成纯函数是为了**可测**：三个分支的取舍理由见下面的文档与 `close_disposition`。
+/// 抽成纯函数是为了**可测**：各分支的取舍理由见下面的文档与 `close_disposition`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseAction {
     /// 主窗口：收进托盘（不退出程序）。
     HideToTray,
-    /// 选择窗口：只隐藏，**永不销毁** —— 它是「重新选择连接方式」的常驻入口，
-    /// 且承载着当前配置的回显。
+    /// 只隐藏，不销毁。
     Hide,
-    /// 关于 / 设置：**放行关闭**，让它被真正销毁以释放 renderer。
+    /// **放行关闭**，让窗口被真正销毁以释放 renderer。
     Destroy,
 }
 
 /// 按窗口 label 决定「点 × 时怎么办」。
 ///
 /// - `main` → 收托盘（关闭 ≠ 退出，由托盘菜单「退出」真正结束）。
-/// - `selector` → 隐藏。它是常驻入口，销毁会让每次切换都要重建。
+/// - `selector` → **有主窗口时销毁**，否则隐藏。
+///
+///   销毁的理由：选择窗口是一次性的「选连接方式」界面，主窗口起来后它的使命就结束了；
+///   留着（哪怕隐藏）会让它的 renderer 一直占内存。销毁后用户仍可从托盘
+///   「重新选择连接方式」把它**重建**出来（见 `reveal_selector`）。
+///
+///   ⚠️ **没有主窗口时必须只隐藏**：此时它是**唯一**的窗口，销毁最后一个窗口
+///   会让 tao 触发 `ExitRequested` ⇒ 整个程序退出（托盘也跟着消失）。
+///   用户点「×」通常只是想把它收起来，不是想退出程序。
 /// - `about` / `settings` → 销毁。本地小页面，重建很快；而隐藏会让它的 renderer
 ///   一直占内存（v0.3.4 优化目标之一）。
 /// - 其它（理论上不存在）→ 保守地按隐藏处理，绝不误销毁未知窗口。
-pub fn close_disposition(label: &str) -> CloseAction {
+pub fn close_disposition(label: &str, has_main_window: bool) -> CloseAction {
     match label {
         MAIN_LABEL => CloseAction::HideToTray,
-        SELECTOR_LABEL => CloseAction::Hide,
+        SELECTOR_LABEL => {
+            if has_main_window {
+                CloseAction::Destroy
+            } else {
+                CloseAction::Hide
+            }
+        }
         ABOUT_LABEL | SETTINGS_LABEL => CloseAction::Destroy,
         _ => CloseAction::Hide,
     }
@@ -1160,7 +1173,21 @@ fn reveal_window<R: Runtime>(app: &AppHandle<R>) {
 }
 
 /// 托盘「重新选择连接方式」/ 自定义标题栏的「重新连接」：
-/// 把选择窗口叫出来（它只是被隐藏了，没有销毁）。
+/// 把选择窗口叫出来；若它已被销毁（v0.3.4：连接成功后销毁）就**重建**。
+///
+/// # 线程说明（已核实，不是想当然）
+///
+/// 重建走 `create_selector_window` → `WebviewWindowBuilder::build()` →
+/// `create_window`，其内部是 `send_user_message(Message::CreateWindow)` 然后
+/// `rx.recv()` 阻塞等响应。我一度以为「在主线程上会死锁」，但**核实后并非如此**：
+/// `handle_user_message` 的 `Message::CreateWindow` 分支会**同步**执行创建并
+/// `sender.send(...)`，所以主线程内联执行时 `recv()` 立刻就能拿到结果。
+///
+/// 但**真正的历史坑**仍然成立且必须避开：这条 IPC 正是选择窗口自己发起的，
+/// 在「正在执行该 IPC 的 webview 的回调里」同步创建窗口会让新的 WebView2
+/// **永远初始化不完**（白屏）—— 见 CHANGELOG v0.1.x。所以 `open_main_window`
+/// 是 `async` 命令，由异步线程调用；`reveal_selector` 的两个调用点
+/// （托盘菜单、`chrome_action` 异步命令）也都不在那个回调里。
 fn reveal_selector<R: Runtime>(app: &AppHandle<R>) {
     if let Some(selector) = app.get_webview_window(SELECTOR_LABEL) {
         let _ = selector.unminimize();
@@ -1168,10 +1195,30 @@ fn reveal_selector<R: Runtime>(app: &AppHandle<R>) {
         let _ = selector.set_focus();
         return;
     }
-    // 理论上不会走到这里（选择窗口不会被销毁），保底重建。
-    if let Err(err) = create_selector_window(app) {
-        eprintln!("[DSHTauri] 重建选择窗口失败：{err}");
+    // v0.3.4：连接成功后选择窗口会被**销毁**（省内存），所以这条重建路径
+    // 现在是**常规路径**，不再是「理论上不会走到」的保底分支。
+    //
+    // 重建要带重试：`destroy()` 走 `send_event`（异步），底层 WebView2 的释放
+    // 可能还没完成，同 label 的 `build()` 会失败（代码里原有注释记着这个坑）。
+    let mut last_err = String::new();
+    for attempt in 0..2 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+        match create_selector_window(app) {
+            Ok(()) => {
+                if let Some(selector) = app.get_webview_window(SELECTOR_LABEL) {
+                    let _ = selector.set_focus();
+                }
+                return;
+            }
+            Err(err) => {
+                last_err = err.to_string();
+                eprintln!("[DSHTauri] 重建选择窗口失败（第 {} 次）：{err}", attempt + 1);
+            }
+        }
     }
+    eprintln!("[DSHTauri] 重建选择窗口最终失败：{last_err}");
 }
 
 
@@ -1992,14 +2039,60 @@ async fn open_main_window_inner(app: &AppHandle, request: OpenRequest) -> Result
     // 放在这里（而不是 setup）是为了避开启动阶段，只在确实有网页在跑时才动手。
     spawn_cookie_keeper(app.clone());
 
-    // 选择窗口使命完成：**隐藏**而不是销毁。
-    // 销毁会干掉「正在执行这条 IPC 的 webview」，Windows 上会让消息处理进入坏状态。
-    // 隐藏更安全，而且保留下来还能通过托盘「重新选择连接方式」再叫出来。
-    if let Some(selector) = app.get_webview_window(SELECTOR_LABEL) {
-        let _ = selector.hide();
+    // 选择窗口使命完成 —— **销毁**它（v0.3.4）。
+    //
+    // # 为什么销毁
+    //
+    // 它是一次性的「选连接方式」界面，主窗口起来后就没用了；隐藏的话它的
+    // renderer 会一直占内存（用户实测空闲态里就有它一份）。
+    // 销毁后用户仍可从托盘「重新选择连接方式」把它**重建**出来（`reveal_selector`）。
+    //
+    // # ⚠️ 为什么**不能**在这里直接 `destroy()`
+    //
+    // 本函数是被选择窗口通过 IPC 调进来的（`open_main_window` 命令）。
+    // CHANGELOG v0.1.x 记着一个真实 bug：**在「正在执行 IPC 的那个 webview」的
+    // 回调里销毁它自己**，会让 Windows 的消息处理进入坏状态（后续 `hide()` 被丢弃
+    // ⇒ 点 × 没反应）。当年正是因此把 `destroy()` 改成了 `hide()`。
+    //
+    // 所以这里**延后到另一个线程**执行：等本次 IPC 回调返回、消息处理回到正常
+    // 循环后，再销毁。`spawn_blocking` 用的是异步运行时的阻塞线程池，
+    // 不会卡住主线程，也不会嵌套在 WebView2 的回调里。
+    //
+    // 为什么还要 sleep 250ms：销毁本身是 `send_event`（非阻塞投递），但我们要确保
+    // **这次 IPC 的响应已经写回**（响应也走同一个消息循环）。给一小段余量最稳妥。
+    {
+        let app = app.clone();
+        // 用 `spawn_blocking`：里面就是一个 sleep + 销毁，天然是阻塞型工作，
+        // 不占用异步工作线程，也**不需要**额外的 tokio 依赖（`tauri::async_runtime`
+        // 没有 re-export `tokio::time`，而 `spawn_blocking` 正好合适）。
+        tauri::async_runtime::spawn_blocking(move || {
+            // 给这次 IPC 响应留出写回的时间（响应走同一个消息循环）。
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            destroy_selector_after_connect(&app);
+        });
     }
 
     Ok(())
+}
+
+/// 主窗口就绪后销毁选择窗口。
+///
+/// 抽成独立函数是为了**可测**与可读：`destroy()` 的失败只记录，
+/// 因为「选择窗口还在」只是没省到内存，不影响功能。
+fn destroy_selector_after_connect<R: Runtime>(app: &AppHandle<R>) {
+    let Some(selector) = app.get_webview_window(SELECTOR_LABEL) else {
+        return;
+    };
+    // 二次确认主窗口确实在：万一主窗口刚被销毁（用户在 250ms 内关了它），
+    // 销毁选择窗口就会让程序**一个窗口都不剩** ⇒ tao 触发 ExitRequested ⇒ 程序退出。
+    if app.get_window(MAIN_LABEL).is_none() {
+        return;
+    }
+    if let Err(err) = selector.destroy() {
+        eprintln!("[DSHTauri] 销毁选择窗口失败（不影响功能，只是没省到内存）：{err}");
+    } else {
+        eprintln!("[DSHTauri] 选择窗口已销毁（主窗口已就绪，释放它的 renderer）");
+    }
 }
 
 /* -------------------------------------------------------------------- run */
@@ -2058,21 +2151,24 @@ pub fn run() {
                 if !TRAY_READY.load(Ordering::Relaxed) {
                     return; // 托盘没起来：放行真正的关闭，否则用户再也找不回窗口
                 }
-                match close_disposition(window.label()) {
+                // 「有没有主窗口」决定选择窗口能不能被销毁（见 `close_disposition`）。
+                // 在**事件处理器里现查**，而不是缓存：主窗口可能刚被创建或刚被销毁。
+                let has_main = window.app_handle().get_window(MAIN_LABEL).is_some();
+                match close_disposition(window.label(), has_main) {
                     // 主窗口关闭 = 整个主界面（含标题栏、侧栏）一起收进托盘
                     CloseAction::HideToTray => {
                         api.prevent_close();
                         hide_main_windows(window.app_handle());
                     }
-                    // 选择窗口是「重新选择连接方式」的常驻入口，只隐藏、不销毁
-                    // （销毁的话每次切换都要重建，而且它承载着当前配置的回显）。
+                    // 只隐藏（选择窗口在主窗口还不存在时走这里 —— 它是唯一窗口，
+                    // 销毁它会让整个程序退出）。
                     CloseAction::Hide => {
                         api.prevent_close();
                         let _ = window.hide();
                     }
-                    // v0.3.4：关于 / 设置**不阻止关闭**，让它被真正销毁
-                    // ⇒ 底层 `InnerWebView::drop` → `controller.Close()` 释放 renderer。
-                    // 这两个是本地小页面，重建很快（见 `show_about_window`）。
+                    // 不阻止关闭，让窗口被真正销毁 ⇒ 底层
+                    // `InnerWebView::drop` → `controller.Close()` 释放 renderer。
+                    // 适用于：关于 / 设置，以及**主窗口已存在时**的选择窗口。
                     CloseAction::Destroy => {}
                 }
             }
@@ -2639,15 +2735,15 @@ mod tests {
     /// v0.3.4：点窗口「×」时的处置策略。
     ///
     /// 这组断言保护的是**内存优化**：关于/设置必须被销毁（否则 renderer 一直占内存），
-    /// 而主窗口必须收托盘（不能真退出），选择窗口必须只隐藏（它是常驻入口）。
+    /// 而主窗口必须收托盘（不能真退出）。
     #[test]
-    fn close_disposition_destroys_only_about_and_settings() {
-        assert_eq!(close_disposition(MAIN_LABEL), CloseAction::HideToTray);
-        assert_eq!(close_disposition(SELECTOR_LABEL), CloseAction::Hide);
-        assert_eq!(close_disposition(ABOUT_LABEL), CloseAction::Destroy);
-        assert_eq!(close_disposition(SETTINGS_LABEL), CloseAction::Destroy);
+    fn close_disposition_covers_each_window_kind() {
+        assert_eq!(close_disposition(MAIN_LABEL, true), CloseAction::HideToTray);
+        assert_eq!(close_disposition(MAIN_LABEL, false), CloseAction::HideToTray);
+        assert_eq!(close_disposition(ABOUT_LABEL, true), CloseAction::Destroy);
+        assert_eq!(close_disposition(SETTINGS_LABEL, true), CloseAction::Destroy);
         // 未知 label 保守处理：只隐藏，绝不误销毁。
-        assert_eq!(close_disposition("some-unknown"), CloseAction::Hide);
+        assert_eq!(close_disposition("some-unknown", true), CloseAction::Hide);
     }
 
     /// 关于/设置必须是「销毁」，否则 v0.3.4 的省内存目标落空。
@@ -2655,21 +2751,35 @@ mod tests {
     fn about_and_settings_are_destroyed_on_close() {
         for label in [ABOUT_LABEL, SETTINGS_LABEL] {
             assert_eq!(
-                close_disposition(label),
+                close_disposition(label, true),
                 CloseAction::Destroy,
                 "{label} 窗口关闭时没有销毁 —— 它的 renderer 会一直占着内存"
             );
         }
     }
 
-    /// 选择窗口**绝不能**被销毁：它是「重新选择连接方式」的常驻入口，
-    /// 而且承载着当前配置的回显。销毁会让每次切换都要重建。
+    /// v0.3.4：**有主窗口时**，选择窗口关闭即销毁（省下它的 renderer）。
+    ///
+    /// 用户仍可从托盘「重新选择连接方式」把它重建出来（`reveal_selector` 有重建分支）。
     #[test]
-    fn selector_is_never_destroyed_on_close() {
-        assert_ne!(
-            close_disposition(SELECTOR_LABEL),
+    fn selector_is_destroyed_once_main_window_exists() {
+        assert_eq!(
+            close_disposition(SELECTOR_LABEL, true),
             CloseAction::Destroy,
-            "选择窗口被改成销毁了 —— 每次切换连接方式都要重建"
+            "主窗口已存在时选择窗口没被销毁 —— 它的 renderer 会一直占着内存"
+        );
+    }
+
+    /// ⚠️ **没有主窗口时，选择窗口绝不能销毁**。
+    ///
+    /// 此时它是**唯一**的窗口；销毁最后一个窗口会让 tao 触发 `ExitRequested`
+    /// ⇒ 整个程序退出（托盘也一起消失）。用户点「×」只是想把它收起来。
+    #[test]
+    fn selector_is_only_hidden_when_it_is_the_last_window() {
+        assert_eq!(
+            close_disposition(SELECTOR_LABEL, false),
+            CloseAction::Hide,
+            "没有主窗口时销毁选择窗口 —— 程序会直接退出"
         );
     }
 

@@ -361,6 +361,25 @@ v0.3.1 的 docked 分支**刻意不做滑动**，直接切到位，理由是「�
 | docked 精确平铺、不重叠 | 单测 `docked_mode_shrinks_content_and_tiles_with_chat`（内容 780 + 侧栏 420 = 1200，窗口尺寸不变） |
 | 真机几何（新增） | 冒烟 `docked：内容页让出侧栏宽度` / `docked：侧栏左边缘与内容页右边缘对齐` |
 
+### ✅ 真机证据（CI `windows-latest`，run `37103819235`）
+
+新增的两条 docked 断言在**真实 Windows** 上**已通过**（从 `ci-logs` 分支的
+`smoke-windows.txt` 读出）：
+
+```
+[PASS] docked：内容页让出侧栏宽度（与侧栏并排、不重叠）
+[PASS] docked：侧栏左边缘与内容页右边缘对齐（精确平铺）
+[PASS] docked：打开侧栏后进程仍存活（未死锁）
+```
+
+这证明「docked 模式下侧栏滑到位后 `on_done` 里的 `layout_main_webviews`
+确实把内容页收窄、并与侧栏精确平铺」在真机上成立 —— 这是本版并排模式改动的
+**核心后果**，不是只靠单测推断的。
+
+> 同一次 run 里第 7/8 节失败，但那是**冒烟脚本自身**的缺陷（新加的 docked 检查
+> 杀掉了后续断言依赖的进程），不是产品缺陷 —— 已在下一个提交修复。
+> 详见第 9 节。
+
 > ⚠️ 上一版「overlay 分支先起动画再 layout」的不变量被保留；docked 与 overlay
 > **唯一**差别变成「内容页什么时候收窄」，布局策略仍只由纯函数 `main_webview_rects` 决定。
 

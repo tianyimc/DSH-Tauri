@@ -62,6 +62,9 @@ pub struct SuspendSlot {
     suspended: AtomicBool,
 }
 
+// 非 Windows 上 `imp` 是空实现，用不到这几个方法（但**测试**要用，且 Windows 实现要用）
+// ⇒ 只在非 Windows 构建里放行 dead_code，避免给 Linux 开发者留一堆无意义警告。
+#[cfg_attr(not(windows), allow(dead_code))]
 impl SuspendSlot {
     const fn new() -> Self {
         Self {
@@ -226,25 +229,6 @@ mod imp {
         });
     }
 
-    /// 同步查询是否处于挂起态。
-    ///
-    /// ⚠️ 只给**非主线程**用（内部会阻塞等主线程回结果）。
-    /// 目前只有 cookie 保活线程需要它，而那是独立后台线程，安全。
-    pub fn is_suspended_blocking<R: Runtime>(webview: &tauri::Webview<R>) -> Option<bool> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let _ = webview.with_webview(move |platform| {
-            let controller = platform.controller();
-            let value = core3(&controller).and_then(|core3| {
-                let mut out = BOOL(0);
-                unsafe { core3.IsSuspended(&mut out) }.ok().map(|_| out.as_bool())
-            });
-            let _ = tx.send(value);
-        });
-        // 超时兜底：万一事件循环正忙，不要让保活线程卡死。
-        rx.recv_timeout(std::time::Duration::from_millis(500))
-            .ok()
-            .flatten()
-    }
 }
 
 // ===========================================================================
@@ -259,12 +243,9 @@ mod imp {
     pub fn suspend<R: Runtime>(_webview: &tauri::Webview<R>, _slot: &'static SuspendSlot) {}
     pub fn resume<R: Runtime>(_webview: &tauri::Webview<R>, _slot: &'static SuspendSlot) {}
     pub fn set_controller_visible<R: Runtime>(_webview: &tauri::Webview<R>, _visible: bool) {}
-    pub fn is_suspended_blocking<R: Runtime>(_webview: &tauri::Webview<R>) -> Option<bool> {
-        None
-    }
 }
 
-pub use imp::{is_suspended_blocking, resume, set_controller_visible, suspend};
+pub use imp::{resume, set_controller_visible, suspend};
 
 /// cookie 保活是否应当**跳过**这个 webview。
 ///

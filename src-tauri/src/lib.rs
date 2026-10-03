@@ -716,13 +716,84 @@ fn navigate_content<R: Runtime>(app: &AppHandle<R>, url: tauri::Url) -> Result<(
 
 /// 主窗口（连同顶栏、内容、侧栏）整体隐藏 —— 「关闭 = 隐藏到托盘」走这里。
 ///
-/// 子 webview 随父窗口一起隐藏，不需要逐个处理。
+/// v0.3.4：隐藏之后**挂起内容页与侧栏**。
+///
+/// # 为什么收托盘是最该省内存的时刻
+///
+/// 用户实测「平时非活动 350–450MB」，而 CI 采样显示收托盘后（采样点 5）与
+/// 收托盘前（采样点 2）**几乎一样** —— 因为 `Window::hide()` **只隐藏 HWND**，
+/// 子 webview 的 `CoreWebView2Controller::IsVisible` 仍然是 `true`：
+/// DSH 页面的 JS 定时器、WebSocket、轮询全都在继续跑，renderer 一点没闲着。
+///
+/// # 为什么必须先显式 `SetIsVisible(false)`
+///
+/// `TrySuspend` 的硬性前置条件是 controller 的 `IsVisible == false`，
+/// 否则直接返回 `HRESULT_FROM_WIN32(ERROR_INVALID_STATE)`。
+/// 子 webview 的 `hide()` 会设它，但主窗口的 `hide()` **不会** ——
+/// 所以这条路径必须自己设。这正是它与「关侧栏挂起 chat」的关键区别。
+///
+/// # 线程安全
+///
+/// 本函数在 `CloseRequested` 事件处理器里被调用（**主线程**）。
+/// `with_webview` 在主线程上是**同步执行闭包**（不像 `add_child` 那样
+/// `run_on_main_thread` + `recv()` 自等 ⇒ 死锁），闭包里只做 COM 调用、
+/// 不再回调 Tauri，所以安全。
 fn hide_main_windows<R: Runtime>(app: &AppHandle<R>) {
     // 先掐掉可能还在跑的侧栏过渡动画：窗口都要收起来了，
     // 让一个后台线程继续改 webview 位置既没意义，也可能和「重新显示」打架。
     anim::cancel();
     if let Some(main) = app.get_window(MAIN_LABEL) {
         let _ = main.hide();
+    }
+    // 窗口已隐藏，现在把子 webview 也真正「停」下来。
+    suspend_main_webviews(app);
+}
+
+/// 收托盘时挂起主窗口里的子 webview（内容页 + 若开着的侧栏）。
+///
+/// 顺序很重要：**先 `SetIsVisible(false)`、再 `TrySuspend`**。
+/// 反了会因 `ERROR_INVALID_STATE` 静默失效（不报错、也没省到内存）。
+fn suspend_main_webviews<R: Runtime>(app: &AppHandle<R>) {
+    for (label, slot) in [
+        (CONTENT_LABEL, &wv_suspend::CONTENT_SUSPEND),
+        (CHAT_LABEL, &wv_suspend::CHAT_SUSPEND),
+    ] {
+        let Some(webview) = app.get_webview(label) else {
+            continue;
+        };
+        // 侧栏若本来就没打开，它的 controller 已是 invisible 且已挂起
+        // （关侧栏那条路径做过）—— 这里再调一遍是幂等的，不做额外判断。
+        wv_suspend::set_controller_visible(&webview, false);
+        wv_suspend::suspend(&webview, slot);
+    }
+}
+
+/// 从托盘恢复主窗口时，把子 webview 唤醒。
+///
+/// 顺序与挂起相反：**先 `Resume()`、再 `SetIsVisible(true)`** ——
+/// 与微软官方示例一致（`Resume(); put_IsVisible(TRUE);`）。
+///
+/// ⚠️ 必须放在显示流程的**最前面**且幂等：万一这里出错导致内容页一直不可见，
+/// 用户看到的就是「窗口回来了但是一片空白」—— 比不省内存严重得多。
+fn resume_main_webviews<R: Runtime>(app: &AppHandle<R>) {
+    for (label, slot) in [
+        (CONTENT_LABEL, &wv_suspend::CONTENT_SUSPEND),
+        (CHAT_LABEL, &wv_suspend::CHAT_SUSPEND),
+    ] {
+        let Some(webview) = app.get_webview(label) else {
+            continue;
+        };
+        // 侧栏若当前不该可见，就不要把它弄成可见 —— 否则会在内容页右侧
+        // 露出一块「本应隐藏」的侧栏。
+        let should_be_visible = if label == CHAT_LABEL {
+            CHAT_VISIBLE.load(Ordering::Relaxed)
+        } else {
+            true
+        };
+        if should_be_visible {
+            wv_suspend::resume(&webview, slot);
+            wv_suspend::set_controller_visible(&webview, true);
+        }
     }
 }
 
@@ -731,6 +802,9 @@ fn show_main_windows<R: Runtime>(app: &AppHandle<R>) {
     let Some(main) = app.get_window(MAIN_LABEL) else {
         return;
     };
+    // ⚠️ 最先恢复子 webview（在 show() 之前）：它们可能在收托盘时被挂起了，
+    // 不先唤醒就会出现「窗口回来了但内容页空白」。
+    resume_main_webviews(app);
     let _ = main.unminimize();
     let _ = main.show();
     let _ = main.set_focus();
@@ -1824,6 +1898,17 @@ async fn open_main_window_inner(app: &AppHandle, request: OpenRequest) -> Result
     // 重建同 label 的窗口要等旧窗口从 Tauri 的注册表里摘掉，而 WebView2 的销毁是异步的，
     // 很容易出现「新窗口建不出来 / 卡住」，表现为点了没反应。
     if app.get_window(MAIN_LABEL).is_some() {
+        // ⚠️ **先唤醒子 webview，再导航**（v0.3.4 加）。
+        //
+        // 主窗口可能是「收进托盘时被挂起」的状态。若在挂起态直接 `navigate`：
+        // 文档说 `Navigate` 会**自动恢复** webview，所以未必出问题，但依赖这个
+        // 隐式行为很脆弱；而且我们的记账（`CONTENT_SUSPEND`）不会同步更新，
+        // 于是 cookie 保活会一直以为它挂起、把持久化全跳过。
+        // 显式恢复一次，代价是几毫秒，换来状态一致。
+        //
+        // 注意顺序仍是「先恢复 → 再导航 → 最后才 show()」：
+        // 不能在导航前就 `show()`，否则用户会先看到**旧页面**闪一下再切走。
+        resume_main_webviews(app);
         navigate_content(app, url)?;
         if let Some(main) = app.get_window(MAIN_LABEL) {
             let _ = main.unminimize();

@@ -1613,6 +1613,102 @@ section("12. v0.3.4：WebView2 挂起、销毁 about/settings");
       /build_with_retry\("打开设置窗口失败"/.test(libCode2),
     "重建没有重试 —— 「关闭关于窗口后立刻再打开」可能失败",
   );
+
+  // ---- 收托盘：挂起 content / chat（v0.3.4 阶段 3）----
+  //
+  // 关键点：`Window::hide()` **只隐藏 HWND**，子 webview 的 controller 仍认为可见
+  // ⇒ `TrySuspend` 会因 ERROR_INVALID_STATE 失败。所以必须先显式 SetIsVisible(false)。
+  const hideFn = extractRustFnBody(libCode2, "hide_main_windows");
+  check(
+    "hide_main_windows 会挂起子 webview（收托盘是最该省内存的时刻）",
+    hideFn !== null && /suspend_main_webviews\s*\(/.test(hideFn),
+    "收托盘只隐藏窗口、没挂起 —— DSH 页面仍在满速跑（CI 采样点 5≈2 就是这个原因）",
+  );
+
+  const suspFn = extractRustFnBody(libCode2, "suspend_main_webviews");
+  check(
+    "suspend_main_webviews 同时处理 content 与 chat",
+    suspFn !== null && /CONTENT_LABEL/.test(suspFn) && /CHAT_LABEL/.test(suspFn),
+    "只挂起了其中一个 —— 另一个的 renderer 仍在占内存",
+  );
+  if (suspFn !== null) {
+    // 顺序：必须先 set_controller_visible(false)，再 suspend。
+    const visIdx = suspFn.indexOf("set_controller_visible");
+    const susIdx = suspFn.indexOf("wv_suspend::suspend");
+    check(
+      "先 SetIsVisible(false) 再 TrySuspend（顺序反了会 ERROR_INVALID_STATE 静默失效）",
+      visIdx !== -1 && susIdx !== -1 && visIdx < susIdx,
+      `顺序错误：set_controller_visible 在第 ${visIdx} 字符、suspend 在第 ${susIdx} 字符`,
+    );
+  }
+
+  const resFn = extractRustFnBody(libCode2, "resume_main_webviews");
+  check(
+    "resume_main_webviews 会唤醒子 webview",
+    resFn !== null && /wv_suspend::resume/.test(resFn),
+    "没有恢复逻辑 —— 从托盘回来会是一片空白",
+  );
+  if (resFn !== null) {
+    // 恢复顺序与挂起相反：先 Resume，再置可见。
+    const resIdx = resFn.indexOf("wv_suspend::resume");
+    const visIdx2 = resFn.indexOf("set_controller_visible");
+    check(
+      "先 Resume() 再 SetIsVisible(true)（与微软官方示例顺序一致）",
+      resIdx !== -1 && visIdx2 !== -1 && resIdx < visIdx2,
+      `顺序错误：resume 在第 ${resIdx} 字符、set_controller_visible 在第 ${visIdx2} 字符`,
+    );
+    // 侧栏不该被「恢复」成可见 —— 否则内容页右侧会露出一块本应隐藏的侧栏。
+    check(
+      "恢复时按 CHAT_VISIBLE 决定侧栏是否置可见（不强行显示隐藏的侧栏）",
+      /CHAT_VISIBLE/.test(resFn),
+      "恢复时无条件把侧栏置可见 —— 会在内容页右侧露出一块本应隐藏的侧栏",
+    );
+  }
+
+  const showFn = extractRustFnBody(libCode2, "show_main_windows");
+  if (showFn !== null) {
+    const resumeIdx = showFn.indexOf("resume_main_webviews");
+    const showIdx2 = showFn.indexOf("main.show()");
+    check(
+      "show_main_windows 在 show() 之前先恢复子 webview",
+      resumeIdx !== -1 && showIdx2 !== -1 && resumeIdx < showIdx2,
+      "先 show() 再恢复 —— 用户会先看到一帧空白窗口",
+    );
+  }
+
+  // 「重新选择连接方式」那条路径也会 show 主窗口，同样必须先恢复。
+  const omwFn = extractRustFnBody(libCode2, "open_main_window_inner");
+  check(
+    "「重新选择连接方式」路径也会先恢复子 webview（否则切地址后页面是挂起的）",
+    omwFn !== null && /resume_main_webviews\s*\(/.test(omwFn),
+    "该路径直接 show() 主窗口 —— 从挂起状态切地址会留下挂起的内容页",
+  );
+  if (omwFn !== null) {
+    // 恢复必须在 navigate 之前：navigate 会隐式自动恢复，但那样我们的记账
+    // （CONTENT_SUSPEND）不会同步，cookie 保活会一直误判为「挂起」而全部跳过。
+    const rIdx = omwFn.indexOf("resume_main_webviews");
+    const nIdx = omwFn.indexOf("navigate_content");
+    check(
+      "先恢复、再导航（避免依赖 Navigate 的隐式自动恢复导致记账不同步）",
+      rIdx !== -1 && nIdx !== -1 && rIdx < nIdx,
+      "navigate 在 resume 之前 —— 状态记账会不同步，cookie 保活会被错误跳过",
+    );
+  }
+
+  // 冒烟里必须有「挂起真的生效」的行为断言（不靠内存数字）。
+  const smoke2 = readIfExists("scripts/smoke-windows.ps1");
+  if (smoke2 !== null) {
+    check(
+      "冒烟用「心跳停止」验证挂起真的生效（行为证据，比内存阈值稳定）",
+      /心跳停止/.test(smoke2) && /\/hb/.test(smoke2),
+      "冒烟没有行为断言 —— 挂起是否生效只能靠内存数字猜",
+    );
+    check(
+      "冒烟验证恢复后页面心跳恢复（兜住「窗口回来但空白」的最坏情况）",
+      /心跳恢复/.test(smoke2),
+      "没有恢复断言 —— 恢复失败会导致内容页永久空白却测不出来",
+    );
+  }
 }
 
 /* ------------------------------------------------------------------ 汇总 */

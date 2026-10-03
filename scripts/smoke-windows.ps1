@@ -309,9 +309,25 @@ function Start-TestServer([int]$ListenPort, [string]$LogFile) {
   $js = Join-Path $WORK "httpd-$ListenPort.js"
   @"
 const http=require('http'),fs=require('fs');
+// v0.3.4：页面里放一个 input（模拟「用户没发出去的草稿」）并每秒心跳上报它的值。
+//
+// 为什么要这个：收托盘时我们挂起内容页（WebView2 TrySuspend）。挂起会
+// **暂停页面脚本定时器**，所以「心跳是否停止」就是「挂起是否真的生效」的
+// 直接行为证据 —— 比看内存数字稳定得多。
+//
+// nonce 每次加载随机生成：一旦页面被**重新加载/导航**，nonce 就会变，
+// 于是我们能用它区分「挂起后恢复（DOM 原样）」与「被重载（草稿丢了）」。
+const page = '<!doctype html><meta charset=utf-8><title>DSH $ListenPort</title>' +
+  '<h1>OK $ListenPort</h1><input id="draft">' +
+  '<script>' +
+  'var nonce=Math.random().toString(36).slice(2);' +
+  'document.getElementById("draft").value="DRAFT-"+nonce;' +
+  'function hb(){fetch("/hb?n="+nonce+"&d="+encodeURIComponent(document.getElementById("draft").value));}' +
+  'hb();setInterval(hb,1000);' +
+  '<\/script>';
 http.createServer((q,s)=>{fs.appendFileSync(process.argv[2],q.method+' '+q.url+'\n');
 s.writeHead(200,{'Content-Type':'text/html; charset=utf-8'});
-s.end('<!doctype html><meta charset=utf-8><title>DSH $ListenPort</title><h1>OK $ListenPort</h1>');})
+s.end(page);})
 .listen($ListenPort,'127.0.0.1');
 "@ | Set-Content -Path $js -Encoding UTF8
   Set-Content -Path $LogFile -Value "" -NoNewline
@@ -596,6 +612,12 @@ try {
       "其链路由 test-titlebar.mjs 的 lib.rs 契约对账 + capability 断言覆盖。"
 
     Write-Host "== 7. 关闭主窗口 = 隐藏到托盘 =="
+    # v0.3.4：先记下收托盘前的草稿 nonce，用来确认测试页真的设置了草稿
+    # （否则后面的心跳断言只是空跑）。
+    $draftBefore = ""
+    $mDraft = [regex]::Match((Get-Content $LOG_A -Raw), "d=([A-Za-z0-9\-]+)")
+    if ($mDraft.Success) { $draftBefore = $mDraft.Groups[1].Value }
+
     [void][Win32]::PostMessage($main, [Win32]::WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero)
     Start-Sleep -Seconds 5
     Check "关闭后进程仍存活" (-not $proc.HasExited)
@@ -603,9 +625,27 @@ try {
       "IsWindowVisible=$([Win32]::IsWindowVisible($main))"
 
     # 阶段 0 采样点 5：已收进托盘 —— 关键对比点！
-    # 当前实现只 `main.hide()`，子 webview 的 controller 仍认为可见 ⇒ DSH 页面继续跑，
-    # 数字应当与采样点 2 接近。阶段 3（托盘挂起 content）就是要让这里明显下降。
     Write-MemSample "5-已收进托盘" $proc.Id
+
+    # ---- v0.3.4：挂起必须真的生效（用**行为**验证，不靠内存数字）----
+    #
+    # 页面每秒发一次 `/hb` 心跳。`TrySuspend` 会暂停页面脚本定时器，
+    # 所以「收托盘后心跳停了」就是「挂起生效」的直接证据 —— 比内存阈值稳定得多
+    # （内存受共享 runner 上其它进程影响，抖动大）。
+    #
+    # ⚠️ 计数窗口必须**从挂起生效之后**开始：
+    # 上面已经等了 5s（给 `SetIsVisible(false)` + `TrySuspend` 生效的时间），
+    # 现在才取基线、再等 6s 比对 —— 这样测的是「隐藏期间的稳定状态」，
+    # 不会把「挂起还没生效的那几秒」算进来而让断言假性失败。
+    $hbBase = @(Select-String -Path $LOG_A -Pattern "/hb" -ErrorAction SilentlyContinue).Count
+    Start-Sleep -Seconds 6
+    $hbNow = @(Select-String -Path $LOG_A -Pattern "/hb" -ErrorAction SilentlyContinue).Count
+    $hbDelta = $hbNow - $hbBase
+    Check "收托盘后页面心跳停止（挂起真的生效，renderer 已休眠）" ($hbDelta -le 2) `
+      "隐藏稳定后 6 秒内仍新增 $hbDelta 次心跳（预期 ≤2）—— 挂起没生效，页面仍在满速跑"
+
+    # ---- v0.3.4：恢复后页面必须真的在跑 ----
+    # 由第 8 节的「恢复后心跳」断言覆盖（那里会重新显示主窗口）。
   }
 
   # ======================================================= B. 切换连接方式
@@ -630,6 +670,26 @@ try {
     Check "切换后主窗口可见" ([Win32]::IsWindowVisible($main))
     $logB = Get-Content $LOG_B -Raw
     Check "新地址($Port2)收到 WebView2 的请求（确实切过去了）" ($logB -match "GET /") "日志：'$logB'"
+
+    # ---- v0.3.4：从挂起中恢复后，页面必须真的在跑 ----
+    #
+    # 恢复路径是 `resume_main_webviews()`（先 Resume + SetIsVisible(true)）。
+    # 页面每秒发心跳，所以「恢复后 LOG_B 有 /hb」就是「内容页真的活过来了」的证据。
+    # 这条同时兜住最坏情况：如果恢复失败，内容页会一直不可见/不跑，
+    # 用户看到的就是「窗口回来了但一片空白」。
+    #
+    # 为什么这里不测「草稿内容是否保留」：本节会把内容页**导航**到新地址，
+    # 导航必然重新加载页面（nonce 会变），所以测不出「挂起是否丢 DOM」。
+    # 那条由「收托盘后心跳停止」的行为断言 + Rust 状态机单测覆盖，
+    # 真机观感留给用户验收 —— 不在这里伪造一条测不准的断言。
+    $hbB = @(Select-String -Path $LOG_B -Pattern "/hb" -ErrorAction SilentlyContinue).Count
+    Check "从挂起恢复后内容页心跳恢复（页面真的活过来了）" ($hbB -ge 1) `
+      "恢复后没有收到任何心跳 —— 内容页可能仍处于挂起/不可见状态"
+
+    # 草稿 nonce 必须在收托盘**之前**就已写入页面（证明测试页真的设置了草稿），
+    # 否则上面的「心跳」断言只是空跑。
+    Check "测试页确实写入过草稿（nonce 非空）" ($draftBefore -ne "") `
+      "收托盘前没在日志里看到草稿 nonce —— 测试页脚本可能没执行"
 
     # 阶段 0 采样点 6：从托盘恢复（主窗口重新可见、内容页已加载新地址）
     # 用来对比采样点 5，确认「恢复」后内存回到正常水平（阶段 3 的挂起必须能正确恢复）。

@@ -115,6 +115,19 @@ function Get-AppMemoryMB([int]$RootPid) {
   }
 }
 
+# 系统可用物理内存（MB）。用来解释「为什么挂起后工作集没降」——
+# 微软文档说 TrySuspend 是「allows the OS to **reuse** the memory」，
+# 即把内存标记为**可回收**，而不是立刻释放。若系统本来就有大量空闲内存，
+# 内核没有理由去回收，工作集自然不变。把可用内存一起记下来，
+# 才能区分「挂起没生效」与「挂起生效了但系统不急着回收」。
+function Get-AvailableMemMB {
+  try {
+    $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+    if ($os) { return [math]::Round([long]$os.FreePhysicalMemory / 1KB, 1) }
+  } catch { }
+  return -1
+}
+
 function Write-MemSample([string]$Stage, [int]$RootPid) {
   if ($RootPid -le 0) { return }
   try {
@@ -123,8 +136,9 @@ function Write-MemSample([string]$Stage, [int]$RootPid) {
     Write-Host "  [INFO] 内存采样失败（$Stage）：$($_.Exception.Message)" -ForegroundColor DarkYellow
     return
   }
-  $line = "  [MEM] {0,-34} 工作集 {1,7} MB | 私有 {2,7} MB | WebView2 进程 {3}" -f `
-    $Stage, $m.WorkingSetMB, $m.PrivateMB, $m.WebViewProcs
+  $avail = Get-AvailableMemMB
+  $line = "  [MEM] {0,-34} 工作集 {1,7} MB | 私有 {2,7} MB | WebView2 进程 {3} | 系统可用 {4} MB" -f `
+    $Stage, $m.WorkingSetMB, $m.PrivateMB, $m.WebViewProcs, $avail
   Write-Host $line -ForegroundColor Cyan
   $script:MemSamples += [pscustomobject]@{
     Stage = $Stage; WorkingSetMB = $m.WorkingSetMB; PrivateMB = $m.PrivateMB

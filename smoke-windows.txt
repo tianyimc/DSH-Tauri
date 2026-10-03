@@ -1,0 +1,187 @@
+run_id: 37125944214
+sha:    e5be38307a1bd54905b87307a554b33a0d9c364a
+result: success
+session: 2
+
+===== app.docked.log =====
+
+===== app.docked.log.err =====
+[DSHTauri] 顶栏 webview 已创建
+[DSHTauri] 主窗口已创建：pos=Ok(PhysicalPosition { x: 0, y: 0 }) size=Ok(PhysicalSize { width: 1044, height: 788 }) visible=Ok(true)
+[DSHTauri] 对话侧栏 webview 已创建
+
+
+===== app.log =====
+
+===== app.log.2 =====
+
+===== app.log.2.err =====
+[DSHTauri] 顶栏 webview 已创建
+[DSHTauri] 主窗口已创建：pos=Ok(PhysicalPosition { x: 0, y: 0 }) size=Ok(PhysicalSize { width: 1044, height: 788 }) visible=Ok(true)
+
+
+===== app.log.cookie1 =====
+
+===== app.log.cookie1.err =====
+[DSHTauri] 顶栏 webview 已创建
+[DSHTauri] 主窗口已创建：pos=Ok(PhysicalPosition { x: 0, y: 0 }) size=Ok(PhysicalSize { width: 1044, height: 788 }) visible=Ok(true)
+
+
+===== app.log.cookie2 =====
+
+===== app.log.cookie2.err =====
+[DSHTauri] 顶栏 webview 已创建
+[DSHTauri] 主窗口已创建：pos=Ok(PhysicalPosition { x: 0, y: 0 }) size=Ok(PhysicalSize { width: 1044, height: 788 }) visible=Ok(true)
+
+
+===== app.log.err =====
+[DSHTauri] 顶栏 webview 已创建
+[DSHTauri] 主窗口已创建：pos=Ok(PhysicalPosition { x: 0, y: 0 }) size=Ok(PhysicalSize { width: 1044, height: 788 }) visible=Ok(true)
+[DSHTauri] 对话侧栏 webview 已创建
+[DSHTauri] 对话侧栏已隐藏
+
+
+===== cookie-3090.js =====
+const http = require("http"), fs = require("fs");
+// 页面先把「当前已有的 cookie」上报，再设置两种 cookie，最后再上报一次。
+// 于是第二次启动时的 /before 就能看出哪些 cookie 真的落盘了。
+const page = "<!doctype html><meta charset=utf-8><title>COOKIE</title><script>" +
+  "fetch('/before?c='+encodeURIComponent(document.cookie));" +
+  "document.cookie='persist=1; Max-Age=86400; Path=/';" +
+  "document.cookie='sess=1; Path=/';" +
+  "fetch('/after?c='+encodeURIComponent(document.cookie));" +
+  "<\/script>";
+http.createServer((q, s) => {
+  fs.appendFileSync(process.argv[2], q.url + "\n");
+  s.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+  s.end(page);
+}).listen(process.argv[3], "127.0.0.1");
+
+
+===== cookie.log =====
+/
+/before?c=persist%3D1%3B%20sess%3D1
+/after?c=persist%3D1%3B%20sess%3D1
+/favicon.ico
+
+
+===== fake-service.js =====
+const http = require('http');
+http.createServer((q, s) => s.end('service')).listen(3099, '127.0.0.1');
+setInterval(() => {}, 1000);
+
+
+===== httpd-3080.js =====
+const http=require('http'),fs=require('fs');
+http.createServer((q,s)=>{fs.appendFileSync(process.argv[2],q.method+' '+q.url+'\n');
+s.writeHead(200,{'Content-Type':'text/html; charset=utf-8'});
+s.end('<!doctype html><meta charset=utf-8><title>DSH 3080</title><h1>OK 3080</h1>');})
+.listen(3080,'127.0.0.1');
+
+
+===== httpd-3080.log =====
+GET /
+GET /favicon.ico
+GET /
+GET /favicon.ico
+
+
+===== httpd-3081.js =====
+const http=require('http'),fs=require('fs');
+http.createServer((q,s)=>{fs.appendFileSync(process.argv[2],q.method+' '+q.url+'\n');
+s.writeHead(200,{'Content-Type':'text/html; charset=utf-8'});
+s.end('<!doctype html><meta charset=utf-8><title>DSH 3081</title><h1>OK 3081</h1>');})
+.listen(3081,'127.0.0.1');
+
+
+===== httpd-3081.log =====
+GET /
+GET /favicon.ico
+
+
+===== smoke-console.txt =====
+== 0. 前置检查 ==
+  [PASS] 应用可执行文件存在
+  [PASS] Node 可用
+== 1. 启动两个测试服务 ==
+  [PASS] 测试服务 3080 已就绪
+  [PASS] 测试服务 3081 已就绪
+== 2. 预置配置（本地 + 远程都配好，便于测试切换）==
+  [PASS] config.json 已写入
+== 3. 启动 DSHTauri ==
+  [PASS] 进程存活
+== 4. 选择窗口 ==
+  [PASS] 选择窗口已出现（标题或 560x460 客户区）
+  选择窗口：hwnd=66062 title='选择 DSH 连接方式' client=560x460
+  启动后窗口清单：hwnd=131672 title='' client=752x480 visible=False hung=False | hwnd=66062 title='选择 DSH 连接方式' client=560x460 visible=True hung=False | hwnd=327706 title='' client=0x0 visible=True hung=False | hwnd=262492 title='' client=0x0 visible=True hung=False | hwnd=131422 title='Default IME' client=0x0 visible=False hung=False | hwnd=66070 title='MSCTFIME UI' client=0x0 visible=False hung=False
+  [PASS] 选择窗口未卡死
+== 5. 点击「本地」= ==
+== 6. 主窗口 ==
+  [PASS] 主窗口已出现（标题 DSHTauri 或 ~1200x800 客户区）
+  主窗口标题='DSHTauri' 客户区=1028x779
+  [PASS] 主窗口没有卡死（IsHungAppWindow=false）
+  [PASS] 主窗口响应 WM_NULL 不超时
+  [PASS] 主窗口可见
+  [PASS] 本地服务(3080)收到 WebView2 的请求
+  [PASS] 首次连接后选择窗口已隐藏
+== 6.5 顶栏子 webview（新架构：主窗口内的子 webview）==
+  客户区=1028x779 DPI=96 scale=1.00 期望顶栏高=40px(±6)
+    子窗口 0x10274 class=WRY_WEBVIEW rect=(0,0) 1028x40
+    子窗口 0x10276 class=Chrome_WidgetWin_0 rect=(0,0) 1028x40
+    子窗口 0x10278 class=Chrome_WidgetWin_1 rect=(0,0) 1028x40
+    子窗口 0x1027A class=Chrome_RenderWidgetHostHWND rect=(0,0) 1028x40
+    子窗口 0x1027E class=Intermediate D3D Window rect=(0,0) 1028x40
+    子窗口 0x10268 class=WRY_WEBVIEW rect=(0,40) 1028x739
+    子窗口 0x1026A class=Chrome_WidgetWin_0 rect=(0,40) 1028x739
+    子窗口 0x1026C class=Chrome_WidgetWin_1 rect=(0,40) 1028x739
+    子窗口 0x1026E class=Chrome_RenderWidgetHostHWND rect=(0,40) 1028x739
+    子窗口 0x10272 class=Intermediate D3D Window rect=(0,40) 1028x739
+  [PASS] 顶栏子 webview 位于客户区顶部且高≈40×scale（未被 DPI 双重缩放）
+  [PASS] 内容子 webview 在顶栏下方且占据主体高度
+== 6.6 点「网页对话」不得卡死（缺陷 1 回归）==
+  [PASS] 点「网页对话」后主窗口没有卡死（IsHungAppWindow=false）
+  [PASS] 点「网页对话」后主窗口仍响应 WM_NULL（未死锁）
+  [PASS] 点「网页对话」后进程仍存活
+  [PASS] 点「网页对话」后多出侧栏子 webview
+  [PASS] 动画结束后侧栏停在客户区右侧（overlay 目标位置）
+  [PASS] 再次点击收起侧栏后仍响应（可反复切换）
+== 6.7 设置窗口（v0.3.0 新增）==
+  [INFO] 设置窗口通过原生菜单打开，CI 不点系统菜单； 其链路由 test-titlebar.mjs 的 lib.rs 契约对账 + capability 断言覆盖。
+== 7. 关闭主窗口 = 隐藏到托盘 ==
+  [PASS] 关闭后进程仍存活
+  [PASS] 关闭后主窗口不可见（已隐藏到托盘）
+== 8. 切换连接方式（模拟托盘「重新选择连接方式」）==
+  [PASS] 选择窗口重新显示成功
+  [PASS] 切换后主窗口仍然存在（复用而非销毁重建）
+  [PASS] 切换后主窗口没有卡死
+  [PASS] 切换后主窗口可见
+  [PASS] 新地址(3081)收到 WebView2 的请求（确实切过去了）
+  [PASS] 切换后主窗口仍是活动窗口
+== 9. 自动启动的本地服务必须随主程序退出而结束 ==
+  [PASS] 服务端口 3099 启动前是关闭的
+  [PASS] 选择窗口已出现（第二轮）
+  [PASS] 自动启动的本地服务确实起来了（端口 3099 在监听）
+  [PASS] 主程序退出后本地服务已结束（端口 3099 关闭）
+== 10. Cookie / 登录态必须跨重启保留 ==
+  [PASS] Cookie 测试服务已就绪
+  [PASS] 第一次运行：页面成功写入 cookie
+  [PASS] 持久 cookie 跨重启保留
+  [PASS] 会话 cookie 也被转成持久 cookie（跨重启保留）
+  [PASS] docked：内容页让出侧栏宽度（与侧栏并排、不重叠）
+  [PASS] docked：侧栏左边缘与内容页右边缘对齐（精确平铺）
+  [PASS] docked：打开侧栏后进程仍存活（未死锁）
+True
+== 清理 ==
+--- app.log.err ---
+[DSHTauri] 顶栏 webview 已创建
+[DSHTauri] 主窗口已创建：pos=Ok(PhysicalPosition { x: 0, y: 0 }) size=Ok(PhysicalSize { width: 1044, height: 788 }) visible=Ok(true)
+[DSHTauri] 对话侧栏 webview 已创建
+[DSHTauri] 对话侧栏已隐藏
+
+--- app.log.2.err ---
+[DSHTauri] 顶栏 webview 已创建
+[DSHTauri] 主窗口已创建：pos=Ok(PhysicalPosition { x: 0, y: 0 }) size=Ok(PhysicalSize { width: 1044, height: 788 }) visible=Ok(true)
+
+
+== 结果: 41 通过, 0 失败 ==
+

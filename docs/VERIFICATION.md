@@ -544,3 +544,123 @@ v0.3.1 的 docked 分支**刻意不做滑动**，直接切到位，理由是「�
 > `win_icon.rs` 的 `ICON_BIG` 断言只查字符串（`use` 语句里就有它，把调用点改成字面量 `0` 也能通过），
 > 以及 NSIS 的 `STARTMENUFOLDER` 正则漏了 `}` 导致那条断言**从未执行**。
 > 两次都是「守卫本身失效」—— 只跑自己写的测试永远发现不了，这是独立验证的核心价值。
+
+---
+
+# v0.3.3 验证记录
+
+发布前收尾：修复「关于 / 设置」窗口图标不跟随主题、统一页内 logo、补齐许可证与官方免责声明。
+
+## 1. 「关于 / 设置」窗口图标不跟随主题（任务 3）
+
+### 根因（创建时机，不是「没做适配」）
+
+`apply_theme_icons()` 只在**三个时刻**执行：`setup()` 末尾、主窗口创建后、
+`WindowEvent::ThemeChanged`。而「关于」/「设置」窗口是用户在菜单里点击时
+**按需创建**的（`show_about_window` / `show_settings_window`），远晚于这些时刻。
+
+于是它们拿到的是 Tauri 的**默认窗口图标** —— bundle 里那个静态 `icon.ico`
+（固定深藏青），之后**再没有任何机会被纠正**：`apply_theme_icons` 里那句
+`for label in [...] { set_icon }` 只对**当时已存在**的窗口生效。
+
+### 修法
+
+1. 新增 `set_creation_icon()`：每个窗口 `.build()` 成功后立刻设一次图标。
+   三个创建点全部接上（选择窗口 / 关于 / 设置）。
+2. 新增 `creation_icon()`：**优先读注册表**（`AppsUseLightTheme`），
+   读不到才退回 `current_theme()`。
+   - 为什么必须这样：创建**第一个**窗口（选择窗口）时**一个窗口都还没有**，
+     `Window::theme()` 无从询问 ⇒ 只能返回 `None` ⇒ 按「深色」给**白色**鲸鱼
+     ⇒ 浅色系统的白色标题栏上几乎看不见。
+3. 用 `set_icon(&self)` 而**不是** `builder.icon(self)`：后者**按值消耗** builder
+   并返回 `Result`，一旦失败原 builder 已被移走、**无法回退**，窗口就建不出来。
+   图标是锦上添花，不该有能力阻止窗口打开。
+
+### 证据
+
+| 检查 | 证据 |
+| --- | --- |
+| 三个创建点都设图标 | 单测 `creation_icon_is_wired_into_all_window_builders`（逐变量名断言） |
+| 无窗口时也能拿到图标 | 单测 `creation_icon_is_available_without_any_window` |
+| 静态守卫 | `verify-titlebar.mjs` 第 11 节：`set_creation_icon` 定义 + 三个调用点 + `creation_icon` 读注册表 |
+
+## 2. 页内 logo 仍是 emoji（任务 4）
+
+**现象**：`src/about.html` 用 `🐋`、`src/settings.html` 用 `⚙️` 作为 logo 占位，
+与托盘 / 任务栏 / 标题栏的统一鲸鱼**不是同一只**。
+
+**修法**：新增前端图片资源并按主题切换（与其余各处同一只鲸鱼）：
+
+| 文件 | 内容 | 用途 |
+| --- | --- | --- |
+| `src/logo-on-light.png` | 深藏青 `#020E36` 鲸鱼，透明底 | 浅色背景显示 |
+| `src/logo-on-dark.png` | 白色鲸鱼，透明底 | 深色背景显示 |
+
+- 由 `convert ... PNG32:` 强制 RGBA 生成 —— 源 `tray-dark.png` 是 **ch=2**（灰度+alpha），
+  不强制会保留灰度形式。
+- 实测：两者均为 **64×64 / ch=4**，不透明像素数**完全相同**（1375），
+  中心像素分别是 `(255,255,255,255)` 与 `(2,14,54,255)` ⇒ **同一只鲸鱼的两个配色**。
+- CSS 用 `@media (prefers-color-scheme: dark)` 切换显隐（`about.css` / `settings.css` 都改）。
+
+## 3. 页内外部链接会把「关于」窗口顶掉（自查发现的连带问题）
+
+WebView2 里的本地页面，`<a target="_blank">` 在 Tauri 中**不保证**会开新窗口 ——
+可能把「关于」窗口自己导航走，用户点一下链接界面就回不来了。
+
+**修法**：`about.js` 统一拦截页内 `http`/`https` 外链，`preventDefault()` 后交给
+Rust 的 `open_external`（与「检查更新」的下载按钮同一条路径，同样只允许 http/https）。
+
+## 4. 许可证与作者信息（任务 2）
+
+用户要求「必须永远保留原作者信息」，选用 **Apache-2.0**：
+
+| 文件 | 作用 |
+| --- | --- |
+| [`LICENSE`](../LICENSE) | Apache-2.0 全文（202 行），含版权行 `Copyright 2026 tianyimc` |
+| [`NOTICE`](../NOTICE) | 归属声明。**Apache-2.0 第 4(d) 条要求分发者必须保留它** —— 这正是「永远保留原作者信息」的强制机制 |
+
+README §6.2 由「未附带许可证 / All rights reserved」整段重写为 Apache-2.0 的准确描述
+（允许商用与修改，但必须保留版权与 NOTICE）。
+
+> ⚠️ 诚实说明：LICENSE 全文本身是标准模板（不含具体作者名），
+> **作者信息落在 `LICENSE` 末尾的 APPENDIX 版权行与 `NOTICE` 里**。
+> Apache-2.0 的「保留归属」义务正是通过这两处生效。
+
+## 5. README 第三方定位声明（任务 5）
+
+- 顶部醒目 ⚠️ 声明 + 新增 §1.1「第三方客户端声明：与 DeepSeek 官方无关」：
+  ① 非官方出品、未获背书授权；② 只把**你自己**跑起来的 DSH WebUI 装进窗口，
+  **不包含、不捆绑、也不代替** DSH 本体；③ 官方仓库链接 + 「需自行获取并运行 DSH」。
+- 新增 §1.2「相关链接」（本项目 / DSH 官方 / 作者主页），两个小节都挂进目录。
+- **DSH 官方链接的来源**：本机 `@deepseek-ai/dsh` 包的 `package.json` 里
+  `repository.url` = `git+https://github.com/deepseek-ai/deepseek-harness.git`
+  （`directory: apps/cli`）⇒ 链接取自官方包元数据，不是推测。
+
+## 6. 本轮本地实测汇总
+
+| 套件 | 结果 |
+| --- | --- |
+| `npm run test:js` | **111 通过 / 0 失败**（新增外链拦截与作者链接断言） |
+| `npm run verify` | **89 通过 / 0 失败**（v0.3.2 为 64；新增 25 项） |
+| `cargo test` | **50 通过 / 0 失败**（v0.3.2 为 48） |
+| `cargo check --target x86_64-pc-windows-msvc` | 类型检查通过（**未链接**，本机无 `link.exe`） |
+| Markdown 锚点 | README / CONTRIBUTER_README / CHANGELOG / docs 全部 **0 死链** |
+| 版本一致性 | `version.json`=`{"channel":"release"}`；三处版本号均为 `0.3.3`；显示 `v.0.3.3` |
+
+### 变异测试（本轮发现并修掉的假绿）
+
+新增断言逐条做了「故意改坏代码，确认会失败」的验证，过程中修掉 **2 处假绿**：
+
+| 假绿 | 为什么原来抓不住 | 修法 |
+| --- | --- | --- |
+| `creation_icon_is_wired_into_all_window_builders` 只数总次数（`>= 3`） | 测试自身源码里含 `"set_creation_icon(&"` 字面量，删掉一个真实调用后计数仍是 4 ⇒ 依然通过 | 改为逐**变量名**断言 `set_creation_icon(&about);` 等，删任何一个都失败 |
+| `about.js` 外链拦截的 `preventDefault` 断言全文件搜 | 文件里另有一处「通道卡片点击」的 `preventDefault`，删掉外链拦截里那处仍能匹配 | 先切出 `a[href]` 监听器作用域再断言 |
+
+### 仍未验证（必须真机 / 只能人工）
+
+- **图标与 logo 的真实显示效果**：本容器无 Windows/WebView2，无法渲染确认
+  （图片格式与像素已实测，但「看起来对不对」需人眼）。
+- **`prefers-color-scheme` 是否真的命中**：取决于 WebView2 / 系统主题设置，静态无法验证。
+- **`set_creation_icon` 在真机上的效果**：`CreateIcon`/`set_icon` 的实际返回与渲染待 CI 冒烟 + 人工验收。
+- **DPI 缩放下的清晰度**（125%/150%/200%）：未验证。
+- **NSIS 安装器行为**：同前几版，需真机安装确认。

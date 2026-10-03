@@ -1030,6 +1030,139 @@ if (lib !== null) {
   }
 }
 
+/* ============================================== 11. v0.3.3：窗口图标 + 页内 logo + 许可证 */
+
+section("11. v0.3.3：窗口图标、页内 logo、许可证");
+
+{
+  // ---- 窗口图标：按需创建的窗口必须在创建后立刻设图标 ----
+  //
+  // 「关于」/「设置」窗口是点菜单时才创建的，远晚于 `apply_theme_icons` 的最后一次调用，
+  // 所以必须在自己的创建路径里设一次，否则会一直用 bundle 里那个静态深藏青 icon.ico。
+  check(
+    "lib.rs 定义了 set_creation_icon（创建后立刻设主题图标）",
+    /fn\s+set_creation_icon/.test(libRaw),
+    "没有 set_creation_icon —— 按需创建的窗口会退回静态图标",
+  );
+  for (const varName of ["selector", "about", "settings"]) {
+    check(
+      `lib.rs 里 ${varName} 窗口创建后调用了 set_creation_icon`,
+      new RegExp(`set_creation_icon\\(&${varName}\\);`).test(libRaw),
+      `${varName} 窗口缺少 set_creation_icon 调用 —— 它的标题栏图标不会跟随主题`,
+    );
+  }
+  // 主题来源不能只靠 current_theme：创建第一个窗口时还没有任何窗口可问。
+  check(
+    "creation_icon 优先读注册表（不依赖已有窗口）",
+    /fn\s+creation_icon[\s\S]{0,600}?apps_prefers_light\s*\(/.test(libRaw),
+    "creation_icon 没有走注册表 —— 创建第一个窗口时拿不到主题，浅色系统上会错用白色鲸鱼",
+  );
+  const winIcon2 = readIfExists("src-tauri/src/win_icon.rs");
+  if (winIcon2 !== null) {
+    check(
+      "win_icon.rs 提供 apps_prefers_light（应用主题，读 AppsUseLightTheme）",
+      /pub\s+fn\s+apps_prefers_light/.test(winIcon2) && /AppsUseLightTheme/.test(winIcon2),
+      "win_icon.rs 没有 apps_prefers_light / 没读 AppsUseLightTheme",
+    );
+  }
+
+  // ---- 页内 logo：不能再是 emoji ----
+  for (const page of ["src/about.html", "src/settings.html"]) {
+    const html = readIfExists(page);
+    if (html === null) continue;
+    check(
+      `${page} 不再用 emoji 当 logo`,
+      !/🐋/.test(html) && !/⚙️/.test(html),
+      `${page} 仍有 emoji logo —— 与统一鲸鱼不一致`,
+    );
+    check(
+      `${page} 引用了统一 logo 图片`,
+      /logo-on-dark\.png/.test(html) && /logo-on-light\.png/.test(html),
+      `${page} 没有引用 logo-on-dark.png / logo-on-light.png`,
+    );
+  }
+  for (const css of ["src/about.css", "src/settings.css"]) {
+    const text = readIfExists(css);
+    if (text === null) continue;
+    check(
+      `${css} 按 prefers-color-scheme 切换 logo`,
+      /prefers-color-scheme/.test(text) &&
+        /\.logo-on-dark/.test(text) &&
+        /\.logo-on-light/.test(text),
+      `${css} 缺少 logo 的明暗切换规则`,
+    );
+  }
+  // 两个 logo 资源必须真的存在（否则页面会显示裂图）。
+  for (const png of ["src/logo-on-dark.png", "src/logo-on-light.png"]) {
+    check(`${png} 存在`, existsSync(join(ROOT, png)), `找不到 ${png} —— 页面会显示裂图`);
+  }
+
+  // ---- 关于页的作者信息与免责声明 ----
+  const aboutHtml = readIfExists("src/about.html");
+  if (aboutHtml !== null) {
+    check(
+      "关于页显示作者信息 tianyimc.com",
+      /tianyimc\.com/.test(aboutHtml),
+      "关于页没有作者信息",
+    );
+    check(
+      "关于页声明与 DeepSeek 官方无关",
+      /与\s*DeepSeek\s*官方无关|与\s*DeepSeek\s*官方无任何关联/.test(aboutHtml),
+      "关于页缺少「与 DeepSeek 官方无关」的声明",
+    );
+  }
+
+  // ---- 许可证文件 ----
+  check("LICENSE 文件存在", existsSync(join(ROOT, "LICENSE")), "找不到 LICENSE");
+  const license = readIfExists("LICENSE");
+  if (license !== null) {
+    check(
+      "LICENSE 是 Apache-2.0 全文",
+      /Apache License/.test(license) && /Version 2\.0/.test(license),
+      "LICENSE 不是 Apache-2.0",
+    );
+    check(
+      "LICENSE 含版权行（作者信息）",
+      /Copyright\s+20\d\d\s+tianyimc/.test(license),
+      "LICENSE 里没有 `Copyright <年> tianyimc` 版权行 —— 用户要求必须保留原作者信息",
+    );
+  }
+  check("NOTICE 文件存在", existsSync(join(ROOT, "NOTICE")), "找不到 NOTICE");
+  const notice = readIfExists("NOTICE");
+  if (notice !== null) {
+    check(
+      "NOTICE 含原作者归属声明",
+      /tianyimc/.test(notice),
+      "NOTICE 里没有原作者信息",
+    );
+  }
+
+  // ---- README 的第三方定位声明 ----
+  const readme = readIfExists("README.md");
+  if (readme !== null) {
+    check(
+      "README 声明与官方无关（第三方客户端）",
+      /第三方[\s\S]{0,40}官方无关|与\s*DeepSeek\s*官方无关/.test(readme),
+      "README 没有「第三方 / 与官方无关」声明",
+    );
+    check(
+      "README 声明不包含 DSH 主程序",
+      /不包含[\s\S]{0,20}DSH|不含[\s\S]{0,20}DSH|不捆绑/.test(readme),
+      "README 没有说明本程序不含 DSH 主程序",
+    );
+    check(
+      "README 给出 DSH 官方仓库链接",
+      /deepseek-ai\/deepseek-harness/.test(readme),
+      "README 没有 DSH 官方链接",
+    );
+    check(
+      "README 许可证章节已更新为 Apache-2.0（不再写 All rights reserved）",
+      /Apache-2\.0/.test(readme) && !/All rights reserved/.test(readme),
+      "README 仍写着「未附带许可证 / All rights reserved」—— 已过期",
+    );
+  }
+}
+
 /* ------------------------------------------------------------------ 汇总 */
 
 console.log("\n" + "=".repeat(60));

@@ -273,6 +273,44 @@ test("src/about.js：全文不出现 Gen（GenX 已取消）", () => {
   assert.doesNotMatch(aboutJs, /Gen/);
 });
 
+/*
+ * 页内**外链**（作者主页等）必须交给系统浏览器，不能在关于窗口内导航。
+ *
+ * 为什么重要：这是 WebView2 里的本地页面，`<a target="_blank">` 在 Tauri 里
+ * 不保证会开新窗口 —— 可能把「关于」窗口自己导航走，用户点一下链接界面就没了。
+ * v0.3.3 加了作者链接，所以这条必须被守住。
+ */
+test("src/about.js：拦截页内 http(s) 外链并交给 open_external", () => {
+  // 必须有针对 a[href] 的点击拦截。
+  assert.match(aboutJsCode, /closest\?\.\("a\[href\]"\)|closest\("a\[href\]"\)/);
+  // 只拦 http/https（页内锚点要放行）。
+  assert.match(aboutJsCode, /\^https\?:\\\/\\\/|\^https\?:/);
+  // 拦截后调用 open_external。
+  assert.match(aboutJsCode, /invoke\("open_external"/);
+
+  // ⚠️ `preventDefault` 必须断言在**外链拦截这段代码内部**，不能全文件搜。
+  // 初版写的是 `/preventDefault\(\)/`，而文件里另有一处「通道卡片点击」的
+  // `if (typeof event.preventDefault === "function") event.preventDefault();`
+  // ⇒ 把外链拦截里的 preventDefault 删掉后断言**依然通过**（变异测试发现的假绿）。
+  // 现在先切出 `a[href]` 那个监听器的作用域再断言。
+  const anchorIdx = aboutJsCode.search(/closest\?\.\("a\[href\]"\)|closest\("a\[href\]"\)/);
+  assert.notEqual(anchorIdx, -1, "找不到 a[href] 拦截器");
+  // 取拦截器之后的一小段（到下一个 addEventListener 之前）作为作用域。
+  const after = aboutJsCode.slice(anchorIdx);
+  const nextListener = after.indexOf("addEventListener");
+  const scope = nextListener === -1 ? after : after.slice(0, nextListener);
+  assert.match(
+    scope,
+    /preventDefault\(\)/,
+    "外链拦截器里没有 preventDefault —— 点击仍会在「关于」窗口内导航，界面会被顶掉",
+  );
+});
+
+test("src/about.html：作者链接存在且是 https", () => {
+  assert.match(aboutHtml, /https:\/\/tianyimc\.com/);
+  assert.match(aboutHtml, /©\s*tianyimc\.com/);
+});
+
 test("src/about.html：版本规则已更新为 v.A.B.C，且不再出现 GenX", () => {
   assert.doesNotMatch(aboutHtml, /Gen/);
   assert.match(aboutHtml, /v\.A\.B\.C/);

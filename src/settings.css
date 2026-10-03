@@ -50,7 +50,19 @@ body {
 
 .head { display: flex; align-items: center; gap: 12px; }
 
-.logo { font-size: 30px; line-height: 1; }
+/*
+ * 统一鲸鱼 logo（与托盘/任务栏、关于页同一只）。
+ * 默认（浅色主题）显示深藏青鲸鱼；深色主题换成白鲸鱼 —— 两张图都在 DOM 里，
+ * 靠 prefers-color-scheme 切换显隐，避免用 JS 判断主题。
+ */
+.logo { display: inline-flex; align-items: center; }
+.logo img { width: 32px; height: 32px; display: block; }
+.logo-on-dark { display: none; }
+
+@media (prefers-color-scheme: dark) {
+  .logo-on-dark { display: block; }
+  .logo-on-light { display: none; }
+}
 
 h1 { margin: 0; font-size: 19px; }
 h2 { margin: 0 0 6px; font-size: 13px; }

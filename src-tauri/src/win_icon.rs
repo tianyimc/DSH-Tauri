@@ -89,6 +89,80 @@ pub fn taskbar_light_from_registry_value(raw: Option<u32>, fallback: bool) -> bo
     }
 }
 
+/// 读取 `HKCU\...\Themes\Personalize` 下的一个 DWORD 值。
+///
+/// 返回 `None` 表示读不到（键/值不存在、权限不足、或非 Windows）。
+/// 两个调用方（应用主题 / 外壳主题）共用这一份实现，避免键名字面量重复两遍。
+#[cfg(windows)]
+fn read_personalize_dword(value: &[u16]) -> Option<u32> {
+    use windows_sys::Win32::System::Registry::{
+        RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD,
+    };
+
+    /// `Software\Microsoft\Windows\CurrentVersion\Themes\Personalize`
+    ///
+    /// 用 UTF-16 字面量（`RegGetValueW` 要 `PCWSTR`）。这里手写而不是引 `w!` 宏，
+    /// 是为了不额外引入 `windows` crate 的宏依赖（本项目只用 `windows-sys`）。
+    const SUBKEY: &[u16] = &[
+        'S' as u16, 'o' as u16, 'f' as u16, 't' as u16, 'w' as u16, 'a' as u16, 'r' as u16,
+        'e' as u16, '\\' as u16, 'M' as u16, 'i' as u16, 'c' as u16, 'r' as u16, 'o' as u16,
+        's' as u16, 'o' as u16, 'f' as u16, 't' as u16, '\\' as u16, 'W' as u16, 'i' as u16,
+        'n' as u16, 'd' as u16, 'o' as u16, 'w' as u16, 's' as u16, '\\' as u16, 'C' as u16,
+        'u' as u16, 'r' as u16, 'r' as u16, 'e' as u16, 'n' as u16, 't' as u16, 'V' as u16,
+        'e' as u16, 'r' as u16, 's' as u16, 'i' as u16, 'o' as u16, 'n' as u16, '\\' as u16,
+        'T' as u16, 'h' as u16, 'e' as u16, 'm' as u16, 'e' as u16, 's' as u16, '\\' as u16,
+        'P' as u16, 'e' as u16, 'r' as u16, 's' as u16, 'o' as u16, 'n' as u16, 'a' as u16,
+        'l' as u16, 'i' as u16, 'z' as u16, 'e' as u16, 0,
+    ];
+
+    let mut data: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    // SAFETY: 键名与值名都是 NUL 结尾的 UTF-16 常量，`data`/`size` 指向有效栈内存。
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            SUBKEY.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_DWORD,
+            std::ptr::null_mut(),
+            &mut data as *mut _ as *mut _,
+            &mut size,
+        )
+    };
+    if status == 0 {
+        Some(data)
+    } else {
+        None
+    }
+}
+
+/// 读取**应用**（窗口）深浅色，`true` = 浅色。读不到返回 `None`。
+///
+/// # 为什么需要它（而不是直接用 `Window::theme()`）
+///
+/// `Window::theme()` 要求**窗口已经存在**。而窗口图标必须在**创建时**就交给
+/// builder（见 `lib.rs` 的 `with_shared_profile`）—— 创建第一个窗口（选择窗口）时
+/// 一个窗口都还没有，`current_theme()` 只能返回 `None`，
+/// 于是会按「深色」给一个**白色**鲸鱼；浅色系统上这个图标在白底标题栏里看不见。
+///
+/// 所以这里**直接读注册表**，不依赖任何窗口存在。
+#[cfg(windows)]
+pub fn apps_prefers_light() -> Option<bool> {
+    /// `AppsUseLightTheme`
+    const VALUE: &[u16] = &[
+        'A' as u16, 'p' as u16, 'p' as u16, 's' as u16, 'U' as u16, 's' as u16, 'e' as u16,
+        'L' as u16, 'i' as u16, 'g' as u16, 'h' as u16, 't' as u16, 'T' as u16, 'h' as u16,
+        'e' as u16, 'm' as u16, 'e' as u16, 0,
+    ];
+    read_personalize_dword(VALUE).map(|v| v != 0)
+}
+
+/// 非 Windows：没有这个设置，交给调用方回退。
+#[cfg(not(windows))]
+pub fn apps_prefers_light() -> Option<bool> {
+    None
+}
+
 /// 读取**任务栏实际使用的**深浅色（`true` = 浅色任务栏）。
 ///
 /// # 为什么不能直接用 Tauri/tao 的 `Window::theme()`
@@ -116,25 +190,6 @@ pub fn taskbar_light_from_registry_value(raw: Option<u32>, fallback: bool) -> bo
 /// 读不到该值时退回 `fallback`（调用方传 tao 的主题），保持原有行为。
 #[cfg(windows)]
 pub fn taskbar_prefers_light(fallback: bool) -> bool {
-    use windows_sys::Win32::System::Registry::{
-        RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD,
-    };
-
-    /// `HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize`
-    ///
-    /// 用 UTF-16 字面量（`RegGetValueW` 要 `PCWSTR`）。这里手写而不是引 `w!` 宏，
-    /// 是为了不额外引入 `windows` crate 的宏依赖（本项目只用 `windows-sys`）。
-    const SUBKEY: &[u16] = &[
-        'S' as u16, 'o' as u16, 'f' as u16, 't' as u16, 'w' as u16, 'a' as u16, 'r' as u16,
-        'e' as u16, '\\' as u16, 'M' as u16, 'i' as u16, 'c' as u16, 'r' as u16, 'o' as u16,
-        's' as u16, 'o' as u16, 'f' as u16, 't' as u16, '\\' as u16, 'W' as u16, 'i' as u16,
-        'n' as u16, 'd' as u16, 'o' as u16, 'w' as u16, 's' as u16, '\\' as u16, 'C' as u16,
-        'u' as u16, 'r' as u16, 'r' as u16, 'e' as u16, 'n' as u16, 't' as u16, 'V' as u16,
-        'e' as u16, 'r' as u16, 's' as u16, 'i' as u16, 'o' as u16, 'n' as u16, '\\' as u16,
-        'T' as u16, 'h' as u16, 'e' as u16, 'm' as u16, 'e' as u16, 's' as u16, '\\' as u16,
-        'P' as u16, 'e' as u16, 'r' as u16, 's' as u16, 'o' as u16, 'n' as u16, 'a' as u16,
-        'l' as u16, 'i' as u16, 'z' as u16, 'e' as u16, 0,
-    ];
     /// `SystemUsesLightTheme`
     const VALUE: &[u16] = &[
         'S' as u16, 'y' as u16, 's' as u16, 't' as u16, 'e' as u16, 'm' as u16, 'U' as u16,
@@ -142,23 +197,8 @@ pub fn taskbar_prefers_light(fallback: bool) -> bool {
         't' as u16, 'T' as u16, 'h' as u16, 'e' as u16, 'm' as u16, 'e' as u16, 0,
     ];
 
-    let mut data: u32 = 0;
-    let mut size = std::mem::size_of::<u32>() as u32;
-    // SAFETY: 两个键名都是 NUL 结尾的 UTF-16 常量，`data`/`size` 指向有效栈内存。
-    let status = unsafe {
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            SUBKEY.as_ptr(),
-            VALUE.as_ptr(),
-            RRF_RT_REG_DWORD,
-            std::ptr::null_mut(),
-            &mut data as *mut _ as *mut _,
-            &mut size,
-        )
-    };
     // 读到 ⇒ 交给纯函数翻译（可单测）；读不到 ⇒ `None` ⇒ 退回 fallback。
-    let raw = if status == 0 { Some(data) } else { None };
-    taskbar_light_from_registry_value(raw, fallback)
+    taskbar_light_from_registry_value(read_personalize_dword(VALUE), fallback)
 }
 
 /// 非 Windows：没有任务栏概念，直接沿用调用方给的主题。

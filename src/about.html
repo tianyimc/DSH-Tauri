@@ -8,7 +8,11 @@
   <body>
     <main class="wrap">
       <header class="head">
-        <span class="logo" aria-hidden="true">🐋</span>
+        <!-- 统一鲸鱼 logo（与托盘/任务栏同一只）：深色底用白鲸鱼，浅色底用深藏青鲸鱼 -->
+        <span class="logo" aria-hidden="true">
+          <img class="logo-on-dark" src="logo-on-dark.png" alt="" />
+          <img class="logo-on-light" src="logo-on-light.png" alt="" />
+        </span>
         <div>
           <h1>DSHTauri</h1>
           <p class="ver">
@@ -40,6 +44,16 @@
         <p class="mono selectable">https://github.com/tianyimc/DSH-Tauri</p>
         <p class="muted">
           版本规则：<span class="mono">v.A.B.C</span>，RC 版附 <span class="mono"> RC</span> 后缀；发布版无后缀。详见仓库的 CHANGELOG.md。
+        </p>
+      </section>
+
+      <section class="box">
+        <h2>作者与声明</h2>
+        <p class="muted">
+          作者：<a class="link selectable" href="https://tianyimc.com" target="_blank" rel="noopener noreferrer">© tianyimc.com</a>
+        </p>
+        <p class="muted note">
+          DSHTauri 是第三方开源客户端，<strong>与 DeepSeek 官方无关，也未获得其背书</strong>。
         </p>
       </section>
 

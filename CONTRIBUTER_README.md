@@ -28,6 +28,7 @@ This file is intended for project contributors and AI Agents. It contains variou
 - [验收标准对照](#验收标准对照)
 - [设计决策速查](#设计决策速查)
 - [验证记录（本仓库实际跑过的检查）](#验证记录本仓库实际跑过的检查)
+- [12. 许可证与项目定位](#12-许可证与项目定位)
 
 ---
 
@@ -71,7 +72,7 @@ This file is intended for project contributors and AI Agents. It contains variou
 ```bash
 npm run ver                                  # 打印当前版本 / 渠道 / 发布包名 / tag
 node scripts/version.mjs --json              # 同上，JSON 格式
-node scripts/version.mjs --set 0.3.2         # 改 A.B.C（三处一起写），渠道保持不变
+node scripts/version.mjs --set 0.3.3         # 改 A.B.C（三处一起写），渠道保持不变
 node scripts/version.mjs --set-channel rc    # 切到 RC 预发布渠道
 node scripts/version.mjs --set-channel release   # 切回正式渠道
 ```
@@ -88,7 +89,7 @@ node scripts/version.mjs --set-channel release   # 切回正式渠道
 
 | 渠道 | 显示 | 安装包文件名 | Git tag | Release 标题 | prerelease |
 | --- | --- | --- | --- | --- | --- |
-| `release` | `v.0.3.2` | `DSHTauri-v.0.3.2-setup.exe` | `v.0.3.2` | `DSHTauri v.0.3.2` | `false` |
+| `release` | `v.0.3.3` | `DSHTauri-v.0.3.3-setup.exe` | `v.0.3.3` | `DSHTauri v.0.3.3` | `false` |
 | `rc` | `v.0.4.0 RC` | `DSHTauri-v.0.4.0-RC-setup.exe` | `v.0.4.0-rc` | `DSHTauri v.0.4.0 RC` | `true` |
 
 > 后缀写法三处不同，别混：**显示**用空格（` RC`）、**文件名**用 `-RC`、**tag** 用小写 `-rc`。
@@ -99,11 +100,11 @@ CI 用 `node scripts/version.mjs --github` 推导 artifact 名、Release tag、�
 
 **在程序里也看得到**：选择窗口右下角显示当前版本；托盘悬浮提示是 `DSHTauri <当前版本>`。
 显示名由 `src-tauri/build.rs` 在编译期读 `version.json` 的 `channel` 塞进二进制
-（`release` → `v.0.3.2`，`rc` → `v.0.3.2 RC`）。
+（`release` → `v.0.3.3`，`rc` → `v.0.3.3 RC`）。
 
 **每次发版要做的四件事**（详见 [CHANGELOG.md](CHANGELOG.md)）：
 
-1. 改版本号：`node scripts/version.mjs --set 0.3.2`
+1. 改版本号：`node scripts/version.mjs --set 0.3.3`
 2. 选渠道：`node scripts/version.mjs --set-channel rc`（发预发布）或
    `--set-channel release`（发正式版）
 3. 在 [CHANGELOG.md](CHANGELOG.md) 顶部加一条对应版本的记录
@@ -140,6 +141,8 @@ DSHTauri/
 │   ├── config-rules.js             # 配置校验纯函数（浏览器与 Node 共用，可单测）
 │   ├── titlebar.html               # 主窗口顶部的自定义标题栏（本地页面 = 有 IPC）
 │   ├── titlebar/                   #   顶栏的 CSS / JS / 纯函数规则 + 说明
+│   ├── logo-on-dark.png            # 「关于」/「设置」窗口内的 logo（深色底：白鲸鱼）
+│   ├── logo-on-light.png           # 同上（浅色底：深藏青鲸鱼），CSS 按主题显隐
 │   └── about.html / about.css / about.js         # 「关于 / 检查更新」窗口
 │   └── settings.html / settings.css / settings.js # 「设置」窗口（连接方式 / 网页对话加载模式）
 ├── src-tauri/
@@ -157,6 +160,7 @@ DSHTauri/
 │   ├── Cargo.lock                  # 提交它，保证 CI 可复现
 │   └── tauri.conf.json             # 第 3 项
 ├── version.json                    # 版本渠道（"release" | "rc"）；A.B.C 在 tauri.conf.json
+├── LICENSE                         # Apache License 2.0 全文
 ├── CHANGELOG.md                    # 按版本号记录的更新日志
 ├── package.json                    # 第 2 项
 ├── package-lock.json               # `npm ci` 依赖它
@@ -177,7 +181,7 @@ DSHTauri/
 {
   "name": "dshtauri",
   "private": true,
-  "version": "0.3.2",
+  "version": "0.3.3",
   "type": "module",
   "engines": { "node": ">=22" },
   "scripts": {
@@ -216,7 +220,7 @@ DSHTauri/
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "DSHTauri",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "identifier": "com.dsh.dshtauri",
   "build": {
     "frontendDist": "../src"
@@ -302,7 +306,15 @@ node scripts/post-icon.mjs    # = 清理移动端图标 + 调用 scripts/make-lo
 | --- | --- | --- |
 | `icon.ico` | **安装包 / exe / 卸载器 / 资源管理器** | 统一 logo（深藏青，透明底），**7 档**多尺寸：16/24/32/48/64/128/256 |
 | `app-dark.png` / `app-light.png` | **运行时窗口 / 任务栏图标** | 64px 两套配色，由 Rust 按系统主题 `Window::set_icon()` 动态切换 |
+| `src/logo-on-dark.png` / `src/logo-on-light.png` | **「关于」/「设置」窗口内的 logo** | 前端资源：深色底用白鲸鱼、浅色底用深藏青鲸鱼，由 CSS 按主题显示其中一个（见下） |
 | `32x32.png` / `128x128.png` / `128x128@2x.png` / `icon.png` / `StoreLogo.png` … | `bundle.icon` 引用的各尺寸 PNG | 同一只鲸鱼，避免仓库里出现两种风格 |
+
+> **「关于」/「设置」窗口的 logo**：`src/about.html` 与 `src/settings.html` 各放
+> `<img class="logo-on-dark" src="logo-on-dark.png">` 与 `<img class="logo-on-light" src="logo-on-light.png">`，
+> 由 `src/about.css` / `src/settings.css` 按 `prefers-color-scheme` 只显示匹配主题的那一只
+> （与托盘/任务栏是同一只鲸鱼，配色规则一致）。这两个 PNG 是**前端资源**，
+> 随 `frontendDist: "../src"` 一起嵌进二进制，不是 `bundle.icon` 用的那套。
+> 早前版本这里是 emoji（🐋 / ⚙️）占位，现已替换为统一鲸鱼。
 
 > **为什么 ico 固定用深藏青版**：Windows 资源管理器/桌面**不会**按深浅色主题切换 exe/ico 的颜色
 > （它只认 ico 里那一个图像）。所以 ico 用深藏青（浅色背景下清晰）；
@@ -440,7 +452,7 @@ RC 与 Release 共用同一个 `identifier`，所以**跨渠道覆盖安装同�
 │    未配置（点击填写）              [未配置]   │   ← 虚线框、半透明
 ├──────────────────────────────────────────────┤
 │ 状态：请选择连接方式；首次使用需要先填写地址。│
-│ 还没配置地址：点「设置」填写…       v.0.3.2 │
+│ 还没配置地址：点「设置」填写…       v.0.3.3 │
 └──────────────────────────────────────────────┘
 ```
 
@@ -519,7 +531,7 @@ async function connect(mode) {
 ```toml
 [package]
 name = "dshtauri"
-version = "0.3.2"
+version = "0.3.3"
 description = "DSHTauri - lightweight Tauri 2 desktop shell for the DSH WebUI"
 authors = ["DSHTauri"]
 edition = "2021"
@@ -965,7 +977,7 @@ jobs:
           ls -l dist
       - uses: softprops/action-gh-release@v2
         with:
-          # 渠道决定 tag：正式版 v.0.3.2，候选版 v.0.3.2-rc，两者互不覆盖
+          # 渠道决定 tag：正式版 v.0.3.3，候选版 v.0.3.3-rc，两者互不覆盖
           tag_name: ${{ needs.build-windows.outputs.tag }}
           target_commitish: ${{ github.sha }}
           name: ${{ needs.build-windows.outputs.title }}
@@ -1153,7 +1165,7 @@ git push -u origin main
 2. 点 `Build NSIS installer (Windows x86_64)` job，展开每一步看日志。
 3. 关键步骤：
    - `Install frontend dependencies` → 应显示 `added N packages`
-   - `Build NSIS bundle` → 最后应有 `Finished 1 bundle at: ...\bundle\nsis\DSHTauri_0.3.2_x64-setup.exe`
+   - `Build NSIS bundle` → 最后应有 `Finished 1 bundle at: ...\bundle\nsis\DSHTauri_0.3.3_x64-setup.exe`
    - `List bundle output` → 打印产物全路径和大小
 4. 失败了先看 **红叉那一步的最后 30 行**，对照 [TROUBLESHOOTING](docs/TROUBLESHOOTING.md)。
 
@@ -1163,10 +1175,10 @@ git push -u origin main
 
 | 方式 | 步骤 | 适合 |
 | --- | --- | --- |
-| **Artifact**（每次运行都有） | 运行详情页最下方 **Artifacts** → 点 `DSHTauri v.0.3.2-nsis` 下载 zip → 解压得到 `DSHTauri_0.3.2_x64-setup.exe`（Tauri 自己的命名） | 自己测试 |
+| **Artifact**（每次运行都有） | 运行详情页最下方 **Artifacts** → 点 `DSHTauri v.0.3.3-nsis` 下载 zip → 解压得到 `DSHTauri_0.3.3_x64-setup.exe`（Tauri 自己的命名） | 自己测试 |
 | **Release**（勾了 `create_release` 才有） | 仓库页右侧 **Releases** → 点对应版本 → **Assets** 里直接下 `.exe` | 发给别人 |
 
-Release 里的文件名按 [§0.5 版本规则](README.md#63-版本规则) 命名，例如正式版 `DSHTauri-v.0.3.2-setup.exe`、
+Release 里的文件名按 [§0.5 版本规则](README.md#63-版本规则) 命名，例如正式版 `DSHTauri-v.0.3.3-setup.exe`、
 RC 版 `DSHTauri-v.0.4.0-RC-setup.exe`；两者 tag 不同（`v0.4.0` / `v0.4.0-rc`），**不会覆盖前一份**。
 
 > Tauri 自己产出的文件始终叫 `DSHTauri_<A.B.C>_x64-setup.exe`（它不认识渠道后缀），
@@ -1215,7 +1227,7 @@ npm run tauri build -- --bundles nsis --verbose 2>&1 | tail -100   # 完整打�
 | 首次点击要求用户提供配置并记录 | ✅ 已验证 | 地址默认为空；无 `config.json` 时点击「本地」：**不打开主窗口、不写配置**；填入地址并保存后才生成 `config.json` 并打开主窗口 |
 | **本地 / 远程允许只配一个** | ✅ 已验证（端到端 + 单测） | 冒烟测试分两轮：只填本地 → 连上，`config.json` 里 `"remoteUrl":""`；清空重来只填远程 → 同样连上，`"localUrl":""`。另有 23 条 JS 单测覆盖校验规则 |
 | 推送到 GitHub 后 Actions 在 `windows-latest` 成功运行 | ✅ 已验证 | [run #36974080393](https://github.com/tianyimc/DSH-Tauri/actions/runs/36974080393) @ `4ac4267`：全部步骤绿（含 `Resolve version` / `Run tests` / `Build NSIS bundle` / `Upload NSIS installer`） |
-| Artifact 中存在 NSIS `.exe` | ✅ 已验证 | Artifact 名形如 `DSHTauri v.0.3.2-nsis`，1.21 MB，未过期。`Upload NSIS installer` 设了 `if-no-files-found: error`，步骤成功即证明 `bundle/nsis/` 非空。（下载 artifact 走 API 需要 token，我没法直接取包内文件） |
+| Artifact 中存在 NSIS `.exe` | ✅ 已验证 | Artifact 名形如 `DSHTauri v.0.3.3-nsis`，1.21 MB，未过期。`Upload NSIS installer` 设了 `if-no-files-found: error`，步骤成功即证明 `bundle/nsis/` 非空。（下载 artifact 走 API 需要 token，我没法直接取包内文件） |
 | Windows 11 安装后功能正常 | ✅ 核心链路已在真实 Windows 上验证 | `windows-latest` 上的 GUI 冒烟测试 **26/26 通过**：选择窗口 560x460 → 点击「本地」→ 主窗口出现且不卡死 → WebView2 真的发起了请求（不再白屏）→ `WM_CLOSE` 后进程存活且窗口隐藏（× 可用）。剩余的人工项只有 NSIS 安装向导交互本身 |
 | ~~主窗口白屏 + × 点不动~~ | ✅ 已修复并验证 | 同一套冒烟测试：修复前 `12 通过 / 2 失败`，修复后 `14 通过 / 0 失败`。根因与修复见 [CHANGELOG](CHANGELOG.md#v011) |
 | ~~切换连接方式无反应~~ | ✅ 已修复并验证 | 冒烟测试 B 段：切换后主窗口被复用（HWND 不变）、未卡死、新地址确实收到 WebView2 请求。见 [CHANGELOG](CHANGELOG.md#v012) |
@@ -1260,7 +1272,7 @@ npm run tauri build -- --bundles nsis --verbose 2>&1 | tail -100   # 完整打�
 | JS 单元测试 | `npm run test:js` | ✅ 109 通过（配置规则、顶栏纯函数与接线对账、设置窗口、双通道更新检查） |
 | 顶栏静态校验 | `npm run verify` | ✅ 64 通过 / 0 失败 |
 | Rust 单元测试 | `npm run test:rust` | ✅ 44 通过（图标解码与主题配色、配置 camelCase 契约与补丁语义、侧栏几何、版本号与 tauri.conf.json 一致） |
-| 版本号 / 渠道工具 | `npm run ver` / `--set` / `--set-channel` | ✅ 当前 `0.3.2` + `release` → 显示 `v.0.3.2`、包名 `DSHTauri-v.0.3.2-setup.exe`、tag `v.0.3.2`、`prerelease=false` |
+| 版本号 / 渠道工具 | `npm run ver` / `--set` / `--set-channel` | ✅ 当前 `0.3.3` + `release` → 显示 `v.0.3.3`、包名 `DSHTauri-v.0.3.3-setup.exe`、tag `v.0.3.3`、`prerelease=false` |
 | 图标 | `node scripts/post-icon.mjs` → `src-tauri/icons/icon.ico` | ✅ 7 档：256/128/64/48/32/24/16（实测解析 ICO 头） |
 | 工作流 YAML | `python3 -c "yaml.safe_load(...)"` | ✅ 解析通过，`permissions: contents: write` 就位 |
 | Linux 端到端冒烟 | `npm run smoke` | ✅ 21 通过 / 0 失败 |
@@ -1270,3 +1282,38 @@ npm run tauri build -- --bundles nsis --verbose 2>&1 | tail -100   # 完整打�
 >
 > 踩过的坑记录：`xdotool windowclose` 是**销毁窗口**（不触发 `CloseRequested`），用它测「关闭到托盘」会得到假结论。必须用 `wmctrl -i -c` 发送真正的 `WM_DELETE_WINDOW`。`scripts/smoke-linux.sh` 里用的是后者。
 
+---
+
+## 12. 许可证与项目定位
+
+### 许可证
+
+本项目以 **Apache License 2.0** 授权，全文见仓库根目录 [LICENSE](LICENSE)。
+
+对贡献者的实际含义：
+
+- **可以**自由使用、修改、分发，**包括商业用途**；
+- **必须保留**版权、作者与出处信息；
+- **必须保留 NOTICE 文件**（若提供）中的署名信息；
+- 若修改了文件，需**标注修改**；
+- 分发时需附带一份 Apache-2.0 许可证副本。
+
+> 这正是用户要求的「**必须永远保留原作者信息**」的落地方式：Apache-2.0 允许自由使用，
+> 但不允许抹掉作者信息。
+
+现状说明（诚实记录）：本仓库目前**没有** `NOTICE` 文件，源文件里也**尚未**统一添加
+版权/许可头（各文件只有描述性注释）。因此「保留作者信息」目前主要靠
+**LICENSE 全文 + 仓库元信息**（`package.json` 的 `description` / `authors`、
+`tauri.conf.json` 的 `publisher`）承载。若后续要加强合规，可考虑补一个 `NOTICE` 文件，
+并给源文件加统一的版权头。
+
+### 项目定位：第三方客户端，与 DeepSeek 官方无关
+
+- DSHTauri 是**第三方**开源项目，**非** DeepSeek 官方出品，**未获**官方背书或授权。
+- 它是**客户端连接程序**：只把用户**自己**运行起来的 DSH WebUI 装进原生窗口，
+  **不包含、不捆绑、不代替** DSH 本体（模型、Agent、工具链、WebUI 服务都不在本仓库与安装包内）。
+- DSH 官方仓库：<https://github.com/deepseek-ai/deepseek-harness>
+- 本项目仓库：<https://github.com/tianyimc/DSH-Tauri>
+- 作者主页：<https://tianyimc.com>
+
+> 面向用户的同一说明见 [README.md §1.1](README.md#11-第三方客户端声明与-deepseek-官方无关)。

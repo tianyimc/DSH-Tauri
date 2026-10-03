@@ -333,6 +333,9 @@ fn webview_data_dir<R: Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
 }
 
 /// 给窗口构造器套上共享的数据目录。
+///
+/// 图标不在这里设 —— 见 [`set_creation_icon`] 的说明（`builder.icon()` 按值消耗
+/// `builder`，失败时无法回退；而 `.build()` 之后用 `set_icon(&self)` 没有这个问题）。
 fn with_shared_profile<'a, R: Runtime, M: Manager<R>>(
     app: &AppHandle<R>,
     mut builder: WebviewWindowBuilder<'a, R, M>,
@@ -341,6 +344,38 @@ fn with_shared_profile<'a, R: Runtime, M: Manager<R>>(
         builder = builder.data_directory(dir);
     }
     builder
+}
+
+/// 给**刚创建好的**窗口设上当前主题对应的 logo（v0.3.3 修的缺陷）。
+///
+/// # 修的是什么
+///
+/// 用户实测：**「关于」与「设置」窗口左上角（标题栏）的图标仍是深藏青的静态
+/// `icon.ico`**，而主窗口已经能跟随主题。根因是**创建时机**：
+///
+/// - [`apply_theme_icons`] 只在三个时刻跑：`setup()` 末尾、主窗口创建后、系统主题变化时；
+/// - 而「关于」/「设置」窗口是用户**点菜单时才创建**的（`show_about_window` /
+///   `show_settings_window`），远晚于上面那几个时刻。
+///
+/// 于是它们拿到的是 Tauri 的**默认窗口图标**（bundle 里那个静态 `icon.ico`，
+/// 固定深藏青），之后再没有机会被纠正 —— `apply_theme_icons` 里那句
+/// `for label in [...] { set_icon }` 只对**当时已存在**的窗口生效。
+///
+/// 修法：每个窗口 `.build()` 成功后立刻设一次图标，这样无论窗口何时被打开，
+/// 都必然带上当前主题对应的鲸鱼。
+///
+/// # 为什么用 `set_icon` 而不是 `builder.icon()`
+///
+/// `WebviewWindowBuilder::icon(self, ...)` **按值消耗** builder 并返回 `Result<Self>`；
+/// 一旦返回 `Err`，原 builder 已被移走，**无法回退**，窗口就建不出来了。
+/// 而 `WebviewWindow::set_icon(&self, ...)` 借用 `&self`，失败只是这一行无效，
+/// 窗口照常存在 —— 对「图标是锦上添花」这个定位更合适。
+///
+/// 失败静默忽略（拿不到图标或设不上都不该影响窗口使用）。
+fn set_creation_icon<R: Runtime>(window: &tauri::WebviewWindow<R>) {
+    if let Some(icon) = creation_icon(window.app_handle()) {
+        let _ = window.set_icon(icon);
+    }
 }
 
 /// 创建启动选择窗口。
@@ -353,7 +388,10 @@ fn create_selector_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         .maximizable(false)
         .center()
         .visible(true);
-    with_shared_profile(app, builder).build()?;
+    let selector = with_shared_profile(app, builder).build()?;
+    // v0.3.3：创建后立刻设主题对应的 logo（选择窗口是**第一个**窗口，
+    // 此时还没有任何窗口可问主题 ⇒ 内部走注册表，见 `creation_icon`）。
+    set_creation_icon(&selector);
     Ok(())
 }
 
@@ -893,9 +931,12 @@ fn show_about_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         .minimizable(false)
         .center()
         .visible(true);
-    with_shared_profile(app, builder)
+    let about = with_shared_profile(app, builder)
         .build()
         .map_err(|e| format!("打开关于窗口失败：{e}"))?;
+    // v0.3.3：关于窗口是**按需创建**的，远晚于 `apply_theme_icons` 的最后一次调用，
+    // 不在这里设图标就会一直用 bundle 里那个静态深藏青 `icon.ico`（用户实测的缺陷）。
+    set_creation_icon(&about);
     Ok(())
 }
 
@@ -924,9 +965,11 @@ fn show_settings_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
             .minimizable(true)
             .center()
             .visible(true);
-    with_shared_profile(app, builder)
+    let settings = with_shared_profile(app, builder)
         .build()
         .map_err(|e| format!("打开设置窗口失败：{e}"))?;
+    // v0.3.3：同「关于」窗口 —— 按需创建，必须在这里设图标（见 `set_creation_icon`）。
+    set_creation_icon(&settings);
     Ok(())
 }
 
@@ -1076,6 +1119,27 @@ fn themed_icon(theme: Option<Theme>) -> Option<Image<'static>> {
         _ => ICON_ON_DARK,
     };
     Image::from_bytes(bytes).ok()
+}
+
+/// 给**窗口创建时**用的图标：不依赖任何窗口已经存在。
+///
+/// # 为什么不能直接用 [`current_theme`]
+///
+/// `current_theme()` 靠 `Window::theme()` 读，而它要求**窗口已经存在**。
+/// 创建**第一个**窗口（选择窗口）时一个窗口都还没有 ⇒ 只能得到 `None`
+/// ⇒ [`themed_icon`] 按「深色」给**白色**鲸鱼 ⇒ 浅色系统上这个图标
+/// 落在白色标题栏里几乎看不见。
+///
+/// 所以这里优先读注册表（不依赖窗口），读不到才退回 `current_theme()`，
+/// 最后仍读不到就交给 [`themed_icon`] 的「按深色」默认。
+fn creation_icon<R: Runtime>(app: &AppHandle<R>) -> Option<Image<'static>> {
+    // 1) 注册表：无窗口依赖，创建第一个窗口时也能拿到正确主题。
+    if let Some(light) = win_icon::apps_prefers_light() {
+        return themed_icon(Some(if light { Theme::Light } else { Theme::Dark }));
+    }
+    // 2) 已有窗口（例如「关于」窗口是在选择窗口之后才开的）⇒ 问窗口。
+    // 3) 都没有 ⇒ `themed_icon(None)` 按深色处理。
+    themed_icon(current_theme(app))
 }
 
 /// 把当前主题对应的 logo 同时应用到**托盘**与**主窗口（任务栏/标题栏）**。
@@ -1840,6 +1904,58 @@ mod tests {
         // 读不到 ⇒ 退回调用方给的 fallback（tao 的应用主题）。
         assert!(tr(None, true), "读不到时应退回 fallback=true");
         assert!(!tr(None, false), "读不到时应退回 fallback=false");
+    }
+
+    /// **窗口创建时的图标**必须能在「一个窗口都还没有」时给出正确配色。
+    ///
+    /// # 为什么这条重要（v0.3.3 修的缺陷）
+    ///
+    /// 「关于」/「设置」窗口是**按需创建**的，远晚于 `apply_theme_icons` 的最后一次调用，
+    /// 所以它们曾经一直用 bundle 里那个静态深藏青 `icon.ico`。
+    /// 修法是创建后立刻 `set_creation_icon()`。
+    ///
+    /// 但 `creation_icon()` 不能依赖 `current_theme()`：创建**第一个**窗口（选择窗口）时
+    /// 一个窗口都没有，`current_theme()` 只能返回 `None`，于是会按「深色」给**白色**鲸鱼
+    /// —— 浅色系统的白色标题栏上几乎看不见。所以它必须走注册表。
+    ///
+    /// 这里断言的是**两条路径都能给出图标**（解码成功），不依赖运行环境的具体主题值。
+    #[test]
+    fn creation_icon_is_available_without_any_window() {
+        // 1) 注册表路径：读不到时 `apps_prefers_light()` 返回 None，这是允许的
+        //    （非 Windows 恒为 None），但它**不能 panic**。
+        let _ = win_icon::apps_prefers_light();
+
+        // 2) 无论主题探测结果如何，`themed_icon` 都必须能解出图标
+        //    —— 否则窗口会退回 bundle 默认图标（就是本次要修的缺陷）。
+        for theme in [None, Some(Theme::Light), Some(Theme::Dark)] {
+            assert!(
+                themed_icon(theme).is_some(),
+                "themed_icon({theme:?}) 解码失败 —— 窗口图标会退回 bundle 默认的深藏青版"
+            );
+        }
+    }
+
+    /// `set_creation_icon` 必须在**三个**按需创建 / 首建的窗口上都被调用。
+    ///
+    /// 这是**静态**断言（源码级），因为这三个调用点都在需要真实窗口的代码路径里，
+    /// 单测跑不到。若有人漏掉其中一个，对应的窗口就会退回静态图标。
+    ///
+    /// ⚠️ 断言必须逐**窗口变量名**检查，不能只数总次数。
+    /// 初版写的是 `src.matches("set_creation_icon(&").count() >= 3`，
+    /// 结果**变异测试发现它抓不住「删掉其中一个调用」**：
+    /// 本测试自身的源码里就含一处 `"set_creation_icon(&"` 字面量，
+    /// 于是删掉一个真实调用后计数仍是 4 ⇒ 依然 >= 3 ⇒ **假绿**。
+    /// 现在按三个变量名分别断言，删任何一个都会失败。
+    #[test]
+    fn creation_icon_is_wired_into_all_window_builders() {
+        let src = include_str!("lib.rs");
+        for var in ["selector", "about", "settings"] {
+            let call = format!("set_creation_icon(&{var});");
+            assert!(
+                src.contains(&call),
+                "缺少 `{call}` —— 该窗口会退回 bundle 里那个静态深藏青图标（v0.3.3 修的缺陷）"
+            );
+        }
     }
 
     /// v0.3.2 起 **docked 与 overlay 共用同一条滑出动画**：

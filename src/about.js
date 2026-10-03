@@ -385,6 +385,27 @@ function boot() {
   // 标题栏菜单里的「检查更新」会打开本窗口并触发这个事件
   window.__TAURI__?.event?.listen?.("check-update", () => checkUpdates());
 
+  /*
+   * 外链一律交给**系统默认浏览器**，不在本窗口内导航。
+   *
+   * 为什么需要：这是 WebView2 里的本地页面，`<a href="https://…" target="_blank">`
+   * 在 Tauri 里**不保证**会开新窗口 —— 某些情况下会把**「关于」窗口自己**导航走，
+   * 用户点一下作者链接，界面就变成网页、再也回不来了。
+   * 所以这里统一拦截所有 http/https 外链，复用 Rust 侧的 `open_external`
+   * （与「检查更新」的下载按钮走同一条路径，它也只允许 http/https）。
+   */
+  document.addEventListener("click", (event) => {
+    const anchor = event.target?.closest?.("a[href]");
+    if (!anchor) return;
+    const href = anchor.getAttribute("href") ?? "";
+    if (!/^https?:\/\//i.test(href)) return; // 页内锚点等放行
+    event.preventDefault();
+    invoke("open_external", { url: href }).catch(() => {
+      // 命令不可用（旧版本）时退回默认行为，至少别让点击完全没反应。
+      window.open(href, "_blank", "noopener");
+    });
+  });
+
   /* ------------------------------------------------------------ 启动 */
 
   (async function init() {

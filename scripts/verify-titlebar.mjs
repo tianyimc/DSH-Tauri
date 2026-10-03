@@ -1377,6 +1377,111 @@ section("11. v0.3.3：窗口图标、页内 logo、许可证");
   }
 }
 
+/* ============================ 12. v0.3.4：WebView2 挂起（省内存） ============ */
+
+section("12. v0.3.4：WebView2 挂起、销毁 about/settings");
+
+{
+  const suspendRaw = readIfExists("src-tauri/src/wv_suspend.rs");
+  check(
+    "src-tauri/src/wv_suspend.rs 存在（挂起模块）",
+    suspendRaw !== null,
+    "找不到挂起模块 —— 关闭后的 webview 会一直占着完整 JS 堆",
+  );
+
+  if (suspendRaw !== null) {
+    // ⚠️ 一律用**去注释**的代码：注释里留一句关键词就能满足断言（本轮已多次踩到）。
+    const suspendCode = stripRustComments(suspendRaw);
+    const libCode12 = stripRustComments(libRaw);
+
+    check(
+      "wv_suspend.rs 真的调用 TrySuspend（不是只在注释里提）",
+      /\bTrySuspend\s*\(/.test(suspendCode),
+      "代码里没有 TrySuspend 调用 —— 挂起是空实现",
+    );
+    check(
+      "wv_suspend.rs 真的调用 Resume",
+      /\bResume\s*\(\s*\)/.test(suspendCode),
+      "代码里没有 Resume() 调用 —— 挂起后无法恢复",
+    );
+    check(
+      "wv_suspend.rs 用 IsSuspended 做实时判断（避免重复挂起/无谓 Resume）",
+      /\bIsSuspended\s*\(/.test(suspendCode),
+      "没有 IsSuspended —— 会重复请求挂起或做无谓恢复",
+    );
+    check(
+      "wv_suspend.rs 声明了非 Windows 的空实现（Linux 上 cargo test 才能过）",
+      /cfg\(not\(windows\)\)/.test(suspendCode),
+      "缺少非 Windows 分支 —— Linux 上编译不过",
+    );
+    check(
+      "wv_suspend.rs 用代次（generation）防止「挂起追着恢复跑」",
+      /generation/.test(suspendCode) && /confirm_suspend/.test(suspendCode),
+      "没有代次校验 —— 迟到的挂起回调会把刚打开的侧栏又标记成挂起",
+    );
+
+    // ---- chat 关闭路径：必须在 hide() **之后**才挂起 ----
+    //
+    // 为什么断言顺序：`TrySuspend` 要求 controller 的 IsVisible 为 false，
+    // 而子 webview 的 `hide()` 才会设它。顺序反了会拿到 ERROR_INVALID_STATE，
+    // 挂起**静默失效**（不报错、也没省到内存）。
+    const closeFn = extractRustFnBody(libCode12, "toggle_chat_webview");
+    check(
+      "能在 toggle_chat_webview 里切出侧栏关闭分支",
+      closeFn !== null,
+      "找不到 toggle_chat_webview —— 断言无法定位",
+    );
+    if (closeFn !== null) {
+      // 只看「关闭分支」那段：从 slide_x_with 到 layout_main_webviews。
+      const slideIdx = closeFn.indexOf("slide_x_with");
+      const layoutIdx = closeFn.indexOf("layout_main_webviews", slideIdx + 1);
+      const closeBlock =
+        slideIdx !== -1 && layoutIdx !== -1 ? closeFn.slice(slideIdx, layoutIdx) : "";
+      check(
+        "侧栏关闭分支里能定位到 hide() + 挂起",
+        closeBlock.length > 0,
+        "切不出关闭分支（slide_x_with / layout_main_webviews 结构变了？）",
+      );
+      const hideIdx = closeBlock.indexOf("chat.hide()");
+      const suspendIdx = closeBlock.indexOf("wv_suspend::suspend");
+      check(
+        "侧栏关闭时调用了 wv_suspend::suspend",
+        suspendIdx !== -1,
+        "关闭侧栏没有挂起 —— 重 renderer 会一直留着",
+      );
+      check(
+        "侧栏挂起发生在 hide() **之后**（否则 ERROR_INVALID_STATE 静默失效）",
+        hideIdx !== -1 && suspendIdx !== -1 && hideIdx < suspendIdx,
+        `顺序错误：hide 在第 ${hideIdx} 字符、suspend 在第 ${suspendIdx} 字符 —— suspend 必须在后`,
+      );
+    }
+
+    // ---- chat 打开路径：必须先 resume() 再 show() ----
+    const openIdx = libCode12.indexOf("wv_suspend::resume");
+    check(
+      "侧栏打开路径调用了 wv_suspend::resume",
+      openIdx !== -1,
+      "打开侧栏没有恢复 —— 挂起后打开会是一张死页",
+    );
+    if (openIdx !== -1) {
+      // 在 resume 之后找**同一次打开**里的 show()。
+      const showIdx = libCode12.indexOf("chat.show()", openIdx);
+      check(
+        "侧栏恢复发生在 chat.show() **之前**（先递增代次，让在飞的挂起回调失效）",
+        showIdx !== -1 && openIdx < showIdx,
+        "resume 在 show() 之后 —— 迟到的挂起回调可能把刚打开的侧栏又挂起",
+      );
+    }
+
+    // ---- cookie 保活必须跳过挂起的 webview ----
+    check(
+      "cookie 保活会跳过已挂起的 webview（否则每 20 秒唤醒一次、挂起白做）",
+      /should_skip_cookie_persist/.test(libCode12),
+      "cookie 保活没有挂起判断 —— GetCookies 会把 webview 唤醒，省内存失效",
+    );
+  }
+}
+
 /* ------------------------------------------------------------------ 汇总 */
 
 console.log("\n" + "=".repeat(60));

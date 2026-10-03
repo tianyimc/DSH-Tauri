@@ -33,6 +33,13 @@ mod anim;
 /// `ICON_BIG` —— 所以 v0.3.1 的任务栏图标根本没跟着主题变。见模块文档。
 mod win_icon;
 
+/// WebView2「挂起」（休眠）：不可见的 webview 省内存。
+///
+/// 我们的 webview 关闭时只 `hide()`、从不销毁，隐藏后 renderer 仍占着完整
+/// JS 堆。用官方 `ICoreWebView2_3::TrySuspend`（等价 Edge 的「标签页休眠」）
+/// 把不可见页面的内存标记为「系统可回收」。见模块文档。
+mod wv_suspend;
+
 /// 启动选择窗口的 label（在 `setup()` 里创建）。
 pub const SELECTOR_LABEL: &str = "selector";
 /// 主窗口的 label。
@@ -778,6 +785,19 @@ fn toggle_chat_webview<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
             anim::slide_x_with(app, CHAT_LABEL, from_x, width, y, chat_w, chat_h, |app| {
                 if let Some(chat) = app.get_webview(CHAT_LABEL) {
                     let _ = chat.hide();
+                    // v0.3.4：隐藏之后**挂起**（等价 Edge 的「标签页休眠」）——
+                    // 侧栏是 chat.deepseek.com 这类重页面，隐藏后 renderer 仍占着
+                    // 完整的 JS 堆。挂起把这块内存标记为「系统可回收」。
+                    //
+                    // ⚠️ **必须在 `hide()` 之后**：`TrySuspend` 要求 controller 的
+                    // `IsVisible == false`，而子 webview 的 `hide()` 恰好会设它
+                    // （`WebviewMessage::Hide` → `webview.set_visible(false)`）。
+                    // 顺序反了会拿到 ERROR_INVALID_STATE、挂起静默失效。
+                    //
+                    // ⚠️ 这里跑在**动画线程**上。`with_webview` 内部是
+                    // `send_user_message`（非阻塞投递），从动画线程调用安全；
+                    // 而 `hide()` 刚投递的 Hide 消息排在同一队列前面，会先被处理。
+                    wv_suspend::suspend(&chat, &wv_suspend::CHAT_SUSPEND);
                 }
             });
             layout_main_webviews(app);
@@ -835,6 +855,20 @@ fn toggle_chat_webview<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
             // 摆位必须在隐藏状态下完成，用户看不到这一步。
             let _ = chat.set_position(tauri::LogicalPosition::new(from_x, y));
             let _ = chat.set_size(tauri::LogicalSize::new(chat_w, chat_h));
+
+            // v0.3.4：若上次关闭时把侧栏**挂起**了，这里先恢复。
+            //
+            // 官方文档说 `show()` 会让 webview **自动**恢复，所以这一步严格来说
+            // 不是必须的；但我们仍然显式调：
+            //   1. 更确定（不依赖「变可见」这一事件时序）；
+            //   2. 让页面**立刻**开始跑 —— 自动恢复要等到它真正变可见那一刻，
+            //      而我们紧接着就要放滑入动画，早一点恢复能少一帧空白。
+            //
+            // ⚠️ 必须在 `show()` **之前**调：`resume()` 会递增代次，从而让
+            // 可能还在飞的挂起回调**不认账**（否则那个迟到的回调会把刚打开的
+            // 侧栏又标记成挂起 —— 这正是「点了没反应」同类缺陷的温床）。
+            wv_suspend::resume(&chat, &wv_suspend::CHAT_SUSPEND);
+
             chat.show().map_err(|e| e.to_string())?;
             CHAT_VISIBLE.store(true, Ordering::Relaxed);
 
@@ -1097,6 +1131,31 @@ fn spawn_cookie_keeper<R: Runtime>(app: AppHandle<R>) {
                 if !url.starts_with("http") {
                     continue;
                 }
+
+                // v0.3.4：**挂起期间必须跳过**，否则会把 webview 唤醒、挂起白做。
+                //
+                // 官方文档明确警告：
+                //   "Some APIs like Navigate will auto resume the WebView. To avoid
+                //    unexpected auto resume, check IsSuspended property before calling
+                //    APIs that might change WebView state."
+                //
+                // `GetCookies` 就是这类 API。若不跳过，我们每 20 秒把刚挂起的
+                // 侧栏/内容页唤醒一次 ⇒ 省内存完全失效。
+                //
+                // 跳过是安全的：这些页面在**可见期间**已经每 20 秒持久化过一轮，
+                // 关闭前的登录态不会因为跳过而丢失。
+                //
+                // 注意这里读的是**我们自己记账**的标志，不是实时问 COM ——
+                // 实时查询要阻塞等主线程回结果（见 `is_suspended_blocking`），
+                // 在这个每 20 秒跑一次的后台线程上没必要冒那个险。
+                let slot = match label {
+                    CHAT_LABEL => &wv_suspend::CHAT_SUSPEND,
+                    _ => &wv_suspend::CONTENT_SUSPEND,
+                };
+                if wv_suspend::should_skip_cookie_persist(slot) {
+                    continue;
+                }
+
                 persist_session_cookies(&webview, &url);
             }
         }

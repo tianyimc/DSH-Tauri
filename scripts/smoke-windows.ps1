@@ -434,6 +434,11 @@ try {
   Set-Content -Path $LOG_A -Value "" -NoNewline
   Set-Content -Path $LOG_B -Value "" -NoNewline
 
+  # ⚠️ 心跳计数基线**先初始化为 0**：第 8 节会拿它做 `-gt` 比较，
+  # 若它在某个分支里没被赋值，`$x -gt $null` 在 PowerShell 里是 **True**
+  # ⇒ 断言会假性通过（这正是本项目反复踩过的「假绿」类型）。
+  $hbNow = 0
+
   Write-Host "== 2. 预置配置（本地 + 远程都配好，便于测试切换）=="
   New-Item -ItemType Directory -Force -Path $CONFIG_DIR | Out-Null
   $cfg = @{ configured = $true;

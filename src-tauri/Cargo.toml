@@ -1,6 +1,6 @@
 [package]
 name = "dshtauri"
-version = "0.3.4"
+version = "0.3.3"
 description = "DSHTauri - lightweight Tauri 2 desktop shell for the DSH WebUI"
 authors = ["DSHTauri"]
 edition = "2021"

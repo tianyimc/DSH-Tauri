@@ -33,13 +33,6 @@ mod anim;
 /// `ICON_BIG` —— 所以 v0.3.1 的任务栏图标根本没跟着主题变。见模块文档。
 mod win_icon;
 
-/// WebView2「挂起」（休眠）：不可见的 webview 省内存。
-///
-/// 我们的 webview 关闭时只 `hide()`、从不销毁，隐藏后 renderer 仍占着完整
-/// JS 堆。用官方 `ICoreWebView2_3::TrySuspend`（等价 Edge 的「标签页休眠」）
-/// 把不可见页面的内存标记为「系统可回收」。见模块文档。
-mod wv_suspend;
-
 /// 启动选择窗口的 label（在 `setup()` 里创建）。
 pub const SELECTOR_LABEL: &str = "selector";
 /// 主窗口的 label。
@@ -63,49 +56,6 @@ pub const CHAT_LABEL: &str = "chat";
 pub const ABOUT_LABEL: &str = "about";
 /// 「设置」窗口的 label（独立 `WebviewWindow`，加载本地 `settings.html` ⇒ 有 IPC）。
 pub const SETTINGS_LABEL: &str = "settings";
-
-/// 用户点窗口「×」时该怎么处理。
-///
-/// 抽成纯函数是为了**可测**：各分支的取舍理由见下面的文档与 `close_disposition`。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CloseAction {
-    /// 主窗口：收进托盘（不退出程序）。
-    HideToTray,
-    /// 只隐藏，不销毁。
-    Hide,
-    /// **放行关闭**，让窗口被真正销毁以释放 renderer。
-    Destroy,
-}
-
-/// 按窗口 label 决定「点 × 时怎么办」。
-///
-/// - `main` → 收托盘（关闭 ≠ 退出，由托盘菜单「退出」真正结束）。
-/// - `selector` → **有主窗口时销毁**，否则隐藏。
-///
-///   销毁的理由：选择窗口是一次性的「选连接方式」界面，主窗口起来后它的使命就结束了；
-///   留着（哪怕隐藏）会让它的 renderer 一直占内存。销毁后用户仍可从托盘
-///   「重新选择连接方式」把它**重建**出来（见 `reveal_selector`）。
-///
-///   ⚠️ **没有主窗口时必须只隐藏**：此时它是**唯一**的窗口，销毁最后一个窗口
-///   会让 tao 触发 `ExitRequested` ⇒ 整个程序退出（托盘也跟着消失）。
-///   用户点「×」通常只是想把它收起来，不是想退出程序。
-/// - `about` / `settings` → 销毁。本地小页面，重建很快；而隐藏会让它的 renderer
-///   一直占内存（v0.3.4 优化目标之一）。
-/// - 其它（理论上不存在）→ 保守地按隐藏处理，绝不误销毁未知窗口。
-pub fn close_disposition(label: &str, has_main_window: bool) -> CloseAction {
-    match label {
-        MAIN_LABEL => CloseAction::HideToTray,
-        SELECTOR_LABEL => {
-            if has_main_window {
-                CloseAction::Destroy
-            } else {
-                CloseAction::Hide
-            }
-        }
-        ABOUT_LABEL | SETTINGS_LABEL => CloseAction::Destroy,
-        _ => CloseAction::Hide,
-    }
-}
 
 /// 版本号（`v.A.B.C`，可选 ` RC` 后缀），由 `build.rs` 从 `Cargo.toml` + `version.json` 生成。
 ///
@@ -729,84 +679,13 @@ fn navigate_content<R: Runtime>(app: &AppHandle<R>, url: tauri::Url) -> Result<(
 
 /// 主窗口（连同顶栏、内容、侧栏）整体隐藏 —— 「关闭 = 隐藏到托盘」走这里。
 ///
-/// v0.3.4：隐藏之后**挂起内容页与侧栏**。
-///
-/// # 为什么收托盘是最该省内存的时刻
-///
-/// 用户实测「平时非活动 350–450MB」，而 CI 采样显示收托盘后（采样点 5）与
-/// 收托盘前（采样点 2）**几乎一样** —— 因为 `Window::hide()` **只隐藏 HWND**，
-/// 子 webview 的 `CoreWebView2Controller::IsVisible` 仍然是 `true`：
-/// DSH 页面的 JS 定时器、WebSocket、轮询全都在继续跑，renderer 一点没闲着。
-///
-/// # 为什么必须先显式 `SetIsVisible(false)`
-///
-/// `TrySuspend` 的硬性前置条件是 controller 的 `IsVisible == false`，
-/// 否则直接返回 `HRESULT_FROM_WIN32(ERROR_INVALID_STATE)`。
-/// 子 webview 的 `hide()` 会设它，但主窗口的 `hide()` **不会** ——
-/// 所以这条路径必须自己设。这正是它与「关侧栏挂起 chat」的关键区别。
-///
-/// # 线程安全
-///
-/// 本函数在 `CloseRequested` 事件处理器里被调用（**主线程**）。
-/// `with_webview` 在主线程上是**同步执行闭包**（不像 `add_child` 那样
-/// `run_on_main_thread` + `recv()` 自等 ⇒ 死锁），闭包里只做 COM 调用、
-/// 不再回调 Tauri，所以安全。
+/// 子 webview 随父窗口一起隐藏，不需要逐个处理。
 fn hide_main_windows<R: Runtime>(app: &AppHandle<R>) {
     // 先掐掉可能还在跑的侧栏过渡动画：窗口都要收起来了，
     // 让一个后台线程继续改 webview 位置既没意义，也可能和「重新显示」打架。
     anim::cancel();
     if let Some(main) = app.get_window(MAIN_LABEL) {
         let _ = main.hide();
-    }
-    // 窗口已隐藏，现在把子 webview 也真正「停」下来。
-    suspend_main_webviews(app);
-}
-
-/// 收托盘时挂起主窗口里的子 webview（内容页 + 若开着的侧栏）。
-///
-/// 顺序很重要：**先 `SetIsVisible(false)`、再 `TrySuspend`**。
-/// 反了会因 `ERROR_INVALID_STATE` 静默失效（不报错、也没省到内存）。
-fn suspend_main_webviews<R: Runtime>(app: &AppHandle<R>) {
-    for (label, slot) in [
-        (CONTENT_LABEL, &wv_suspend::CONTENT_SUSPEND),
-        (CHAT_LABEL, &wv_suspend::CHAT_SUSPEND),
-    ] {
-        let Some(webview) = app.get_webview(label) else {
-            continue;
-        };
-        // 侧栏若本来就没打开，它的 controller 已是 invisible 且已挂起
-        // （关侧栏那条路径做过）—— 这里再调一遍是幂等的，不做额外判断。
-        wv_suspend::set_controller_visible(&webview, false);
-        wv_suspend::suspend(&webview, slot);
-    }
-}
-
-/// 从托盘恢复主窗口时，把子 webview 唤醒。
-///
-/// 顺序与挂起相反：**先 `Resume()`、再 `SetIsVisible(true)`** ——
-/// 与微软官方示例一致（`Resume(); put_IsVisible(TRUE);`）。
-///
-/// ⚠️ 必须放在显示流程的**最前面**且幂等：万一这里出错导致内容页一直不可见，
-/// 用户看到的就是「窗口回来了但是一片空白」—— 比不省内存严重得多。
-fn resume_main_webviews<R: Runtime>(app: &AppHandle<R>) {
-    for (label, slot) in [
-        (CONTENT_LABEL, &wv_suspend::CONTENT_SUSPEND),
-        (CHAT_LABEL, &wv_suspend::CHAT_SUSPEND),
-    ] {
-        let Some(webview) = app.get_webview(label) else {
-            continue;
-        };
-        // 侧栏若当前不该可见，就不要把它弄成可见 —— 否则会在内容页右侧
-        // 露出一块「本应隐藏」的侧栏。
-        let should_be_visible = if label == CHAT_LABEL {
-            CHAT_VISIBLE.load(Ordering::Relaxed)
-        } else {
-            true
-        };
-        if should_be_visible {
-            wv_suspend::resume(&webview, slot);
-            wv_suspend::set_controller_visible(&webview, true);
-        }
     }
 }
 
@@ -815,9 +694,6 @@ fn show_main_windows<R: Runtime>(app: &AppHandle<R>) {
     let Some(main) = app.get_window(MAIN_LABEL) else {
         return;
     };
-    // ⚠️ 最先恢复子 webview（在 show() 之前）：它们可能在收托盘时被挂起了，
-    // 不先唤醒就会出现「窗口回来了但内容页空白」。
-    resume_main_webviews(app);
     let _ = main.unminimize();
     let _ = main.show();
     let _ = main.set_focus();
@@ -902,19 +778,6 @@ fn toggle_chat_webview<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
             anim::slide_x_with(app, CHAT_LABEL, from_x, width, y, chat_w, chat_h, |app| {
                 if let Some(chat) = app.get_webview(CHAT_LABEL) {
                     let _ = chat.hide();
-                    // v0.3.4：隐藏之后**挂起**（等价 Edge 的「标签页休眠」）——
-                    // 侧栏是 chat.deepseek.com 这类重页面，隐藏后 renderer 仍占着
-                    // 完整的 JS 堆。挂起把这块内存标记为「系统可回收」。
-                    //
-                    // ⚠️ **必须在 `hide()` 之后**：`TrySuspend` 要求 controller 的
-                    // `IsVisible == false`，而子 webview 的 `hide()` 恰好会设它
-                    // （`WebviewMessage::Hide` → `webview.set_visible(false)`）。
-                    // 顺序反了会拿到 ERROR_INVALID_STATE、挂起静默失效。
-                    //
-                    // ⚠️ 这里跑在**动画线程**上。`with_webview` 内部是
-                    // `send_user_message`（非阻塞投递），从动画线程调用安全；
-                    // 而 `hide()` 刚投递的 Hide 消息排在同一队列前面，会先被处理。
-                    wv_suspend::suspend(&chat, &wv_suspend::CHAT_SUSPEND);
                 }
             });
             layout_main_webviews(app);
@@ -972,20 +835,6 @@ fn toggle_chat_webview<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
             // 摆位必须在隐藏状态下完成，用户看不到这一步。
             let _ = chat.set_position(tauri::LogicalPosition::new(from_x, y));
             let _ = chat.set_size(tauri::LogicalSize::new(chat_w, chat_h));
-
-            // v0.3.4：若上次关闭时把侧栏**挂起**了，这里先恢复。
-            //
-            // 官方文档说 `show()` 会让 webview **自动**恢复，所以这一步严格来说
-            // 不是必须的；但我们仍然显式调：
-            //   1. 更确定（不依赖「变可见」这一事件时序）；
-            //   2. 让页面**立刻**开始跑 —— 自动恢复要等到它真正变可见那一刻，
-            //      而我们紧接着就要放滑入动画，早一点恢复能少一帧空白。
-            //
-            // ⚠️ 必须在 `show()` **之前**调：`resume()` 会递增代次，从而让
-            // 可能还在飞的挂起回调**不认账**（否则那个迟到的回调会把刚打开的
-            // 侧栏又标记成挂起 —— 这正是「点了没反应」同类缺陷的温床）。
-            wv_suspend::resume(&chat, &wv_suspend::CHAT_SUSPEND);
-
             chat.show().map_err(|e| e.to_string())?;
             CHAT_VISIBLE.store(true, Ordering::Relaxed);
 
@@ -1074,58 +923,21 @@ fn show_about_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         let _ = about.set_focus();
         return Ok(());
     }
-    let about = build_with_retry("打开关于窗口失败", || {
-        let builder =
-            WebviewWindowBuilder::new(app, ABOUT_LABEL, WebviewUrl::App("about.html".into()))
-                .title(ABOUT_TITLE)
-                .inner_size(ABOUT_WIDTH, ABOUT_HEIGHT)
-                .resizable(false)
-                .maximizable(false)
-                .minimizable(false)
-                .center()
-                .visible(true);
-        with_shared_profile(app, builder).build()
-    })?;
+    let builder = WebviewWindowBuilder::new(app, ABOUT_LABEL, WebviewUrl::App("about.html".into()))
+        .title(ABOUT_TITLE)
+        .inner_size(ABOUT_WIDTH, ABOUT_HEIGHT)
+        .resizable(false)
+        .maximizable(false)
+        .minimizable(false)
+        .center()
+        .visible(true);
+    let about = with_shared_profile(app, builder)
+        .build()
+        .map_err(|e| format!("打开关于窗口失败：{e}"))?;
     // v0.3.3：关于窗口是**按需创建**的，远晚于 `apply_theme_icons` 的最后一次调用，
     // 不在这里设图标就会一直用 bundle 里那个静态深藏青 `icon.ico`（用户实测的缺陷）。
     set_creation_icon(&about);
     Ok(())
-}
-
-/// 按需创建窗口（关于 / 设置），**带一次重试**。
-///
-/// 为什么需要重试：v0.3.4 起这两个窗口「关闭即销毁」，于是它们会被**反复重建**。
-/// 而 `destroy()` 走的是 `send_event` —— 异步的，`build()` 可能赶在底层
-/// WebView2 真正释放之前执行。此时同 label 的 `build()` 在 Windows 上会失败
-/// （代码里原有注释就记着这个坑：「重复 `build()` 同 label 窗口在 Windows 上会因
-/// 旧 WebView2 尚未销毁而失败」）。
-///
-/// 做法：失败后等 150ms 再试一次。`builder_factory` 每次重新构造 builder，
-/// 因为 `build()` 会**消耗** builder（不能复用）。
-///
-/// ⚠️ 这里用 `std::thread::sleep` 阻塞等待：调用方是 `async` 命令
-/// （`chrome_action` / `run_action`），跑在 tokio 的阻塞池之外的异步上下文里，
-/// 阻塞 150ms 只影响这一次打开操作，不会卡住 UI 主线程。
-fn build_with_retry<R, F>(err_prefix: &str, build: F) -> Result<tauri::WebviewWindow<R>, String>
-where
-    R: Runtime,
-    F: Fn() -> tauri::Result<tauri::WebviewWindow<R>>,
-{
-    // 最多两次：第一次直接用；失败（多半是旧 WebView2 还没释放）等一会再试。
-    let mut last_err = String::new();
-    for attempt in 0..2 {
-        if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(150));
-        }
-        match build() {
-            Ok(window) => return Ok(window),
-            Err(err) => {
-                last_err = err.to_string();
-                eprintln!("[DSHTauri] {err_prefix}（第 {} 次）：{err}", attempt + 1);
-            }
-        }
-    }
-    Err(format!("{err_prefix}：{last_err}"))
 }
 
 /// 「设置」窗口。
@@ -1143,19 +955,19 @@ fn show_settings_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         let _ = settings.set_focus();
         return Ok(());
     }
-    let settings = build_with_retry("打开设置窗口失败", || {
-        let builder =
-            WebviewWindowBuilder::new(app, SETTINGS_LABEL, WebviewUrl::App("settings.html".into()))
-                .title(SETTINGS_TITLE)
-                .inner_size(SETTINGS_WIDTH, SETTINGS_HEIGHT)
-                .min_inner_size(480.0, 400.0)
-                .resizable(true)
-                .maximizable(false)
-                .minimizable(true)
-                .center()
-                .visible(true);
-        with_shared_profile(app, builder).build()
-    })?;
+    let builder =
+        WebviewWindowBuilder::new(app, SETTINGS_LABEL, WebviewUrl::App("settings.html".into()))
+            .title(SETTINGS_TITLE)
+            .inner_size(SETTINGS_WIDTH, SETTINGS_HEIGHT)
+            .min_inner_size(480.0, 400.0)
+            .resizable(true)
+            .maximizable(false)
+            .minimizable(true)
+            .center()
+            .visible(true);
+    let settings = with_shared_profile(app, builder)
+        .build()
+        .map_err(|e| format!("打开设置窗口失败：{e}"))?;
     // v0.3.3：同「关于」窗口 —— 按需创建，必须在这里设图标（见 `set_creation_icon`）。
     set_creation_icon(&settings);
     Ok(())
@@ -1173,21 +985,7 @@ fn reveal_window<R: Runtime>(app: &AppHandle<R>) {
 }
 
 /// 托盘「重新选择连接方式」/ 自定义标题栏的「重新连接」：
-/// 把选择窗口叫出来；若它已被销毁（v0.3.4：连接成功后销毁）就**重建**。
-///
-/// # 线程说明（已核实，不是想当然）
-///
-/// 重建走 `create_selector_window` → `WebviewWindowBuilder::build()` →
-/// `create_window`，其内部是 `send_user_message(Message::CreateWindow)` 然后
-/// `rx.recv()` 阻塞等响应。我一度以为「在主线程上会死锁」，但**核实后并非如此**：
-/// `handle_user_message` 的 `Message::CreateWindow` 分支会**同步**执行创建并
-/// `sender.send(...)`，所以主线程内联执行时 `recv()` 立刻就能拿到结果。
-///
-/// 但**真正的历史坑**仍然成立且必须避开：这条 IPC 正是选择窗口自己发起的，
-/// 在「正在执行该 IPC 的 webview 的回调里」同步创建窗口会让新的 WebView2
-/// **永远初始化不完**（白屏）—— 见 CHANGELOG v0.1.x。所以 `open_main_window`
-/// 是 `async` 命令，由异步线程调用；`reveal_selector` 的两个调用点
-/// （托盘菜单、`chrome_action` 异步命令）也都不在那个回调里。
+/// 把选择窗口叫出来（它只是被隐藏了，没有销毁）。
 fn reveal_selector<R: Runtime>(app: &AppHandle<R>) {
     if let Some(selector) = app.get_webview_window(SELECTOR_LABEL) {
         let _ = selector.unminimize();
@@ -1195,30 +993,10 @@ fn reveal_selector<R: Runtime>(app: &AppHandle<R>) {
         let _ = selector.set_focus();
         return;
     }
-    // v0.3.4：连接成功后选择窗口会被**销毁**（省内存），所以这条重建路径
-    // 现在是**常规路径**，不再是「理论上不会走到」的保底分支。
-    //
-    // 重建要带重试：`destroy()` 走 `send_event`（异步），底层 WebView2 的释放
-    // 可能还没完成，同 label 的 `build()` 会失败（代码里原有注释记着这个坑）。
-    let mut last_err = String::new();
-    for attempt in 0..2 {
-        if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(150));
-        }
-        match create_selector_window(app) {
-            Ok(()) => {
-                if let Some(selector) = app.get_webview_window(SELECTOR_LABEL) {
-                    let _ = selector.set_focus();
-                }
-                return;
-            }
-            Err(err) => {
-                last_err = err.to_string();
-                eprintln!("[DSHTauri] 重建选择窗口失败（第 {} 次）：{err}", attempt + 1);
-            }
-        }
+    // 理论上不会走到这里（选择窗口不会被销毁），保底重建。
+    if let Err(err) = create_selector_window(app) {
+        eprintln!("[DSHTauri] 重建选择窗口失败：{err}");
     }
-    eprintln!("[DSHTauri] 重建选择窗口最终失败：{last_err}");
 }
 
 
@@ -1319,31 +1097,6 @@ fn spawn_cookie_keeper<R: Runtime>(app: AppHandle<R>) {
                 if !url.starts_with("http") {
                     continue;
                 }
-
-                // v0.3.4：**挂起期间必须跳过**，否则会把 webview 唤醒、挂起白做。
-                //
-                // 官方文档明确警告：
-                //   "Some APIs like Navigate will auto resume the WebView. To avoid
-                //    unexpected auto resume, check IsSuspended property before calling
-                //    APIs that might change WebView state."
-                //
-                // `GetCookies` 就是这类 API。若不跳过，我们每 20 秒把刚挂起的
-                // 侧栏/内容页唤醒一次 ⇒ 省内存完全失效。
-                //
-                // 跳过是安全的：这些页面在**可见期间**已经每 20 秒持久化过一轮，
-                // 关闭前的登录态不会因为跳过而丢失。
-                //
-                // 注意这里读的是**我们自己记账**的标志，不是实时问 COM ——
-                // 实时查询要阻塞等主线程回结果（见 `is_suspended_blocking`），
-                // 在这个每 20 秒跑一次的后台线程上没必要冒那个险。
-                let slot = match label {
-                    CHAT_LABEL => &wv_suspend::CHAT_SUSPEND,
-                    _ => &wv_suspend::CONTENT_SUSPEND,
-                };
-                if wv_suspend::should_skip_cookie_persist(slot) {
-                    continue;
-                }
-
                 persist_session_cookies(&webview, &url);
             }
         }
@@ -1680,39 +1433,19 @@ fn open_url_in_system(url: &str) -> Result<(), String> {
 /// 放到异步运行时执行，避免占住主线程。
 #[tauri::command]
 async fn window_control(app: AppHandle, action: String) -> Result<(), String> {
-    // 关于窗口自己就能关自己，不需要主窗口存在。
-    //
-    // v0.3.4：**从 `hide()` 改成 `destroy()`** —— 这两个窗口是本地小页面，
-    // 重建很快（<100ms），而隐藏会让它的 renderer 一直占着内存。
-    // 用户实测「平时非活动 350–450MB」，其中就有这两个窗口的份额。
-    //
-    // 为什么 `destroy()` 在这里是安全的（都核查过）：
-    //   1. 本命令是 `async`，不在主线程上跑；
-    //   2. `WindowDispatcher::destroy` 用的是 `send_event`（**不是**
-    //      `send_user_message`），所以不会命中 `handle_user_message` 里的
-    //      `panic!("cannot handle WindowMessage::Destroy on the main thread")`；
-    //   3. 销毁后 `on_window_close` 会把窗口从 Tauri 注册表移除，
-    //      底层 `InnerWebView::drop` → `controller.Close()` 真正释放 renderer；
-    //   4. 之后再打开走 `show_about_window` 的**重建**分支（已加重试，见那里）。
-    if action == "close-about" {
+    // 关于窗口自己就能关自己，不需要主窗口存在
+    if action == "hide-about" {
         if let Some(about) = app.get_webview_window(ABOUT_LABEL) {
-            if let Err(err) = about.destroy() {
-                // 销毁失败时退回隐藏：至少别让「关闭」这个操作看起来没反应。
-                eprintln!("[DSHTauri] 销毁关于窗口失败，退回隐藏：{err}");
-                let _ = about.hide();
-            }
+            let _ = about.hide();
         }
         return Ok(());
     }
 
     // 设置窗口同理：它可能是在**没有主窗口**的情况下打开的（比如用户还没连接），
     // 所以这个分支必须放在取 `main` 之前。
-    if action == "close-settings" {
+    if action == "hide-settings" {
         if let Some(settings) = app.get_webview_window(SETTINGS_LABEL) {
-            if let Err(err) = settings.destroy() {
-                eprintln!("[DSHTauri] 销毁设置窗口失败，退回隐藏：{err}");
-                let _ = settings.hide();
-            }
+            let _ = settings.hide();
         }
         return Ok(());
     }
@@ -1945,17 +1678,6 @@ async fn open_main_window_inner(app: &AppHandle, request: OpenRequest) -> Result
     // 重建同 label 的窗口要等旧窗口从 Tauri 的注册表里摘掉，而 WebView2 的销毁是异步的，
     // 很容易出现「新窗口建不出来 / 卡住」，表现为点了没反应。
     if app.get_window(MAIN_LABEL).is_some() {
-        // ⚠️ **先唤醒子 webview，再导航**（v0.3.4 加）。
-        //
-        // 主窗口可能是「收进托盘时被挂起」的状态。若在挂起态直接 `navigate`：
-        // 文档说 `Navigate` 会**自动恢复** webview，所以未必出问题，但依赖这个
-        // 隐式行为很脆弱；而且我们的记账（`CONTENT_SUSPEND`）不会同步更新，
-        // 于是 cookie 保活会一直以为它挂起、把持久化全跳过。
-        // 显式恢复一次，代价是几毫秒，换来状态一致。
-        //
-        // 注意顺序仍是「先恢复 → 再导航 → 最后才 show()」：
-        // 不能在导航前就 `show()`，否则用户会先看到**旧页面**闪一下再切走。
-        resume_main_webviews(app);
         navigate_content(app, url)?;
         if let Some(main) = app.get_window(MAIN_LABEL) {
             let _ = main.unminimize();
@@ -2039,60 +1761,14 @@ async fn open_main_window_inner(app: &AppHandle, request: OpenRequest) -> Result
     // 放在这里（而不是 setup）是为了避开启动阶段，只在确实有网页在跑时才动手。
     spawn_cookie_keeper(app.clone());
 
-    // 选择窗口使命完成 —— **销毁**它（v0.3.4）。
-    //
-    // # 为什么销毁
-    //
-    // 它是一次性的「选连接方式」界面，主窗口起来后就没用了；隐藏的话它的
-    // renderer 会一直占内存（用户实测空闲态里就有它一份）。
-    // 销毁后用户仍可从托盘「重新选择连接方式」把它**重建**出来（`reveal_selector`）。
-    //
-    // # ⚠️ 为什么**不能**在这里直接 `destroy()`
-    //
-    // 本函数是被选择窗口通过 IPC 调进来的（`open_main_window` 命令）。
-    // CHANGELOG v0.1.x 记着一个真实 bug：**在「正在执行 IPC 的那个 webview」的
-    // 回调里销毁它自己**，会让 Windows 的消息处理进入坏状态（后续 `hide()` 被丢弃
-    // ⇒ 点 × 没反应）。当年正是因此把 `destroy()` 改成了 `hide()`。
-    //
-    // 所以这里**延后到另一个线程**执行：等本次 IPC 回调返回、消息处理回到正常
-    // 循环后，再销毁。`spawn_blocking` 用的是异步运行时的阻塞线程池，
-    // 不会卡住主线程，也不会嵌套在 WebView2 的回调里。
-    //
-    // 为什么还要 sleep 250ms：销毁本身是 `send_event`（非阻塞投递），但我们要确保
-    // **这次 IPC 的响应已经写回**（响应也走同一个消息循环）。给一小段余量最稳妥。
-    {
-        let app = app.clone();
-        // 用 `spawn_blocking`：里面就是一个 sleep + 销毁，天然是阻塞型工作，
-        // 不占用异步工作线程，也**不需要**额外的 tokio 依赖（`tauri::async_runtime`
-        // 没有 re-export `tokio::time`，而 `spawn_blocking` 正好合适）。
-        tauri::async_runtime::spawn_blocking(move || {
-            // 给这次 IPC 响应留出写回的时间（响应走同一个消息循环）。
-            std::thread::sleep(std::time::Duration::from_millis(250));
-            destroy_selector_after_connect(&app);
-        });
+    // 选择窗口使命完成：**隐藏**而不是销毁。
+    // 销毁会干掉「正在执行这条 IPC 的 webview」，Windows 上会让消息处理进入坏状态。
+    // 隐藏更安全，而且保留下来还能通过托盘「重新选择连接方式」再叫出来。
+    if let Some(selector) = app.get_webview_window(SELECTOR_LABEL) {
+        let _ = selector.hide();
     }
 
     Ok(())
-}
-
-/// 主窗口就绪后销毁选择窗口。
-///
-/// 抽成独立函数是为了**可测**与可读：`destroy()` 的失败只记录，
-/// 因为「选择窗口还在」只是没省到内存，不影响功能。
-fn destroy_selector_after_connect<R: Runtime>(app: &AppHandle<R>) {
-    let Some(selector) = app.get_webview_window(SELECTOR_LABEL) else {
-        return;
-    };
-    // 二次确认主窗口确实在：万一主窗口刚被销毁（用户在 250ms 内关了它），
-    // 销毁选择窗口就会让程序**一个窗口都不剩** ⇒ tao 触发 ExitRequested ⇒ 程序退出。
-    if app.get_window(MAIN_LABEL).is_none() {
-        return;
-    }
-    if let Err(err) = selector.destroy() {
-        eprintln!("[DSHTauri] 销毁选择窗口失败（不影响功能，只是没省到内存）：{err}");
-    } else {
-        eprintln!("[DSHTauri] 选择窗口已销毁（主窗口已就绪，释放它的 renderer）");
-    }
 }
 
 /* -------------------------------------------------------------------- run */
@@ -2148,28 +1824,14 @@ pub fn run() {
             // 关闭窗口 ≠ 退出程序：隐藏到托盘，由托盘菜单「退出」真正结束。
             // 托盘不可用时不能隐藏，否则用户再也找不回窗口。
             WindowEvent::CloseRequested { api, .. } => {
-                if !TRAY_READY.load(Ordering::Relaxed) {
-                    return; // 托盘没起来：放行真正的关闭，否则用户再也找不回窗口
-                }
-                // 「有没有主窗口」决定选择窗口能不能被销毁（见 `close_disposition`）。
-                // 在**事件处理器里现查**，而不是缓存：主窗口可能刚被创建或刚被销毁。
-                let has_main = window.app_handle().get_window(MAIN_LABEL).is_some();
-                match close_disposition(window.label(), has_main) {
-                    // 主窗口关闭 = 整个主界面（含标题栏、侧栏）一起收进托盘
-                    CloseAction::HideToTray => {
-                        api.prevent_close();
+                if TRAY_READY.load(Ordering::Relaxed) {
+                    api.prevent_close();
+                    if window.label() == MAIN_LABEL {
+                        // 主窗口关闭 = 整个主界面（含标题栏、侧栏）一起收进托盘
                         hide_main_windows(window.app_handle());
-                    }
-                    // 只隐藏（选择窗口在主窗口还不存在时走这里 —— 它是唯一窗口，
-                    // 销毁它会让整个程序退出）。
-                    CloseAction::Hide => {
-                        api.prevent_close();
+                    } else {
                         let _ = window.hide();
                     }
-                    // 不阻止关闭，让窗口被真正销毁 ⇒ 底层
-                    // `InnerWebView::drop` → `controller.Close()` 释放 renderer。
-                    // 适用于：关于 / 设置，以及**主窗口已存在时**的选择窗口。
-                    CloseAction::Destroy => {}
                 }
             }
             // 主窗口缩放 / DPI 变化时，重新摆放子 webview（顶栏恒 40 逻辑 px、内容占满剩余）。
@@ -2730,57 +2392,6 @@ mod tests {
         for other in [MAIN_LABEL, TITLEBAR_LABEL, CONTENT_LABEL, CHAT_LABEL, SELECTOR_LABEL] {
             assert_ne!(SETTINGS_LABEL, other);
         }
-    }
-
-    /// v0.3.4：点窗口「×」时的处置策略。
-    ///
-    /// 这组断言保护的是**内存优化**：关于/设置必须被销毁（否则 renderer 一直占内存），
-    /// 而主窗口必须收托盘（不能真退出）。
-    #[test]
-    fn close_disposition_covers_each_window_kind() {
-        assert_eq!(close_disposition(MAIN_LABEL, true), CloseAction::HideToTray);
-        assert_eq!(close_disposition(MAIN_LABEL, false), CloseAction::HideToTray);
-        assert_eq!(close_disposition(ABOUT_LABEL, true), CloseAction::Destroy);
-        assert_eq!(close_disposition(SETTINGS_LABEL, true), CloseAction::Destroy);
-        // 未知 label 保守处理：只隐藏，绝不误销毁。
-        assert_eq!(close_disposition("some-unknown", true), CloseAction::Hide);
-    }
-
-    /// 关于/设置必须是「销毁」，否则 v0.3.4 的省内存目标落空。
-    #[test]
-    fn about_and_settings_are_destroyed_on_close() {
-        for label in [ABOUT_LABEL, SETTINGS_LABEL] {
-            assert_eq!(
-                close_disposition(label, true),
-                CloseAction::Destroy,
-                "{label} 窗口关闭时没有销毁 —— 它的 renderer 会一直占着内存"
-            );
-        }
-    }
-
-    /// v0.3.4：**有主窗口时**，选择窗口关闭即销毁（省下它的 renderer）。
-    ///
-    /// 用户仍可从托盘「重新选择连接方式」把它重建出来（`reveal_selector` 有重建分支）。
-    #[test]
-    fn selector_is_destroyed_once_main_window_exists() {
-        assert_eq!(
-            close_disposition(SELECTOR_LABEL, true),
-            CloseAction::Destroy,
-            "主窗口已存在时选择窗口没被销毁 —— 它的 renderer 会一直占着内存"
-        );
-    }
-
-    /// ⚠️ **没有主窗口时，选择窗口绝不能销毁**。
-    ///
-    /// 此时它是**唯一**的窗口；销毁最后一个窗口会让 tao 触发 `ExitRequested`
-    /// ⇒ 整个程序退出（托盘也一起消失）。用户点「×」只是想把它收起来。
-    #[test]
-    fn selector_is_only_hidden_when_it_is_the_last_window() {
-        assert_eq!(
-            close_disposition(SELECTOR_LABEL, false),
-            CloseAction::Hide,
-            "没有主窗口时销毁选择窗口 —— 程序会直接退出"
-        );
     }
 
     /// 顶栏高度是逻辑值，必须原样交给 Tauri（**不许**再乘 scale）。

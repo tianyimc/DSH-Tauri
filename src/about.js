@@ -376,7 +376,7 @@ function boot() {
   document.getElementById("btn-check").addEventListener("click", checkUpdates);
 
   document.getElementById("btn-close").addEventListener("click", () => {
-    invoke("window_control", { action: "close-about" }).catch(() => {
+    invoke("window_control", { action: "hide-about" }).catch(() => {
       // 兜底：直接关掉本窗口
       window.close();
     });

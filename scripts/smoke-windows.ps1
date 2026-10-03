@@ -34,135 +34,6 @@ function Check([string]$Name, [bool]$Ok, [string]$Detail = "") {
   }
 }
 
-# ============================================================================
-# 内存采样（v0.3.4 阶段 0）
-# ============================================================================
-#
-# 目的：把「各阶段到底占多少内存」变成 CI 上可复现的数字，而不是靠猜。
-# 后续阶段（挂起 chat / 销毁 about+settings / 托盘挂起 content）都要拿它做前后对比。
-#
-# 口径说明（重要，否则数字没有意义）：
-#   · 以 dshtauri.exe 的 PID 为根，**递归**遍历其子进程（WebView2 的 browser/GPU/
-#     utility/renderer 全是它的子进程），只统计这棵树里的进程。
-#     不统计「全机所有 msedgewebview2.exe」—— CI 机器上可能有其它 WebView2 宿主，
-#     那样会把无关进程算进来。
-#   · WorkingSet = 任务管理器「内存」列的口径（物理内存工作集，含可共享部分，
-#     所以多个进程相加会**重复计算**共享的 DLL 页，数值偏高）。
-#   · Private      = 私有提交内存，不重复计算共享页，更能反映真实占用。
-#     两个都记录，便于与用户的任务管理器数字对上。
-#   · 采样本身只读进程信息，不改应用行为。
-
-$script:MemSamples = @()
-
-function Get-AppProcessTree([int]$RootPid) {
-  # 一次取全量进程表，再在内存里做 BFS —— 比每个节点查一次 WMI 快得多，
-  # 也避免「父进程已退出导致子进程查不到」的竞态。
-  $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-    Select-Object ProcessId, ParentProcessId, Name, WorkingSetSize, PrivatePageCount)
-  $byPid = @{}
-  $byParent = @{}
-  foreach ($p in $all) {
-    $byPid[[int]$p.ProcessId] = $p
-    $ppid = [int]$p.ParentProcessId
-    if (-not $byParent.ContainsKey($ppid)) { $byParent[$ppid] = @() }
-    $byParent[$ppid] += $p
-  }
-
-  # ⚠️ 必须**去重**后再聚合，不能一边 BFS 一边累加：
-  # 真实进程表的 PID 唯一，但「同一 PID 出现在两个父下」的脏数据、以及
-  # 我们自己重复入队都会让同一个进程被算两次（实测过一次：汇总虚高）。
-  # 所以这里只负责收集**唯一的 PID 集合**（含根进程自己），聚合交给调用方。
-  $pids = [System.Collections.Generic.List[int]]::new()
-  $seen = @{}
-  $queue = [System.Collections.Queue]::new()
-  $queue.Enqueue($RootPid)
-  while ($queue.Count -gt 0) {
-    $cur = [int]$queue.Dequeue()
-    if ($seen.ContainsKey($cur)) { continue }
-    $seen[$cur] = $true
-    $pids.Add($cur)
-    # ⚠️ 必须先判 ContainsKey 再取：`@($byParent[$cur])` 在**没有子进程**时
-    # 会得到 `@($null)`（一个元素、值为 $null），循环里会塞进空行 —— 实测会让
-    # 「进程数」凭空变大。
-    if (-not $byParent.ContainsKey($cur)) { continue }
-    foreach ($child in $byParent[$cur]) { $queue.Enqueue([int]$child.ProcessId) }
-  }
-  return [pscustomobject]@{ Pids = $pids; ByPid = $byPid }
-}
-
-function Get-AppMemoryMB([int]$RootPid) {
-  $tree = Get-AppProcessTree $RootPid
-  $ws = [long]0
-  $pv = [long]0
-  $renderers = 0
-  $count = 0
-  # ⚠️ 循环变量**不能叫 `$pid`** —— PowerShell 里 `$PID` 是只读自动变量
-  # （当前进程 ID），赋值会直接抛 "Cannot overwrite variable PID"。
-  foreach ($procId in $tree.Pids) {
-    $p = $tree.ByPid[$procId]
-    if ($null -eq $p) { continue }   # 进程可能在采样瞬间退出
-    $ws += [long]$p.WorkingSetSize
-    $pv += [long]$p.PrivatePageCount
-    $count++
-    # WebView2 的渲染进程（每个 webview 一个）—— 用来解释「多开一个页面」的增量
-    if ($p.Name -eq "msedgewebview2.exe") { $renderers++ }
-  }
-  return [pscustomobject]@{
-    WorkingSetMB = [math]::Round($ws / 1MB, 1)
-    PrivateMB    = [math]::Round($pv / 1MB, 1)
-    WebViewProcs = $renderers
-    ProcCount    = $count
-  }
-}
-
-# 系统可用物理内存（MB）。用来解释「为什么挂起后工作集没降」——
-# 微软文档说 TrySuspend 是「allows the OS to **reuse** the memory」，
-# 即把内存标记为**可回收**，而不是立刻释放。若系统本来就有大量空闲内存，
-# 内核没有理由去回收，工作集自然不变。把可用内存一起记下来，
-# 才能区分「挂起没生效」与「挂起生效了但系统不急着回收」。
-function Get-AvailableMemMB {
-  try {
-    $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
-    if ($os) { return [math]::Round([long]$os.FreePhysicalMemory / 1KB, 1) }
-  } catch { }
-  return -1
-}
-
-function Write-MemSample([string]$Stage, [int]$RootPid) {
-  if ($RootPid -le 0) { return }
-  try {
-    $m = Get-AppMemoryMB $RootPid
-  } catch {
-    Write-Host "  [INFO] 内存采样失败（$Stage）：$($_.Exception.Message)" -ForegroundColor DarkYellow
-    return
-  }
-  $avail = Get-AvailableMemMB
-  $line = "  [MEM] {0,-34} 工作集 {1,7} MB | 私有 {2,7} MB | WebView2 进程 {3} | 系统可用 {4} MB" -f `
-    $Stage, $m.WorkingSetMB, $m.PrivateMB, $m.WebViewProcs, $avail
-  Write-Host $line -ForegroundColor Cyan
-  $script:MemSamples += [pscustomobject]@{
-    Stage = $Stage; WorkingSetMB = $m.WorkingSetMB; PrivateMB = $m.PrivateMB
-    WebViewProcs = $m.WebViewProcs; ProcCount = $m.ProcCount
-  }
-}
-
-# 打印汇总表。**只打印、不断言** —— 阶段 0 的目的是先拿到基线数字，
-# 若一上来就写死阈值，CI 会因为内存抖动而 flaky（阶段 1/2 再按实测加相对断言）。
-function Write-MemSummary {
-  if ($script:MemSamples.Count -eq 0) { return }
-  Write-Host ""
-  Write-Host "== 内存采样汇总（工作集=任务管理器口径；私有=不重复计共享页）==" -ForegroundColor Cyan
-  # ⚠️ 对齐只能用 .NET 的 `{n,width}`，**不能写 `{n,>10}`** ——
-  # `>` 是 PowerShell 的字符串格式化习惯，.NET 的 `-f` 不认，会抛
-  # "Error formatting a string: Input string was not in a correct format"
-  # （实测在 CI 上就是这个把整个冒烟脚本搞挂的）。负数宽度本身就是右对齐。
-  Write-Host ("  {0,-34}{1,10}{2,10}{3,10}" -f "阶段", "工作集MB", "私有MB", "WV2进程")
-  foreach ($s in $script:MemSamples) {
-    Write-Host ("  {0,-34}{1,10}{2,10}{3,10}" -f $s.Stage, $s.WorkingSetMB, $s.PrivateMB, $s.WebViewProcs)
-  }
-  Write-Host ""
-}
-
 Add-Type @'
 using System;
 using System.Collections.Generic;
@@ -323,25 +194,9 @@ function Start-TestServer([int]$ListenPort, [string]$LogFile) {
   $js = Join-Path $WORK "httpd-$ListenPort.js"
   @"
 const http=require('http'),fs=require('fs');
-// v0.3.4：页面里放一个 input（模拟「用户没发出去的草稿」）并每秒心跳上报它的值。
-//
-// 为什么要这个：收托盘时我们挂起内容页（WebView2 TrySuspend）。挂起会
-// **暂停页面脚本定时器**，所以「心跳是否停止」就是「挂起是否真的生效」的
-// 直接行为证据 —— 比看内存数字稳定得多。
-//
-// nonce 每次加载随机生成：一旦页面被**重新加载/导航**，nonce 就会变，
-// 于是我们能用它区分「挂起后恢复（DOM 原样）」与「被重载（草稿丢了）」。
-const page = '<!doctype html><meta charset=utf-8><title>DSH $ListenPort</title>' +
-  '<h1>OK $ListenPort</h1><input id="draft">' +
-  '<script>' +
-  'var nonce=Math.random().toString(36).slice(2);' +
-  'document.getElementById("draft").value="DRAFT-"+nonce;' +
-  'function hb(){fetch("/hb?n="+nonce+"&d="+encodeURIComponent(document.getElementById("draft").value));}' +
-  'hb();setInterval(hb,1000);' +
-  '<\/script>';
 http.createServer((q,s)=>{fs.appendFileSync(process.argv[2],q.method+' '+q.url+'\n');
 s.writeHead(200,{'Content-Type':'text/html; charset=utf-8'});
-s.end(page);})
+s.end('<!doctype html><meta charset=utf-8><title>DSH $ListenPort</title><h1>OK $ListenPort</h1>');})
 .listen($ListenPort,'127.0.0.1');
 "@ | Set-Content -Path $js -Encoding UTF8
   Set-Content -Path $LogFile -Value "" -NoNewline
@@ -434,11 +289,6 @@ try {
   Set-Content -Path $LOG_A -Value "" -NoNewline
   Set-Content -Path $LOG_B -Value "" -NoNewline
 
-  # ⚠️ 心跳计数基线**先初始化为 0**：第 8 节会拿它做 `-gt` 比较，
-  # 若它在某个分支里没被赋值，`$x -gt $null` 在 PowerShell 里是 **True**
-  # ⇒ 断言会假性通过（这正是本项目反复踩过的「假绿」类型）。
-  $hbNow = 0
-
   Write-Host "== 2. 预置配置（本地 + 远程都配好，便于测试切换）=="
   New-Item -ItemType Directory -Force -Path $CONFIG_DIR | Out-Null
   $cfg = @{ configured = $true;
@@ -472,9 +322,6 @@ try {
     Start-Sleep -Seconds 2
   }
   Check "选择窗口未卡死" $responsive "进程窗口：$(Format-WindowList $proc.Id)"
-
-  # 阶段 0 采样点 1：只有选择窗口（本地小页面）时的基线
-  Write-MemSample "1-选择窗口" $proc.Id
 
   Write-Host "== 5. 点击「本地」= =="
   # 窗口响应了不代表页面已经渲染完（CI 上 build job 并行跑，CPU 抢占会让启动明显变慢），
@@ -512,38 +359,8 @@ try {
     Check "主窗口可见" ([Win32]::IsWindowVisible($main))
     Start-Sleep -Seconds 3
     Check "本地服务($Port)收到 WebView2 的请求" ((Get-Content $LOG_A -Raw) -match "GET /") "日志：'$(Get-Content $LOG_A -Raw)'"
-    # v0.3.4：连接成功后选择窗口被**销毁**（不是隐藏），所以这里断言句柄已失效。
-    # 为什么要等：销毁是在 `open_main_window` 的 IPC 返回后、由异步阻塞线程
-    # 延迟 250ms 执行的（避开「在自己的 IPC 回调里销毁自己」的历史坑）。
-    $hbBeforeDestroy = @(Select-String -Path $LOG_A -Pattern "/hb" -ErrorAction SilentlyContinue).Count
-    $destroyed = $false
-    for ($i = 0; $i -lt 10; $i++) {
-      if (-not [Win32]::IsWindow($sel)) { $destroyed = $true; break }
-      Start-Sleep -Milliseconds 500
-    }
-    Check "首次连接后选择窗口已销毁（省下它的 renderer）" $destroyed `
-      "5 秒后选择窗口仍然存在 —— 销毁没生效（v0.3.4 的省内存目标未达成）"
-
-    # ⚠️ 「销毁选择窗口后应用仍健康」必须**在这里**断言（主窗口此刻可见、内容页在跑）。
-    #
-    # 为什么不能放到第 8 节：第 7 节已经把主窗口收进托盘并**挂起了内容页**，
-    # 那里再断言「主窗口可见 / 心跳累积」是自相矛盾的状态（我第一版就是这么写错的，
-    # CI 直接抓出 4 条失败 —— 那 4 条是**测试的错**，不是产品回归）。
-    #
-    # 这里是历史坏状态（销毁正在执行 IPC 的 webview ⇒ 点 × 没反应）的正确检测点。
-    Check "销毁选择窗口后主窗口仍可见" ([Win32]::IsWindowVisible($main))
-
-    # ⚠️ **必须等够时间**再比心跳：心跳是 1 秒 1 次，而上面的等待循环在
-    # 「窗口早就销毁完了」的情况下**第一次迭代就 break**（0 秒等待），
-    # 于是立刻比较会拿到相同计数 ⇒ 断言假性失败（CI 实测踩到过）。
-    # 等 3 秒给心跳至少 3 次机会，既消除竞态又保持对「内容页真的死了」的敏感性。
-    Start-Sleep -Seconds 3
-    $hbAfterDestroy = @(Select-String -Path $LOG_A -Pattern "/hb" -ErrorAction SilentlyContinue).Count
-    Check "销毁选择窗口后内容页仍在运行（心跳仍在累积）" ($hbAfterDestroy -gt $hbBeforeDestroy) `
-      "销毁选择窗口后内容页心跳停止累积（$hbBeforeDestroy -> $hbAfterDestroy）—— 销毁影响了内容页"
-
-    # 阶段 0 采样点 2：连接后（顶栏 + 内容页，选择窗口已销毁）
-    Write-MemSample "2-连接后(未开侧栏)" $proc.Id
+    # 这条走的是 Tauri 自己的 show/hide，可见性状态同步，断言有效
+    Check "首次连接后选择窗口已隐藏" (-not [Win32]::IsWindowVisible($sel))
 
     Write-Host "== 6.5 顶栏子 webview（新架构：主窗口内的子 webview）=="
     # 这一段专门盯住用户报告的缺陷 2（顶栏错位）与缺陷 1（点「网页对话」卡死）。
@@ -632,18 +449,10 @@ try {
       ("期望左边缘≈{0}（客户区宽 {1} - 侧栏宽 {2}）；实际子 webview：{3}" -f `
         $expectChatX, $ms[0], $chatW, $sbDesc)
 
-    # 阶段 0 采样点 3：侧栏已打开（多了一个 chat.deepseek.com 的重 renderer）
-    Write-MemSample "3-侧栏已打开" $proc.Id
-
     # 再点一次收起，确认反复切换也不会卡
     [Win32]::ClickClient($main, [int]($CHAT_BTN_X * $scale), [int](20 * $scale))
     Start-Sleep -Seconds 4
     Check "再次点击收起侧栏后仍响应（可反复切换）" ([Win32]::IsResponsive($main, 5000))
-
-    # 阶段 0 采样点 4：侧栏已关闭 —— 关键对比点！
-    # 当前实现只 `chat.hide()`、**不销毁也不挂起**，所以这个数字应当与采样点 3 接近。
-    # 阶段 1（挂起 chat）就是要让这里明显低于采样点 3。
-    Write-MemSample "4-侧栏已关闭" $proc.Id
 
     Write-Host "== 6.7 设置窗口（v0.3.0 新增）=="
     # 「应用 → 设置」走**系统原生菜单**，菜单是系统级弹出窗口、不是 DOM 元素，
@@ -658,93 +467,43 @@ try {
       "其链路由 test-titlebar.mjs 的 lib.rs 契约对账 + capability 断言覆盖。"
 
     Write-Host "== 7. 关闭主窗口 = 隐藏到托盘 =="
-    # v0.3.4：先记下收托盘前的草稿 nonce，用来确认测试页真的设置了草稿
-    # （否则后面的心跳断言只是空跑）。
-    $draftBefore = ""
-    $mDraft = [regex]::Match((Get-Content $LOG_A -Raw), "d=([A-Za-z0-9\-]+)")
-    if ($mDraft.Success) { $draftBefore = $mDraft.Groups[1].Value }
-
     [void][Win32]::PostMessage($main, [Win32]::WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero)
     Start-Sleep -Seconds 5
     Check "关闭后进程仍存活" (-not $proc.HasExited)
     Check "关闭后主窗口不可见（已隐藏到托盘）" (-not [Win32]::IsWindowVisible($main)) `
       "IsWindowVisible=$([Win32]::IsWindowVisible($main))"
-
-    # 阶段 0 采样点 5：已收进托盘 —— 关键对比点！
-    Write-MemSample "5-已收进托盘" $proc.Id
-
-    # ---- v0.3.4：挂起是否真的生效 ----
-    #
-    # ⚠️ **诚实说明**：这一节**不能**用「页面心跳停止」当作「我们的挂起生效」的证据。
-    # 原因（首次 CI 后发现的推理错误）：Chromium 自己就会对**隐藏/被遮挡**的页面
-    # 节流定时器，所以「心跳停了」既可能是我们挂起成功，也可能是「我们什么都没做、
-    # Chromium 自己停了」。两者在行为上无法区分。
-    #
-    # 因此真正的证据是**应用日志**：`wv_suspend` 在 `TrySuspend` 回调里显式打印
-    # 「已挂起 webview（TrySuspend 成功）」。这里断言那行日志存在 —— 它直接证明
-    # WebView2 API 报告挂起成功。
-    #
-    # 同时保留心跳统计作为**诊断信息**打印（不断言），便于日后对照。
-    $hbBase = @(Select-String -Path $LOG_A -Pattern "/hb" -ErrorAction SilentlyContinue).Count
-    Start-Sleep -Seconds 6
-    $hbNow = @(Select-String -Path $LOG_A -Pattern "/hb" -ErrorAction SilentlyContinue).Count
-    Write-Host "  [INFO] 收托盘后 6 秒内心跳 $($hbNow - $hbBase) 次（Chromium 对隐藏页也会节流，故仅作诊断）"
-
-    $errLog = if (Test-Path "$APP_LOG.err") { Get-Content "$APP_LOG.err" -Raw } else { "" }
-    Check "收托盘后 WebView2 API 报告挂起成功（应用日志有 TrySuspend 成功记录）" `
-      ($errLog -match "已挂起 webview") `
-      "日志里没有挂起成功记录 —— 挂起没生效（renderer 仍在占内存）"
-    Check "挂起没有失败/被阻止的记录" `
-      (-not ($errLog -match "挂起失败|挂起未生效|TrySuspend 调用失败")) `
-      "日志里出现了挂起失败 —— 见 app.log.err 的挂起相关行"
   }
 
   # ======================================================= B. 切换连接方式
-  Write-Host "== 8. 连接后选择窗口已销毁 + 应用仍然健康 =="
-  #
-  # v0.3.4：连接成功后选择窗口会被**销毁**（省内存），不再沿用第 5 节的 `$sel`。
-  #
-  # 这一段盯住的是**本版最大的回归风险**：选择窗口正是发起 `open_main_window`
-  # 那条 IPC 的 webview，而历史上「在它自己的 IPC 回调里销毁它」曾导致消息处理
-  # 进入坏状态（后续 hide() 被丢弃、点 × 没反应 —— 见 CHANGELOG v0.1.x）。
-  # 所以必须断言：销毁之后，主界面、内容页、进程**全都还正常**。
-  # ⚠️ 本节开始时主窗口**已被第 7 节收进托盘**、内容页也**已被挂起**。
-  # 所以这里**只能**断言「与隐藏/挂起状态相符」的事：
-  # 进程还活着、主窗口句柄还在（只是不可见）。「仍可见 / 心跳累积」那种断言
-  # 必须放在第 6 节（主窗口可见时）—— 详见那里的注释。
-  Check "连接后选择窗口已被销毁（不是隐藏，句柄已失效）" (-not [Win32]::IsWindow($sel)) `
-    "IsWindow=$([Win32]::IsWindow($sel)) —— 选择窗口仍存在，v0.3.4 的省内存目标未达成"
-  Check "销毁选择窗口后进程仍存活" (-not $proc.HasExited)
+  Write-Host "== 8. 切换连接方式（模拟托盘「重新选择连接方式」）=="
+  # 主窗口已经在跑；把被隐藏的选择窗口重新显示出来，再点「远程」。
+  # 这一步验证 open_main_window 在「已有主窗口」时的行为：
+  # 必须是**复用同一个窗口导航**，而不是销毁再重建（重建会卡住/点了没反应）。
+  [void][Win32]::ShowWindow($sel, [Win32]::SW_SHOWNORMAL)
+  Start-Sleep -Seconds 2
+  [void][Win32]::SetForegroundWindow($sel)
+  Start-Sleep -Milliseconds 500
+  Check "选择窗口重新显示成功" ([Win32]::IsWindowVisible($sel))
+
+  Set-Content -Path $LOG_B -Value "" -NoNewline
+  [Win32]::ClickClient($sel, [int]($selCs[0] / 2), $CARD_REMOTE_Y)
+  Start-Sleep -Seconds 10
+
   if ($main -ne [IntPtr]::Zero) {
-    Check "销毁选择窗口后主窗口句柄仍然存在（只是收在托盘里）" ([Win32]::IsWindow($main)) `
-      "主窗口被销毁了 —— 可能连带把主窗口一起销毁了"
-    Check "销毁选择窗口后主窗口没有卡死" ([Win32]::IsResponsive($main, 5000)) `
-      "主窗口不再响应 WM_NULL —— 正是历史上「销毁正在执行 IPC 的 webview」造成的坏状态"
+    $stillThere = [Win32]::IsWindow($main)
+    Check "切换后主窗口仍然存在（复用而非销毁重建）" $stillThere "IsWindow=$stillThere"
+    Check "切换后主窗口没有卡死" ([Win32]::IsResponsive($main, 5000))
+    Check "切换后主窗口可见" ([Win32]::IsWindowVisible($main))
+    $logB = Get-Content $LOG_B -Raw
+    Check "新地址($Port2)收到 WebView2 的请求（确实切过去了）" ($logB -match "GET /") "日志：'$logB'"
   }
-
-  # 重建路径（托盘「重新选择连接方式」）走**系统原生菜单**，菜单是系统级弹出窗口、
-  # 不是 DOM 元素，无法用坐标可靠点中（与「设置窗口」同样的限制，见第 6.7 节）。
-  # 所以这里不伪造点击，改由两条能在 CI 稳定跑的断言覆盖：
-  #   1) `cargo test`：close_disposition 的「有主窗口→销毁 / 无主窗口→隐藏」语义；
-  #   2) `npm run verify`：断言 reveal_selector 真的有重建分支且带重试。
-  Write-Host "  [INFO] 选择窗口重建走原生托盘菜单，CI 不点系统菜单；" `
-    "其链路由 cargo test（close_disposition 语义）+ verify（reveal_selector 重建分支）覆盖。"
-
-  # 从挂起中恢复后内容页必须仍在跑。
-  #
-  # 恢复路径是 `resume_main_webviews()`（先 Resume + SetIsVisible(true)），
-  # 而第 8 节不再导航到新地址（选择窗口已销毁、切地址走原生菜单点不中），
-  # 所以这里用**主窗口恢复可见** + 内容页心跳仍在累积来验证。
-  # 草稿 nonce 必须在收托盘**之前**就已写入页面（证明测试页真的设置了草稿）。
-  Check "测试页确实写入过草稿（nonce 非空）" ($draftBefore -ne "") `
-    "收托盘前没在日志里看到草稿 nonce —— 测试页脚本可能没执行"
-
-  # 阶段 0 采样点 6：收托盘后的稳定状态（主窗口仍在托盘里、内容页已挂起）。
-  # 「恢复」路径由第 9/10 节各自新建的进程覆盖（它们会重新连接并显示主窗口），
-  # 以及第 6 节「销毁后内容页仍在跑」的断言 —— 不在这里伪造。
-  if ($main -ne [IntPtr]::Zero) {
-    Write-MemSample "6-从托盘恢复(收托盘稳定态)" $proc.Id
-  }
+  # 这里**不**断言「选择窗口重新隐藏」：本测试是用外部 ShowWindow 把它显示出来的，
+  # 绕过了 Tauri/tao 内部的可见性状态；tao 认为它「本来就是隐藏的」，
+  # set_visible(false) 不产生差异所以不会调用 ShowWindow —— 这是测试手段的限制，
+  # 不是产品问题（真实流程走托盘 -> selector.show()，状态是同步的；
+  # 「连接后选择窗口隐藏」已在第 6 节用有效路径断言过）。
+  Check "切换后主窗口仍是活动窗口" ([Win32]::GetForegroundWindow() -eq $main) `
+    "foreground=$([Win32]::GetForegroundWindow()) main=$main"
 
   Stop-App $proc
   Start-Sleep -Seconds 3
@@ -940,10 +699,6 @@ catch {
   Check "脚本异常中止" $false $_.Exception.Message
 }
 finally {
-  # ⚠️ 内存汇总必须在**杀进程之前**打印 —— 下面的 Stop-App 会把采样对象干掉，
-  # 之后连进程都查不到（采样值是当时记录的，但汇总表放在这里更醒目、
-  # 且确保「脚本异常中止」时也一定能打出来）。
-  Write-MemSummary
   Write-Host "== 清理 =="
   foreach ($f in @((Join-Path $WORK "app.log"), (Join-Path $WORK "app.log.err"),
                    (Join-Path $WORK "app.log.2"), (Join-Path $WORK "app.log.2.err"))) {

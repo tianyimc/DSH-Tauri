@@ -255,7 +255,7 @@ test("「重新选择连接方式」复用 chrome_action reconnect，然后收�
   assert.deepEqual(actions[0][1], { action: "reconnect" });
 
   const wc = app.callsOf("window_control");
-  assert.deepEqual(wc.map(([, a]) => a), [{ action: "close-settings" }]);
+  assert.deepEqual(wc.map(([, a]) => a), [{ action: "hide-settings" }]);
   finish(app);
 });
 
@@ -275,12 +275,12 @@ test("打开选择窗口失败时报错，且不收起设置窗口", async () =>
 
 /* ------------------------------------------------------------------ 关闭 */
 
-test("关闭按钮发 window_control close-settings", async () => {
+test("关闭按钮发 window_control hide-settings", async () => {
   const app = await freshBoot({ config: {} });
   await app.click("btn-close");
   assert.deepEqual(
     app.callsOf("window_control").map(([, a]) => a),
-    [{ action: "close-settings" }],
+    [{ action: "hide-settings" }],
   );
   finish(app);
 });
@@ -290,7 +290,7 @@ test("Esc 等同于点关闭", async () => {
   await app.keydown("Escape");
   assert.deepEqual(
     app.callsOf("window_control").map(([, a]) => a),
-    [{ action: "close-settings" }],
+    [{ action: "hide-settings" }],
   );
   // 其它键不该关窗
   app.calls.length = 0;

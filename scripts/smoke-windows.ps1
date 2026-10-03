@@ -532,9 +532,15 @@ try {
     #
     # 这里是历史坏状态（销毁正在执行 IPC 的 webview ⇒ 点 × 没反应）的正确检测点。
     Check "销毁选择窗口后主窗口仍可见" ([Win32]::IsWindowVisible($main))
-    Check "销毁选择窗口后内容页仍在运行（心跳仍在累积）" `
-      ((@(Select-String -Path $LOG_A -Pattern "/hb" -ErrorAction SilentlyContinue).Count) -gt $hbBeforeDestroy) `
-      "销毁选择窗口后内容页心跳停止累积 —— 销毁影响了内容页"
+
+    # ⚠️ **必须等够时间**再比心跳：心跳是 1 秒 1 次，而上面的等待循环在
+    # 「窗口早就销毁完了」的情况下**第一次迭代就 break**（0 秒等待），
+    # 于是立刻比较会拿到相同计数 ⇒ 断言假性失败（CI 实测踩到过）。
+    # 等 3 秒给心跳至少 3 次机会，既消除竞态又保持对「内容页真的死了」的敏感性。
+    Start-Sleep -Seconds 3
+    $hbAfterDestroy = @(Select-String -Path $LOG_A -Pattern "/hb" -ErrorAction SilentlyContinue).Count
+    Check "销毁选择窗口后内容页仍在运行（心跳仍在累积）" ($hbAfterDestroy -gt $hbBeforeDestroy) `
+      "销毁选择窗口后内容页心跳停止累积（$hbBeforeDestroy -> $hbAfterDestroy）—— 销毁影响了内容页"
 
     # 阶段 0 采样点 2：连接后（顶栏 + 内容页，选择窗口已销毁）
     Write-MemSample "2-连接后(未开侧栏)" $proc.Id

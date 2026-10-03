@@ -515,6 +515,7 @@ try {
     # v0.3.4：连接成功后选择窗口被**销毁**（不是隐藏），所以这里断言句柄已失效。
     # 为什么要等：销毁是在 `open_main_window` 的 IPC 返回后、由异步阻塞线程
     # 延迟 250ms 执行的（避开「在自己的 IPC 回调里销毁自己」的历史坑）。
+    $hbBeforeDestroy = @(Select-String -Path $LOG_A -Pattern "/hb" -ErrorAction SilentlyContinue).Count
     $destroyed = $false
     for ($i = 0; $i -lt 10; $i++) {
       if (-not [Win32]::IsWindow($sel)) { $destroyed = $true; break }
@@ -522,6 +523,18 @@ try {
     }
     Check "首次连接后选择窗口已销毁（省下它的 renderer）" $destroyed `
       "5 秒后选择窗口仍然存在 —— 销毁没生效（v0.3.4 的省内存目标未达成）"
+
+    # ⚠️ 「销毁选择窗口后应用仍健康」必须**在这里**断言（主窗口此刻可见、内容页在跑）。
+    #
+    # 为什么不能放到第 8 节：第 7 节已经把主窗口收进托盘并**挂起了内容页**，
+    # 那里再断言「主窗口可见 / 心跳累积」是自相矛盾的状态（我第一版就是这么写错的，
+    # CI 直接抓出 4 条失败 —— 那 4 条是**测试的错**，不是产品回归）。
+    #
+    # 这里是历史坏状态（销毁正在执行 IPC 的 webview ⇒ 点 × 没反应）的正确检测点。
+    Check "销毁选择窗口后主窗口仍可见" ([Win32]::IsWindowVisible($main))
+    Check "销毁选择窗口后内容页仍在运行（心跳仍在累积）" `
+      ((@(Select-String -Path $LOG_A -Pattern "/hb" -ErrorAction SilentlyContinue).Count) -gt $hbBeforeDestroy) `
+      "销毁选择窗口后内容页心跳停止累积 —— 销毁影响了内容页"
 
     # 阶段 0 采样点 2：连接后（顶栏 + 内容页，选择窗口已销毁）
     Write-MemSample "2-连接后(未开侧栏)" $proc.Id
@@ -689,21 +702,18 @@ try {
   # 那条 IPC 的 webview，而历史上「在它自己的 IPC 回调里销毁它」曾导致消息处理
   # 进入坏状态（后续 hide() 被丢弃、点 × 没反应 —— 见 CHANGELOG v0.1.x）。
   # 所以必须断言：销毁之后，主界面、内容页、进程**全都还正常**。
+  # ⚠️ 本节开始时主窗口**已被第 7 节收进托盘**、内容页也**已被挂起**。
+  # 所以这里**只能**断言「与隐藏/挂起状态相符」的事：
+  # 进程还活着、主窗口句柄还在（只是不可见）。「仍可见 / 心跳累积」那种断言
+  # 必须放在第 6 节（主窗口可见时）—— 详见那里的注释。
   Check "连接后选择窗口已被销毁（不是隐藏，句柄已失效）" (-not [Win32]::IsWindow($sel)) `
     "IsWindow=$([Win32]::IsWindow($sel)) —— 选择窗口仍存在，v0.3.4 的省内存目标未达成"
-
-  # 销毁选择窗口之后，主窗口必须一切正常（这就是当年那个坏状态的检测点）。
+  Check "销毁选择窗口后进程仍存活" (-not $proc.HasExited)
   if ($main -ne [IntPtr]::Zero) {
-    Check "销毁选择窗口后主窗口仍然存在" ([Win32]::IsWindow($main)) `
-      "主窗口消失了 —— 可能连带把主窗口一起销毁了"
+    Check "销毁选择窗口后主窗口句柄仍然存在（只是收在托盘里）" ([Win32]::IsWindow($main)) `
+      "主窗口被销毁了 —— 可能连带把主窗口一起销毁了"
     Check "销毁选择窗口后主窗口没有卡死" ([Win32]::IsResponsive($main, 5000)) `
       "主窗口不再响应 WM_NULL —— 正是历史上「销毁正在执行 IPC 的 webview」造成的坏状态"
-    Check "销毁选择窗口后主窗口仍可见" ([Win32]::IsWindowVisible($main))
-    Check "销毁选择窗口后进程仍存活" (-not $proc.HasExited)
-    # 内容页必须仍在跑（用第 5 节之后仍在累积的心跳判断）。
-    $hbAfterDestroy = @(Select-String -Path $LOG_A -Pattern "/hb" -ErrorAction SilentlyContinue).Count
-    Check "销毁选择窗口后内容页仍在运行（心跳仍在累积）" ($hbAfterDestroy -gt $hbNow) `
-      "内容页心跳停止累积（$hbNow -> $hbAfterDestroy）—— 销毁选择窗口影响了内容页"
   }
 
   # 重建路径（托盘「重新选择连接方式」）走**系统原生菜单**，菜单是系统级弹出窗口、
@@ -719,18 +729,15 @@ try {
   # 恢复路径是 `resume_main_webviews()`（先 Resume + SetIsVisible(true)），
   # 而第 8 节不再导航到新地址（选择窗口已销毁、切地址走原生菜单点不中），
   # 所以这里用**主窗口恢复可见** + 内容页心跳仍在累积来验证。
+  # 草稿 nonce 必须在收托盘**之前**就已写入页面（证明测试页真的设置了草稿）。
+  Check "测试页确实写入过草稿（nonce 非空）" ($draftBefore -ne "") `
+    "收托盘前没在日志里看到草稿 nonce —— 测试页脚本可能没执行"
+
+  # 阶段 0 采样点 6：收托盘后的稳定状态（主窗口仍在托盘里、内容页已挂起）。
+  # 「恢复」路径由第 9/10 节各自新建的进程覆盖（它们会重新连接并显示主窗口），
+  # 以及第 6 节「销毁后内容页仍在跑」的断言 —— 不在这里伪造。
   if ($main -ne [IntPtr]::Zero) {
-    Check "从托盘恢复后主窗口仍可见" ([Win32]::IsWindowVisible($main))
-    $hbB = @(Select-String -Path $LOG_A -Pattern "/hb" -ErrorAction SilentlyContinue).Count
-    Check "从托盘恢复后内容页仍在跑（心跳仍在累积）" ($hbB -gt $hbAfterDestroy) `
-      "恢复后心跳没有继续累积（$hbAfterDestroy -> $hbB）—— 内容页可能仍处于挂起状态"
-
-    # 草稿 nonce 必须在收托盘**之前**就已写入页面（证明测试页真的设置了草稿）。
-    Check "测试页确实写入过草稿（nonce 非空）" ($draftBefore -ne "") `
-      "收托盘前没在日志里看到草稿 nonce —— 测试页脚本可能没执行"
-
-    # 阶段 0 采样点 6：从托盘恢复（主窗口重新可见）
-    Write-MemSample "6-从托盘恢复" $proc.Id
+    Write-MemSample "6-从托盘恢复(收托盘稳定态)" $proc.Id
   }
 
   Stop-App $proc

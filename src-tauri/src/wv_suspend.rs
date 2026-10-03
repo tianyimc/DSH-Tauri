@@ -171,6 +171,14 @@ mod imp {
                     match result {
                         Ok(()) if is_successful => {
                             let _ = slot.confirm_suspend(my_generation, true);
+                            // ⚠️ 成功也要**显式打日志**（v0.3.4 首次 CI 后补的）。
+                            //
+                            // 为什么：我们原本用「隐藏后页面心跳停止」当作挂起生效的证据，
+                            // 但那个推理**不成立** —— Chromium 自己就会对隐藏/被遮挡的页面
+                            // 节流定时器。也就是说「心跳停了」既可能是我们挂起成功，
+                            // 也可能是「我们什么都没做、Chromium 自己停了」。
+                            // 只有这行日志能区分两者，所以必须打。
+                            eprintln!("[DSHTauri] 已挂起 webview（TrySuspend 成功）");
                         }
                         Ok(()) => {
                             // 文档：可能被 Sleeping Tabs 的条件阻止，此时 errorCode 为

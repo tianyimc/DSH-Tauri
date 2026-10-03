@@ -1698,14 +1698,24 @@ section("12. v0.3.4：WebView2 挂起、销毁 about/settings");
   // 冒烟里必须有「挂起真的生效」的行为断言（不靠内存数字）。
   const smoke2 = readIfExists("scripts/smoke-windows.ps1");
   if (smoke2 !== null) {
+    // ⚠️ 首次 CI 后修正的推理：**不能**用「隐藏后页面心跳停止」证明挂起生效 ——
+    // Chromium 自己就会对隐藏页节流定时器，两者行为上无法区分。
+    // 真正的证据是 `TrySuspend` 回调里打的日志（见 wv_suspend.rs）。
     check(
-      "冒烟用「心跳停止」验证挂起真的生效（行为证据，比内存阈值稳定）",
-      /心跳停止/.test(smoke2) && /\/hb/.test(smoke2),
-      "冒烟没有行为断言 —— 挂起是否生效只能靠内存数字猜",
+      "wv_suspend 在挂起成功时打日志（区分「我们挂起成功」与「Chromium 自己节流」）",
+      /已挂起 webview/.test(
+        readIfExists("src-tauri/src/wv_suspend.rs") || "",
+      ),
+      "挂起成功没有日志 —— 「心跳停止」无法区分我们的挂起与 Chromium 自身的节流",
     );
     check(
-      "冒烟验证恢复后页面心跳恢复（兜住「窗口回来但空白」的最坏情况）",
-      /心跳恢复/.test(smoke2),
+      "冒烟断言挂起成功的日志（而不是用不可靠的心跳停止）",
+      /已挂起 webview/.test(smoke2),
+      "冒烟没有断言挂起日志 —— 挂起是否生效无法确认",
+    );
+    check(
+      "冒烟验证恢复后内容页在跑（兜住「窗口回来但空白」的最坏情况）",
+      /从托盘恢复后内容页在跑/.test(smoke2),
       "没有恢复断言 —— 恢复失败会导致内容页永久空白却测不出来",
     );
   }

@@ -326,14 +326,27 @@ try {
   Write-Host "== 5. 点击「本地」= =="
   # 窗口响应了不代表页面已经渲染完（CI 上 build job 并行跑，CPU 抢占会让启动明显变慢），
   # 页面没就绪时点击会落空，所以这里多等一会儿。
+  #
+  # ⚠️ **必须重试**（v0.3.3 实测到的一次 CI flake）：
+  # 原先只点一次、然后等 8 秒。若那一次点击恰好落在「页面还没绑好事件」的窗口期，
+  # 主窗口就永远不会出现，第 6 节直接失败 —— 而同一次运行里第 9/10 节
+  # （它们各自重新点一次「本地」）**全部通过**，证明主窗口本身完全正常，
+  # 失败的只是「这一次点击」。
+  # 现在改成最多 3 次：每次点击后等主窗口出现，出现即进入第 6 节。
   Start-Sleep -Seconds 3
-  [void][Win32]::SetForegroundWindow($sel)
-  Start-Sleep -Milliseconds 500
-  [Win32]::ClickClient($sel, [int]($selCs[0] / 2), $CARD_LOCAL_Y)
-  Start-Sleep -Seconds 8
+  $main = [IntPtr]::Zero
+  for ($attempt = 1; $attempt -le 3; $attempt++) {
+    [void][Win32]::SetForegroundWindow($sel)
+    Start-Sleep -Milliseconds 500
+    [Win32]::ClickClient($sel, [int]($selCs[0] / 2), $CARD_LOCAL_Y)
+    # 首次等待久一点（页面还要加载远程内容），后续重试等短一些。
+    Start-Sleep -Seconds $(if ($attempt -eq 1) { 8 } else { 5 })
+    $main = Wait-AppWindow $proc.Id $MAIN_TITLE 1200 800 200
+    if ($main -ne [IntPtr]::Zero) { break }
+    Write-Host "  [INFO] 第 $attempt 次点击「本地」后主窗口尚未出现，重试…"
+  }
 
   Write-Host "== 6. 主窗口 =="
-  $main = Wait-AppWindow $proc.Id $MAIN_TITLE 1200 800 200
   Check "主窗口已出现（标题 DSHTauri 或 ~1200x800 客户区）" ($main -ne [IntPtr]::Zero) `
     "进程窗口：$(Format-WindowList $proc.Id)"
 
